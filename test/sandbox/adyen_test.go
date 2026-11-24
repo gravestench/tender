@@ -196,13 +196,15 @@ func compareAccounting(input io.Reader, merchant, paymentPSP, ref, brand string,
 		psp           string
 	}
 	expected := map[string]movement{
-		"Authorised":    {minor, 0, ""},
-		"SentForSettle": {-minor, minor, psps["CAPTURE"]},
-		"SentForRefund": {0, -minor, psps["REFUND"]},
-		"Settled":       {0, -minor, psps["CAPTURE"]},
-		"Refunded":      {0, minor, psps["REFUND"]},
+		"Authorised":       {minor, 0, ""},
+		"SentForSettle":    {-minor, minor, psps["CAPTURE"]},
+		"RefundAuthorised": {0, 0, psps["REFUND"]},
+		"SentForRefund":    {0, -minor, psps["REFUND"]},
+		"Settled":          {0, -minor, psps["CAPTURE"]},
+		"Refunded":         {0, minor, psps["REFUND"]},
 	}
 	seen := map[string]bool{}
+	var refundAuthBooked, refundAuthReleased bool
 	for {
 		row, err := reader.Read()
 		if err == io.EOF {
@@ -227,6 +229,14 @@ func compareAccounting(input io.Reader, merchant, paymentPSP, ref, brand string,
 		if !ok {
 			return errors.New("adverse or unrecognized accounting row for this payment")
 		}
+		// When a refund moves through the authorisation register its full
+		// debit must be released by the matching SentForRefund journal.
+		if kind == "RefundAuthorised" && registerEquals(get("Authorised (PC)"), -minor) {
+			want.auth, refundAuthBooked = -minor, true
+		}
+		if kind == "SentForRefund" && registerEquals(get("Authorised (PC)"), minor) {
+			want.auth, refundAuthReleased = minor, true
+		}
 		if seen[kind] || get("Merchant Reference") != ref || get("Payment Currency") != "USD" || get("Payment Method") != brand ||
 			want.psp != "" && get("Modification Psp Reference") != want.psp || !registerEquals(get("Authorised (PC)"), want.auth) || !registerEquals(get("Captured (PC)"), want.capture) {
 			return fmt.Errorf("contradictory %s accounting movement", kind)
@@ -237,6 +247,9 @@ func compareAccounting(input io.Reader, merchant, paymentPSP, ref, brand string,
 		if !seen[kind] {
 			return fmt.Errorf("missing %s accounting movement", kind)
 		}
+	}
+	if refundAuthBooked != refundAuthReleased {
+		return errors.New("unbalanced refund authorisation register")
 	}
 	return nil
 }
@@ -259,11 +272,20 @@ func TestAccountingRegisterEvidence(t *testing.T) {
 	const auth = "merchant,payment,order,visa,Authorised,USD,25.99,0.00,\n"
 	const capture = "merchant,payment,order,visa,SentForSettle,USD,-25.99,25.99,cap\n"
 	const refund = "merchant,payment,order,visa,SentForRefund,USD,0,-25.99,ref\n"
+	const refundAuth = "merchant,payment,order,visa,RefundAuthorised,USD,0,0,ref\n"
+	const bookedAuth = "merchant,payment,order,visa,RefundAuthorised,USD,-25.99,0,ref\n"
+	const releasedAuth = "merchant,payment,order,visa,SentForRefund,USD,25.99,-25.99,ref\n"
 	for _, tc := range []struct {
 		name, rows string
 		ok         bool
 	}{
 		{"valid", auth + capture + refund, true},
+		{"refund authorisation", auth + capture + refundAuth + refund, true},
+		{"refund authorisation register cleared", auth + capture + bookedAuth + releasedAuth, true},
+		{"unbalanced refund authorisation", auth + capture + bookedAuth + refund, false},
+		{"wrong refund authorisation modification", auth + capture + strings.Replace(refundAuth, ",ref\n", ",other\n", 1) + refund, false},
+		{"wrong refund authorisation brand", auth + capture + strings.Replace(refundAuth, ",visa,", ",mc,", 1) + refund, false},
+		{"incorrect refund authorisation movement", auth + capture + strings.Replace(refundAuth, ",0,0,", ",0,-25.99,", 1) + refund, false},
 		{"incorrect capture", auth + strings.Replace(capture, ",25.99,cap", ",0.01,cap", 1) + refund, false},
 		{"incorrect refund sign", auth + capture + strings.Replace(refund, "-25.99", "25.99", 1), false},
 		{"nonzero received register", auth + capture + refund + "merchant,payment,order,visa,Received,USD,0,-25.99,\n", false},

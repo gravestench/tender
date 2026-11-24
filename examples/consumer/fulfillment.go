@@ -54,7 +54,9 @@ func (a *app) project(ctx context.Context, o order) error {
 	if a.ledger == nil {
 		return nil
 	}
-	tx, err := a.ledger.BeginTx(ctx, nil)
+	// The evidence read after locking the inbox must see receipts that
+	// committed since the earlier payment/outbox read, under any DB default.
+	tx, err := a.ledger.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
 		return err
 	}

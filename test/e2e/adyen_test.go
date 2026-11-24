@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -293,8 +294,29 @@ func confirmationPath(t *testing.T, p page) string {
 func TestAdyenCheckoutCaptureFailureAtFulfillment(t *testing.T) {
 	for _, late := range []bool{false, true} {
 		t.Run(map[bool]string{false: "receipt before delivery", true: "receipt after delivery"}[late], func(t *testing.T) {
-			dsn, schema, cfg := demoSchema(t)
-			opts := []string{"TENDER_CONSUMER_PROVIDER=adyen", "TENDER_CONSUMER_OPERATOR_KEY=" + operatorFixture, "TENDER_CONSUMER_DATABASE_URL=" + dsn, "TENDER_CONSUMER_SCHEMA=" + schema}
+			dsn, schema, cfg := demoSchema(t, `ALTER TABLE consumer_fulfillments
+ ADD COLUMN default_isolation text DEFAULT current_setting('default_transaction_isolation'),
+ ADD COLUMN delivery_isolation text DEFAULT current_setting('transaction_isolation')`)
+			opts := []string{"TENDER_CONSUMER_PROVIDER=adyen", "TENDER_CONSUMER_OPERATOR_KEY=" + operatorFixture, "TENDER_CONSUMER_DATABASE_URL=" + dsn, "TENDER_CONSUMER_SCHEMA=" + schema, `PGOPTIONS=-c default_transaction_isolation=repeatable\ read`}
+			if os.Getenv("TENDER_TEST_PGLITE") == "1" {
+				// PGlite has one backend and does not apply startup PGOPTIONS.
+				conn := inspectDemo(t, cfg, schema)
+				if _, err := conn.Exec(t.Context(), "SET default_transaction_isolation TO 'repeatable read'"); err != nil {
+					t.Fatal(err)
+				}
+				conn.Close(t.Context())
+				t.Cleanup(func() {
+					conn, err := connectDemo(context.Background(), cfg)
+					if err != nil {
+						t.Error(err)
+						return
+					}
+					defer conn.Close(context.Background())
+					if _, err := conn.Exec(context.Background(), "RESET default_transaction_isolation"); err != nil {
+						t.Error(err)
+					}
+				})
+			}
 			t.Run("collect", func(t *testing.T) {
 				d := launch(t, opts...)
 				c := client(t, d.Origin)
@@ -314,6 +336,13 @@ func TestAdyenCheckoutCaptureFailureAtFulfillment(t *testing.T) {
 			}
 			t.Run("verify and persist failure", func(t *testing.T) {
 				conn := inspectDemo(t, cfg, schema)
+				var configured, effective string
+				if err := conn.QueryRow(t.Context(), "SELECT default_isolation, delivery_isolation FROM consumer_fulfillments").Scan(&configured, &effective); err != nil {
+					t.Fatal(err)
+				}
+				if configured != "repeatable read" || effective != "read committed" {
+					t.Fatalf("delivery isolation %q with configured default %q", effective, configured)
+				}
 				var psp, original, reference string
 				err := conn.QueryRow(t.Context(), `SELECT evidence->>'pspReference',evidence->>'originalReference',evidence->>'merchantReference' FROM tender_provider_events WHERE evidence->>'eventCode'='CAPTURE' AND processed_at IS NOT NULL`).Scan(&psp, &original, &reference)
 				if err != nil {
@@ -368,6 +397,9 @@ func TestAdyenCheckoutCaptureFailureAtFulfillment(t *testing.T) {
 				return
 			}
 			t.Run("restart before processing", func(t *testing.T) {
+				if !late && os.Getenv("TENDER_TEST_PGLITE") != "1" {
+					commitReceiptDuringProjection(t, cfg, schema)
+				}
 				d := launch(t, opts...)
 				c := client(t, d.Origin)
 				p := request(t, c, "GET", d.Guest, "", nil)
@@ -399,6 +431,66 @@ func TestAdyenCheckoutCaptureFailureAtFulfillment(t *testing.T) {
 			}
 		})
 	}
+}
+
+// On native PostgreSQL, commit the verified receipt after the restarted
+// projector has taken its first snapshot. PGlite uses one backend and
+// exercises the durable-before-restart case and effective isolation instead.
+func commitReceiptDuringProjection(t *testing.T, cfg *pgx.ConnConfig, schema string) {
+	t.Helper()
+	conn := inspectDemo(t, cfg, schema)
+	_, err := conn.Exec(t.Context(), `CREATE TEMP TABLE staged_failure AS
+ WITH receipt AS (DELETE FROM tender_provider_events WHERE evidence->>'eventCode'='CAPTURE_FAILED' RETURNING *)
+ SELECT * FROM receipt`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 12*time.Second)
+	t.Cleanup(cancel)
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var seq int64
+	if err := tx.QueryRow(ctx, "SELECT seq FROM tender_outbox WHERE consumed_at IS NULL FOR UPDATE").Scan(&seq); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- releaseReceipt(ctx, tx) }()
+	t.Cleanup(func() {
+		if err := <-done; err != nil {
+			t.Errorf("commit receipt during projection: %v", err)
+		}
+	})
+}
+
+func releaseReceipt(ctx context.Context, tx pgx.Tx) error {
+	defer tx.Rollback(context.Background())
+	for {
+		// Refresh the activity snapshot before checking whether the projector
+		// is waiting for the outbox row held by this backend.
+		if _, err := tx.Exec(ctx, "SELECT pg_stat_clear_snapshot()"); err != nil {
+			return err
+		}
+		var waiting bool
+		err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT FROM pg_stat_activity
+ WHERE pg_backend_pid()=ANY(pg_blocking_pids(pid)) AND query LIKE '%FOR UPDATE OF n,p%')`).Scan(&waiting)
+		if err != nil {
+			return err
+		}
+		if waiting {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	tag, err := tx.Exec(ctx, "INSERT INTO tender_provider_events SELECT * FROM staged_failure")
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return errors.New("expected one staged verified receipt")
+	}
+	return tx.Commit(ctx)
 }
 
 func TestAdyenCheckoutBrowserPolicy(t *testing.T) {

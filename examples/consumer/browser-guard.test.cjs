@@ -49,6 +49,11 @@ test("follows permitted redirects and denies every redirected destination", asyn
   assert.equal(visits, 0);
 });
 test("qualification reads the component response with the checkout CSP active", async (t) => {
+  let outsideHits = 0;
+  const outside = await serve(t, (_req, res) => {
+    outsideHits++;
+    res.end();
+  });
   const origin = await serve(t, (req, res) => {
     if (req.url === "/orders/1/card-state") {
       res.setHeader("Content-Type", "application/json");
@@ -69,13 +74,14 @@ test("qualification reads the component response with the checkout CSP active", 
         : "<form><input name='prepare' type='hidden' value='1'><button>Prepare card checkout</button></form>",
     );
   });
-  const browser = await chromium.launch({ executablePath: process.env.TENDER_CHROMIUM || undefined });
-  t.after(() => browser.close());
-  const page = await browser.newPage();
+  const page = await guarded(t, [origin]);
   const order = origin + "/orders/1";
   await page.goto(order);
   const state = await prepareAndReadState(page, order);
   assert.deepEqual(state, { key: "test_fixture", brands: ["visa"] });
+  const response = await page.goto(outside + "/unapproved").catch(() => null);
+  assert.ok(!response || response.status() >= 400, "offline CSP test allowed another origin");
+  assert.equal(outsideHits, 0);
 });
 
 test("HTTPS redirects cannot escape the tunnel policy or navigate checkout to an approved frame origin", async (t) => {
