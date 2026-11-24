@@ -30,3 +30,29 @@ jobs:
         run: go test -race ./...
       - name: Vet
         run: go vet ./...
+
+  postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17.11
+        env:
+          POSTGRES_DB: tender_test
+          POSTGRES_PASSWORD: tender_test
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U postgres -d tender_test"
+          --health-interval 5s --health-timeout 3s --health-retries 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: '1.26.x'
+      - name: PostgreSQL storage contract
+        env:
+          TENDER_TEST_DATABASE_URL: postgres://postgres:tender_test@127.0.0.1:${{ job.services.postgres.ports[5432] }}/tender_test?sslmode=disable
+        run: go test -race -tags=integration -count=1 -timeout=2m ./test/contract/... -run '^TestPostgres'

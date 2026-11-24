@@ -1,0 +1,116 @@
+# PostgreSQL storage
+
+Tender stores the host order claim, payment, attempt and operation reservation before dispatch. A later transaction commits the observed outcome, audit entry and full-collection notice together. Each payment has one immutable attempt, identified by `attempt_id` on the payment row. An operation references that attempt through a scoped foreign key.
+
+## Install and configure
+
+Use PostgreSQL 17 with a UTF-8 database. Choose a schema where only trusted roles can create objects. Set that schema as the search path for the migration session and **every** connection in the application pool. The example uses an existing schema named `tender`.
+
+Apply the migration once, before starting workers. Both migration scripts contain `BEGIN` and `COMMIT`. Record `001_initial` in the host migration ledger after successful execution. The scripts are also available in Go under `postgres.Migrations` at `migrations/001_initial.up.sql` and `migrations/001_initial.down.sql`.
+
+```sh
+PGOPTIONS='-c search_path=tender' psql "$TENDER_MIGRATION_DSN" -X -v ON_ERROR_STOP=1 \
+  -f store/postgres/migrations/001_initial.up.sql
+```
+
+Grant the runtime role schema usage, table privileges for its operations, and sequence usage for inserts. Reserve DDL for the migration role. The host owns the SQL driver, pool, credentials, network settings and shutdown. With pgx v5, a PostgreSQL URL can include `search_path=tender` and `sslmode=verify-full` for a remote database. Configure a trusted CA for the server certificate. The `store/postgres` package uses the Go standard library and accepts a pool opened with any PostgreSQL `database/sql` driver that supports serializable transactions and SQLSTATE errors via `SQLState() string`.
+
+```go
+import (
+    "context"
+    "database/sql"
+
+    "github.com/gravestench/tender/store/postgres"
+    _ "github.com/jackc/pgx/v5/stdlib"
+)
+
+func openStore(ctx context.Context, dsn string) (*sql.DB, *postgres.Store, error) {
+    db, err := sql.Open("pgx", dsn)
+    if err != nil { return nil, nil, err }
+    if err := db.PingContext(ctx); err != nil {
+        db.Close()
+        return nil, nil, err
+    }
+    return db, postgres.New(db), nil
+}
+```
+
+Pass the returned store to `tender.EngineConfig.Store`. The host closes the pool after stopping its workers. Use separate merchant, environment and processor-account bindings for every engine.
+
+## Recovery and host processing
+
+- **Reservations.** Scoped unique indexes protect payment and order claims, operation IDs and keys, bound provider references and one active operation per payment. PostgreSQL serializable transactions protect reads of absent keys and version-checked updates across processes. The callback runs once. A uniqueness or serialization race returns `tender.ErrConflict`. After a commit error, replay the original request with its original key and fingerprint inputs to learn whether its reservation exists. An unknown or reserved result requires `Engine.Recover` or verified evidence before another monetary mutation can proceed. Recovery uses the recorded provider key. A definite no-effect rejection retains the retry deadline and one successor for `RetryCreate`.
+- **History.** `History(ctx, scope, paymentID)` returns the committed reservation, dispatch and result changes. The JSON records retain typed values including int64 amounts, uint64 versions, nanosecond timestamps and operation retry metadata. Generated columns index the same identity that the Go decoder reads. Treat changes to exported field names, field types or index expressions as schema migrations.
+- **Verified callbacks.** After authenticating the signed event, insert the verified, allowlisted evidence into `tender_provider_events` before acknowledging the delivery. Use the scoped provider event identity. On duplicate delivery, compare the stored evidence with the normalized incoming event before acknowledging it. Keep raw payloads, credentials and payment instruments out of this table. A worker can retry unprocessed events through `Engine.ApplyVerified` and set `processed_at` after success. If a worker stops between these steps, another worker can reapply the same observation. Keep unresolved evidence pending for correlation or authoritative recovery.
+
+```sql
+INSERT INTO tender_provider_events
+    (merchant_id, environment, provider, merchant_account, event_id, evidence)
+VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (merchant_id, environment, provider, merchant_account, event_id) DO NOTHING;
+```
+
+- **Fulfillment.** `Outbox(ctx, scope)` lists committed collection notices. For a worker, claim a pending row with the following query inside a host transaction. Check current payment state and host policy. Record the scoped `entry_id` in the host's unique fulfillment ledger, enqueue host work and update `consumed_at` in that same transaction. A host using another database or external service must make that destination idempotent using the same scoped ID. Identity sequence numbers establish insertion order and can have gaps or commit out of order. Select by pending status when polling.
+
+```sql
+SELECT seq, entry_id, record FROM tender_outbox
+WHERE merchant_id = $1 AND environment = $2 AND consumed_at IS NULL
+ORDER BY seq LIMIT 1 FOR UPDATE SKIP LOCKED;
+
+UPDATE tender_outbox SET consumed_at = CURRENT_TIMESTAMP
+WHERE merchant_id = $1 AND environment = $2 AND seq = $3;
+```
+
+- **Settlement and reconciliation.** Insert normalized signed minor units, currency, payout and processor references into `tender_settlements`. The primary key is merchant, environment, provider, merchant account, report and line ID. Within a transaction, insert with `ON CONFLICT DO NOTHING` and compare an existing line with the normalized facts on replay. Preserve unmatched lines for later resolution. Insert a row in `tender_reconciliation_runs` for each reconciliation run. In a transaction, append matched lines, discrepancies and resolution evidence to `tender_reconciliation_history` and set `finished_at` on the run when complete. Preserve the original evidence and add a new history row for corrections. The provider adapter supplies the report mapping, and the host schedules ingestion.
+
+For example, use these parameterized statements inside the importer transaction. The lookup locks the immutable report line while the worker decides whether a duplicate agrees. A discrepancy can retain both versions as sanitized history evidence.
+
+```sql
+INSERT INTO tender_settlements
+    (merchant_id, environment, provider, merchant_account, report_id, line_id,
+     provider_reference, entry_kind, currency, gross_minor, fee_minor, net_minor,
+     payout_reference, observed_at)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+ON CONFLICT (merchant_id, environment, provider, merchant_account, report_id, line_id) DO NOTHING;
+
+SELECT provider_reference, entry_kind, currency, gross_minor, fee_minor, net_minor,
+       payout_reference, observed_at FROM tender_settlements
+WHERE (merchant_id, environment, provider, merchant_account, report_id, line_id)
+    = ($1,$2,$3,$4,$5,$6) FOR SHARE;
+```
+
+For a reconciliation run, commit its start before processing. Append one history row per result or subsequent resolution, and commit the final batch and run completion together.
+
+```sql
+INSERT INTO tender_reconciliation_runs
+    (merchant_id, environment, provider, merchant_account, run_id, report_id)
+VALUES ($1,$2,$3,$4,$5,$6);
+
+INSERT INTO tender_reconciliation_history
+    (merchant_id, environment, provider, merchant_account, run_id, line_id,
+     payment_id, outcome, evidence)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9);
+
+UPDATE tender_reconciliation_runs SET finished_at = CURRENT_TIMESTAMP
+WHERE (merchant_id, environment, provider, merchant_account, run_id) = ($1,$2,$3,$4,$5);
+```
+
+## Rollback
+
+Before deployment, back up existing Tender data and verify restore access. A code rollback can keep a compatible schema. Before removing the initial schema, stop all Tender writers and workers, identify pending operations and outbox work, and preserve the full database for recovery. On a disposable database or after the host has explicitly approved deleting the records, run the down migration using the same role and search path.
+
+```sh
+PGOPTIONS='-c search_path=tender' psql "$TENDER_MIGRATION_DSN" -X -v ON_ERROR_STOP=1 \
+  -f store/postgres/migrations/001_initial.down.sql
+```
+
+The down migration drops the eight Tender tables and their indexes and sequences. Restore the backup and reconcile outstanding external operations before resuming payment traffic. Recreating an empty schema erases the durable keys needed for recovery.
+
+## Test the storage contract
+
+Provide a disposable database using a role with `CREATE` on that database. Each test creates a random schema, applies the shipped migration, reconnects as needed, and drops only its own schema during cleanup. `TENDER_TEST_DATABASE_URL` is required. The CI service uses PostgreSQL 17.11. The pgx driver is imported by the tagged tests only.
+
+```sh
+TENDER_TEST_DATABASE_URL='postgres://tender_test@localhost/tender_test?sslmode=disable' \
+  go test -race -count=1 -tags=integration ./test/contract/... -run '^TestPostgres'
+```

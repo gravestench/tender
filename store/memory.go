@@ -8,6 +8,7 @@ import (
 	"slices"
 
 	"github.com/gravestench/tender"
+	"github.com/gravestench/tender/store/internal/binding"
 )
 
 type key struct {
@@ -131,11 +132,8 @@ func (t *memoryTx) UpdatePayment(p tender.Payment) error {
 	if err != nil {
 		return err
 	}
-	if p.OrderID != old.OrderID || p.Amount != old.Amount || p.Version != old.Version+1 ||
-		p.AttemptID != old.AttemptID || p.Market != old.Market ||
-		p.Provider != old.Provider || p.MerchantAccount != old.MerchantAccount ||
-		old.ProviderReference != "" && old.ProviderReference != p.ProviderReference {
-		return tender.ErrConflict
+	if err := binding.PaymentUpdate(old, p); err != nil {
+		return err
 	}
 	return t.savePayment(p)
 }
@@ -170,14 +168,8 @@ func (t *memoryTx) UpdateOperation(o tender.OperationRecord) error {
 	if err != nil {
 		return err
 	}
-	if old.SuccessorID != "" && o.SuccessorID != old.SuccessorID ||
-		old.ProviderReference != "" && o.ProviderReference != old.ProviderReference {
-		return tender.ErrConflict
-	}
-	// Only the result and its binding may change after reservation.
-	old.Status, old.ProviderReference = o.Status, o.ProviderReference
-	if o.Operation != old.Operation {
-		return tender.ErrConflict
+	if err := binding.OperationUpdate(old, o); err != nil {
+		return err
 	}
 	return t.saveOperation(o)
 }

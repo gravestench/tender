@@ -19,6 +19,7 @@ The default checks are offline. The [milestone backlog](docs/backlog.md) tracks 
 
 ## Design and release
 
+- [PostgreSQL setup and recovery](docs/storage.md)
 - [Architecture decisions](docs/adr/README.md)
 - [v1.0 implementation plan](docs/superpowers/plans/2026-11-24-tender-v1.md)
 - [Changelog](CHANGELOG.md)
