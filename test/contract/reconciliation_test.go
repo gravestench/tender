@@ -1,0 +1,221 @@
+//go:build integration
+
+package contract_test
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/gravestench/tender"
+	"github.com/gravestench/tender/store/postgres"
+)
+
+// A changed comparison, report identity, or ledger lookup must make this test fail.
+func TestReconcileReports(t *testing.T) {
+	open := postgresFixture(t)
+	db := open()
+	defer db.Close()
+	ctx := context.Background()
+	scope := tender.Scope{MerchantID: "reconcile-shop", Environment: tender.EnvironmentMock}
+	card := tender.Market{Country: "US", Currency: "USD", Method: tender.MethodVisa}
+	ach := tender.Market{Country: "US", Currency: "USD", Method: tender.MethodACH}
+	store := postgres.New(db)
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	seed := func(id, ref string, market tender.Market, funds tender.Funds, status tender.PaymentStatus) {
+		t.Helper()
+		p, err := tender.NewPayment(scope, id, "order-"+id, tender.Money{Minor: 10000, Currency: "USD"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.Provider, p.MerchantAccount, p.AttemptID, p.ProviderReference, p.Market = "adyen", "acct", "attempt-"+id, ref, market
+		if _, err := p.Apply(tender.Snapshot{Status: status, Funds: funds}, now); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Transact(ctx, func(tx tender.Tx) error { return tx.InsertPayment(p) }); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed("card", "psp-card", card, tender.Funds{Authorized: 10000, Captured: 10000, Refunded: 2500}, tender.PaymentCaptured)
+	seed("bank", "psp-bank", ach, tender.Funds{Settled: 10000}, tender.PaymentSettled)
+	seed("held-bank", "psp-held", ach, tender.Funds{Authorized: 10000, Settled: 10000}, tender.PaymentCaptureFailed)
+	phantom := tender.OperationRecord{Operation: tender.Operation{Scope: scope, ID: "phantom", PaymentID: "card", AttemptID: "attempt-card", Key: "phantom-key", Fingerprint: "fingerprint", ProviderKey: "provider-key", ProviderReference: "phantom-ref", Kind: tender.OpRefund, Status: tender.OperationSucceeded, Amount: tender.Money{Minor: 5000, Currency: "USD"}, BaseVersion: 2}}
+	if err := store.Transact(ctx, func(tx tender.Tx) error { return tx.InsertOperation(phantom) }); err != nil {
+		t.Fatal(err)
+	}
+	engine := func(m tender.Market) *tender.Engine {
+		t.Helper()
+		e, err := tender.NewEngine(tender.EngineConfig{Store: store, Provider: storageProvider{}, Scope: scope, ProviderName: "adyen", MerchantAccount: "acct", Market: m, Now: func() time.Time { return now }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	cardEngine, bankEngine := engine(card), engine(ach)
+	line := func(id, ref string, kind tender.SettlementEntryKind, gross, fee, net int64) tender.SettlementLine {
+		return tender.SettlementLine{ID: id, ProviderReference: ref, Kind: kind, Currency: "USD", GrossMinor: gross, FeeMinor: fee, NetMinor: net, PayoutReference: "payout-1", ObservedAt: now}
+	}
+	cardReport := tender.SettlementReport{ID: "card-report", Feed: tender.FeedHostVerified, Lines: []tender.SettlementLine{
+		line("capture", "psp-card", tender.SettlementCaptured, 10000, 300, 9700),
+		line("refund", "psp-card", tender.SettlementRefunded, -2500, 0, -2500),
+		line("unmatched", "unknown", tender.SettlementCaptured, 10000, 300, 9700),
+		line("wrong-currency", "psp-card", tender.SettlementCaptured, 10000, 300, 9700),
+		line("wrong-amount", "psp-card", tender.SettlementCaptured, 9999, 299, 9700),
+		line("wrong-fee", "psp-card", tender.SettlementCaptured, 10000, 299, 9700),
+	}}
+	cardReport.Lines[3].Currency = "EUR"
+	run, err := cardEngine.Reconcile(ctx, cardReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var orderedTimes bool
+	if err := db.QueryRowContext(ctx, `SELECT finished_at >= started_at FROM tender_reconciliation_runs WHERE merchant_id=$1 AND run_id=$2`, scope.MerchantID, cardReport.ID).Scan(&orderedTimes); err != nil {
+		t.Fatal(err)
+	}
+	if !orderedTimes {
+		t.Fatal("reconciliation finished before it started")
+	}
+	if run.ID != cardReport.ID || len(run.Results) != 6 {
+		t.Fatalf("run: %+v", run)
+	}
+	want := []tender.ReconciliationOutcome{tender.ReconciliationMatched, tender.ReconciliationMatched, tender.ReconciliationUnmatched, tender.ReconciliationCurrencyMismatch, tender.ReconciliationAmountMismatch, tender.ReconciliationFeeMismatch}
+	for i, result := range run.Results {
+		if result.Outcome != want[i] {
+			t.Errorf("line %d: got %s want %s", i, result.Outcome, want[i])
+		}
+	}
+	if run.Results[0].Line.FeeMinor != 300 || run.Results[0].Line.NetMinor != 9700 || run.Results[0].Line.PayoutReference != "payout-1" {
+		t.Fatalf("missing payout evidence: %+v", run.Results[0])
+	}
+	phantomRun, err := cardEngine.Reconcile(ctx, tender.SettlementReport{ID: "phantom-report", Feed: tender.FeedHostVerified, Lines: []tender.SettlementLine{line("phantom", "phantom-ref", tender.SettlementRefunded, -5000, 0, -5000)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if phantomRun.Results[0].Outcome != tender.ReconciliationUnconfirmed {
+		t.Fatalf("operation without ledger funds was matched: %+v", phantomRun.Results[0])
+	}
+	bankReport := tender.SettlementReport{ID: "ach-report", Feed: tender.FeedHostVerified, Lines: []tender.SettlementLine{line("settled", "psp-bank", tender.SettlementSettled, 10000, 50, 9950)}}
+	bankRun, err := bankEngine.Reconcile(ctx, bankReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, result := range bankRun.Results {
+		if result.Outcome != tender.ReconciliationMatched || result.PaymentID != "bank" {
+			t.Errorf("bank result: %+v", result)
+		}
+	}
+	if err := store.Transact(ctx, func(tx tender.Tx) error {
+		p, err := tx.Payment(scope, "bank")
+		if err != nil {
+			return err
+		}
+		if _, err := p.Apply(tender.Snapshot{Status: tender.PaymentReturned, Funds: tender.Funds{Settled: 10000, Returned: 10000}}, now.Add(time.Hour)); err != nil {
+			return err
+		}
+		return tx.UpdatePayment(p)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	returnRun, err := bankEngine.Reconcile(ctx, tender.SettlementReport{ID: "ach-return", Feed: tender.FeedHostVerified, Lines: []tender.SettlementLine{line("returned", "psp-bank", tender.SettlementReturned, -10000, 0, -10000)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if returnRun.Results[0].Outcome != tender.ReconciliationMatched || returnRun.Results[0].PaymentID != "bank" {
+		t.Fatalf("bank return: %+v", returnRun.Results[0])
+	}
+	held, err := bankEngine.Reconcile(ctx, tender.SettlementReport{ID: "held-report", Feed: tender.FeedHostVerified, Lines: []tender.SettlementLine{line("held", "psp-held", tender.SettlementSettled, 10000, 50, 9950)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held.Results[0].Outcome != tender.ReconciliationUnconfirmed {
+		t.Fatalf("capture failure hold was ignored: %+v", held.Results[0])
+	}
+	// A new engine and pool must replay the exact report without new history.
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db2 := open()
+	defer db2.Close()
+	restarted, err := tender.NewEngine(tender.EngineConfig{Store: postgres.New(db2), Provider: storageProvider{}, Scope: scope, ProviderName: "adyen", MerchantAccount: "acct", Market: card, Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replay, err := restarted.Reconcile(ctx, cardReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replay.Results) != len(run.Results) {
+		t.Fatalf("duplicate result count: %d", len(replay.Results))
+	}
+	var historyCount, outboxCount int
+	if err := db2.QueryRowContext(ctx, `SELECT count(*) FROM tender_reconciliation_history WHERE merchant_id=$1 AND run_id=$2`, scope.MerchantID, cardReport.ID).Scan(&historyCount); err != nil {
+		t.Fatal(err)
+	}
+	if historyCount != 6 {
+		t.Fatalf("history count %d", historyCount)
+	}
+	if err := db2.QueryRowContext(ctx, `SELECT count(*) FROM tender_outbox WHERE merchant_id=$1`, scope.MerchantID).Scan(&outboxCount); err != nil {
+		t.Fatal(err)
+	}
+	if outboxCount != 0 {
+		t.Fatalf("reconciliation created %d outbox items", outboxCount)
+	}
+	// A report line can be revisited after the host ledger catches up. Retain
+	// the original unmatched observation and append exactly one resolution.
+	store2 := postgres.New(db2)
+	p, err := tender.NewPayment(scope, "late", "order-late", tender.Money{Minor: 10000, Currency: "USD"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Provider, p.MerchantAccount, p.AttemptID, p.ProviderReference, p.Market = "adyen", "acct", "attempt-late", "unknown", card
+	if _, err := p.Apply(tender.Snapshot{Status: tender.PaymentCaptured, Funds: tender.Funds{Authorized: 10000, Captured: 10000}}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store2.Transact(ctx, func(tx tender.Tx) error { return tx.InsertPayment(p) }); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := restarted.Reconcile(ctx, cardReport)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Results[2].Outcome != tender.ReconciliationMatched || resolved.Results[2].PaymentID != "late" {
+		t.Fatalf("late resolution: %+v", resolved.Results[2])
+	}
+	if _, err := restarted.Reconcile(ctx, cardReport); err != nil {
+		t.Fatal(err)
+	}
+	if err := db2.QueryRowContext(ctx, `SELECT count(*) FROM tender_reconciliation_history WHERE merchant_id=$1 AND run_id=$2`, scope.MerchantID, cardReport.ID).Scan(&historyCount); err != nil {
+		t.Fatal(err)
+	}
+	if historyCount != 7 {
+		t.Fatalf("duplicate or missing resolution history %d", historyCount)
+	}
+	changed := cardReport
+	changed.Lines = append([]tender.SettlementLine(nil), cardReport.Lines...)
+	changed.Lines[0].NetMinor--
+	if _, err := restarted.Reconcile(ctx, changed); !errors.Is(err, tender.ErrConflict) {
+		t.Fatalf("changed report: %v", err)
+	}
+	if err := db2.QueryRowContext(ctx, `SELECT count(*) FROM tender_reconciliation_history WHERE merchant_id=$1 AND run_id=$2 AND outcome='report_conflict'`, scope.MerchantID, cardReport.ID).Scan(&historyCount); err != nil {
+		t.Fatal(err)
+	}
+	if historyCount != 1 {
+		t.Fatalf("conflict history %d", historyCount)
+	}
+	openItems, err := store2.OpenReconciliationDiscrepancies(ctx, scope, "adyen", "acct")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(openItems) != 6 {
+		t.Fatalf("open discrepancies: %+v", openItems)
+	}
+	for _, item := range openItems {
+		if item.Result.Outcome == tender.ReconciliationMatched || item.Result.LineID == "unmatched" {
+			t.Fatalf("resolved line remains open: %+v", item)
+		}
+	}
+	if _, err := bankEngine.Reconcile(ctx, tender.SettlementReport{ID: "unsupported", Feed: tender.ReportFeed("provider_auto")}); !errors.Is(err, tender.ErrUnsupported) {
+		t.Fatalf("unsupported feed: %v", err)
+	}
+}
