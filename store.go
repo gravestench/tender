@@ -2,6 +2,7 @@ package tender
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 )
 
@@ -73,4 +74,27 @@ type Tx interface {
 	UpdateOperation(OperationRecord) error
 	AppendAudit(AuditEntry) error
 	Enqueue(OutboxEntry) error
+}
+
+// VerifiedEventKey is the provider-defined delivery identity on one engine route.
+type VerifiedEventKey struct {
+	Scope                         Scope
+	Provider, MerchantAccount, ID string
+}
+
+// VerifiedEvent is normalized from persisted authenticated evidence. ID and
+// Provider identify the delivery. Observation carries its account and scope.
+type VerifiedEvent struct {
+	ID, Provider string
+	Observation  Observation
+}
+
+// VerifiedEventTx extends Tx for stores with a verified callback inbox. Insert
+// accepts allowlisted authenticated JSON and returns ErrConflict on a duplicate
+// key. Process runs fn against that stored evidence, recording success in the
+// same transaction, or returns nil for an already processed delivery. Return
+// every processing error from the outer Transact callback so it rolls back.
+type VerifiedEventTx interface {
+	InsertVerifiedEvent(VerifiedEventKey, json.RawMessage) error
+	ProcessVerifiedEvent(VerifiedEventKey, time.Time, func(json.RawMessage) error) error
 }

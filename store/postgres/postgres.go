@@ -9,6 +9,7 @@ import (
 	"embed"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/gravestench/tender"
 	"github.com/gravestench/tender/store/internal/binding"
@@ -88,7 +89,7 @@ func (t *transaction) OperationByKey(scope tender.Scope, key string) (tender.Ope
 	return read[tender.OperationRecord](t.tx.QueryRowContext(t.ctx, `SELECT record FROM tender_operations WHERE merchant_id=$1 AND environment=$2 AND operation_key=$3`, scope.MerchantID, scope.Environment, key))
 }
 func (t *transaction) OperationByReference(scope tender.Scope, paymentID, ref string) (tender.OperationRecord, error) {
-	return read[tender.OperationRecord](t.tx.QueryRowContext(t.ctx, `SELECT record FROM tender_operations WHERE merchant_id=$1 AND environment=$2 AND payment_id=$3 AND provider_reference=$4`, scope.MerchantID, scope.Environment, paymentID, ref))
+	return read[tender.OperationRecord](t.tx.QueryRowContext(t.ctx, `SELECT record FROM tender_operations WHERE merchant_id=$1 AND environment=$2 AND payment_id=$3 AND tender_reference_digest(provider_reference)=tender_reference_digest($4) AND provider_reference=$4`, scope.MerchantID, scope.Environment, paymentID, ref))
 }
 func (t *transaction) ActiveOperation(scope tender.Scope, paymentID string) (tender.OperationRecord, error) {
 	return read[tender.OperationRecord](t.tx.QueryRowContext(t.ctx, `SELECT record FROM tender_operations WHERE merchant_id=$1 AND environment=$2 AND payment_id=$3 AND status NOT IN ('succeeded','failed')`, scope.MerchantID, scope.Environment, paymentID))
@@ -163,4 +164,32 @@ func (s *Store) History(ctx context.Context, scope tender.Scope, paymentID strin
 // order. Hosts can claim and acknowledge pending notices using docs/storage.md.
 func (s *Store) Outbox(ctx context.Context, scope tender.Scope) ([]tender.OutboxEntry, error) {
 	return list[tender.OutboxEntry](ctx, s.db, `SELECT record FROM tender_outbox WHERE merchant_id=$1 AND environment=$2 ORDER BY seq`, scope.MerchantID, scope.Environment)
+}
+
+func (t *transaction) InsertVerifiedEvent(key tender.VerifiedEventKey, evidence json.RawMessage) error {
+	if !json.Valid(evidence) {
+		return tender.ErrValidation
+	}
+	_, err := t.tx.ExecContext(t.ctx, `INSERT INTO tender_provider_events
+        (merchant_id, environment, provider, merchant_account, event_id, evidence) VALUES ($1,$2,$3,$4,$5,$6)`, key.Scope.MerchantID, key.Scope.Environment, key.Provider, key.MerchantAccount, key.ID, string(evidence))
+	return dbError(err)
+}
+
+func (t *transaction) ProcessVerifiedEvent(key tender.VerifiedEventKey, at time.Time, apply func(json.RawMessage) error) error {
+	var evidence []byte
+	var processed bool
+	err := t.tx.QueryRowContext(t.ctx, `SELECT evidence, processed_at IS NOT NULL FROM tender_provider_events
+        WHERE merchant_id=$1 AND environment=$2 AND provider=$3 AND merchant_account=$4 AND event_id=$5 FOR UPDATE`, key.Scope.MerchantID, key.Scope.Environment, key.Provider, key.MerchantAccount, key.ID).Scan(&evidence, &processed)
+	if err != nil {
+		return dbError(err)
+	}
+	if processed {
+		return nil
+	}
+	if err = apply(evidence); err != nil {
+		return err
+	}
+	_, err = t.tx.ExecContext(t.ctx, `UPDATE tender_provider_events SET processed_at=$6
+        WHERE merchant_id=$1 AND environment=$2 AND provider=$3 AND merchant_account=$4 AND event_id=$5`, key.Scope.MerchantID, key.Scope.Environment, key.Provider, key.MerchantAccount, key.ID, at)
+	return dbError(err)
 }

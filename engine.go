@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -436,106 +437,139 @@ func (e *Engine) ApplyVerified(ctx context.Context, o Observation) (Result, erro
 	return Result{s.payment, s.op.Operation}, nil
 }
 
+// ProcessVerifiedEvent processes the durable, verified inbox row at this
+// engine's route and event ID. The normalizer must derive the event identity
+// and observation from the stored evidence using only local computation. Its
+// receipt, payment, audit and outbox writes commit in the same transaction.
+// A delivery replay after commit succeeds without running the normalizer.
+func (e *Engine) ProcessVerifiedEvent(ctx context.Context, id string, normalize func(json.RawMessage) (VerifiedEvent, error)) error {
+	if strings.TrimSpace(id) == "" || normalize == nil {
+		return ErrValidation
+	}
+	key := VerifiedEventKey{Scope: e.config.Scope, Provider: e.config.ProviderName, MerchantAccount: e.config.MerchantAccount, ID: id}
+	return e.config.Store.Transact(ctx, func(tx Tx) error {
+		inbox, ok := tx.(VerifiedEventTx)
+		if !ok {
+			return ErrUnsupported
+		}
+		return inbox.ProcessVerifiedEvent(key, e.config.Now().UTC(), func(evidence json.RawMessage) error {
+			event, err := normalize(evidence)
+			if err != nil {
+				return err
+			}
+			if event.ID != id || event.Provider != key.Provider {
+				return fmt.Errorf("%w: verified event identity does not match inbox", ErrConflict)
+			}
+			_, err = e.applyTx(tx, state{}, event.Observation, "webhook")
+			return err
+		})
+	})
+}
+
 func (e *Engine) apply(ctx context.Context, original state, o Observation, source string) (state, error) {
 	var final state
 	err := e.config.Store.Transact(ctx, func(tx Tx) error {
-		id := original.op.ID
-		if source == "webhook" {
-			if o.Scope != e.config.Scope || o.MerchantAccount != e.config.MerchantAccount {
-				return fmt.Errorf("%w: wrong callback account", ErrConflict)
-			}
-			id = o.OperationID
-			if id == "" {
-				rec, err := tx.OperationByReference(o.Scope, o.PaymentID, o.OperationReference)
-				if err != nil {
-					return err
-				}
-				id = rec.ID
-			}
-		}
-		s, err := e.load(tx, id)
-		if err != nil {
-			return err
-		}
-		if err := bind(s, o); err != nil {
-			return err
-		}
-		final = s
-		// A mutation reply is fenced by its original reservation. Cumulative
-		// settlement/return/dispute evidence may refer to an older operation.
-		versionChanged := s.payment.Version != original.payment.Version
-		if source == "response" && (versionChanged || s.op != original.op) {
-			return nil
-		}
-		earlierOperation := s.op.PaymentVersion != s.payment.Version
-		if source == "query" && versionChanged && !earlierOperation {
-			return nil
-		}
-		if earlierOperation && !s.canReconcile(o, source) {
-			return fmt.Errorf("%w: stale observation for an earlier payment version", ErrConflict)
-		}
-		if active, err := tx.ActiveOperation(s.payment.Scope, s.payment.ID); err == nil && active.ID != s.op.ID {
-			return fmt.Errorf("%w: another operation is in progress", ErrConflict)
-		} else if err != nil && !errors.Is(err, ErrNotFound) {
-			return err
-		}
-		o.Snapshot = o.Snapshot.principalSnapshot(s.payment.Status)
-		o.Snapshot.ProviderStatus = sanitizeStatus(o.Snapshot.ProviderStatus)
-		o.Snapshot.Action.ExpiresAt = o.Snapshot.Action.ExpiresAt.UTC()
-		if err := validateOutcome(s, o, source); err != nil {
-			return err
-		}
-		if s.op.Status == o.Status && s.payment.Snapshot == o.Snapshot &&
-			(o.ProviderReference == "" || s.payment.ProviderReference == o.ProviderReference) &&
-			(o.OperationReference == "" || s.op.ProviderReference == o.OperationReference) {
-			return nil
-		}
-
-		if err := s.op.SetStatus(o.Status); err != nil {
-			return err
-		}
-		if o.Status == OperationFailed && s.op.Failure == "" {
-			s.op.Failure = ErrOperationFailed
-			s.op.FailureStatus = o.Snapshot.ProviderStatus
-			if o.Snapshot.Status == PaymentDeclined {
-				s.op.Failure = ErrDeclined
-			}
-		}
-		if o.ProviderReference != "" {
-			s.payment.ProviderReference = o.ProviderReference
-		}
-		if o.OperationReference != "" {
-			s.op.ProviderReference = o.OperationReference
-		}
-		change, err := s.payment.Apply(o.Snapshot, e.config.Now().UTC())
-		if err != nil {
-			return err
-		}
-		if !earlierOperation {
-			s.op.PaymentVersion = s.payment.Version
-		}
-		if err := tx.UpdatePayment(s.payment); err != nil {
-			return err
-		}
-		if err := tx.UpdateOperation(s.op); err != nil {
-			return err
-		}
-		if err := e.audit(tx, s, change, source); err != nil {
-			return err
-		}
-		if o.Status == OperationSucceeded && fullyCollected(s.payment) {
-			entry := OutboxEntry{
-				Scope: s.payment.Scope, ID: s.payment.ID, PaymentID: s.payment.ID, OrderID: s.payment.OrderID,
-				OperationID: s.op.ID, Version: s.payment.Version, At: change.At,
-			}
-			if err := tx.Enqueue(entry); err != nil {
-				return err
-			}
-		}
-		final = s
-		return nil
+		var err error
+		final, err = e.applyTx(tx, original, o, source)
+		return err
 	})
 	return final, err
+}
+
+func (e *Engine) applyTx(tx Tx, original state, o Observation, source string) (state, error) {
+	id := original.op.ID
+	if source == "webhook" {
+		if o.Scope != e.config.Scope || o.MerchantAccount != e.config.MerchantAccount {
+			return state{}, fmt.Errorf("%w: wrong callback account", ErrConflict)
+		}
+		id = o.OperationID
+		if id == "" {
+			rec, err := tx.OperationByReference(o.Scope, o.PaymentID, o.OperationReference)
+			if err != nil {
+				return state{}, err
+			}
+			id = rec.ID
+		}
+	}
+	s, err := e.load(tx, id)
+	if err != nil {
+		return state{}, err
+	}
+	if err := bind(s, o); err != nil {
+		return state{}, err
+	}
+	// A mutation reply is fenced by its original reservation. Cumulative
+	// settlement/return/dispute evidence may refer to an older operation.
+	versionChanged := s.payment.Version != original.payment.Version
+	if source == "response" && (versionChanged || s.op != original.op) {
+		return s, nil
+	}
+	earlierOperation := s.op.PaymentVersion != s.payment.Version
+	if source == "query" && versionChanged && !earlierOperation {
+		return s, nil
+	}
+	if earlierOperation && !s.canReconcile(o, source) {
+		return state{}, fmt.Errorf("%w: stale observation for an earlier payment version", ErrConflict)
+	}
+	if active, err := tx.ActiveOperation(s.payment.Scope, s.payment.ID); err == nil && active.ID != s.op.ID {
+		return state{}, fmt.Errorf("%w: another operation is in progress", ErrConflict)
+	} else if err != nil && !errors.Is(err, ErrNotFound) {
+		return state{}, err
+	}
+	o.Snapshot = o.Snapshot.principalSnapshot(s.payment.Status)
+	o.Snapshot.ProviderStatus = sanitizeStatus(o.Snapshot.ProviderStatus)
+	o.Snapshot.Action.ExpiresAt = o.Snapshot.Action.ExpiresAt.UTC()
+	if err := validateOutcome(s, o, source); err != nil {
+		return state{}, err
+	}
+	if s.op.Status == o.Status && s.payment.Snapshot == o.Snapshot &&
+		(o.ProviderReference == "" || s.payment.ProviderReference == o.ProviderReference) &&
+		(o.OperationReference == "" || s.op.ProviderReference == o.OperationReference) {
+		return s, nil
+	}
+
+	if err := s.op.SetStatus(o.Status); err != nil {
+		return state{}, err
+	}
+	if o.Status == OperationFailed && s.op.Failure == "" {
+		s.op.Failure = ErrOperationFailed
+		s.op.FailureStatus = o.Snapshot.ProviderStatus
+		if o.Snapshot.Status == PaymentDeclined {
+			s.op.Failure = ErrDeclined
+		}
+	}
+	if o.ProviderReference != "" {
+		s.payment.ProviderReference = o.ProviderReference
+	}
+	if o.OperationReference != "" {
+		s.op.ProviderReference = o.OperationReference
+	}
+	change, err := s.payment.Apply(o.Snapshot, e.config.Now().UTC())
+	if err != nil {
+		return state{}, err
+	}
+	if !earlierOperation {
+		s.op.PaymentVersion = s.payment.Version
+	}
+	if err := tx.UpdatePayment(s.payment); err != nil {
+		return state{}, err
+	}
+	if err := tx.UpdateOperation(s.op); err != nil {
+		return state{}, err
+	}
+	if err := e.audit(tx, s, change, source); err != nil {
+		return state{}, err
+	}
+	if o.Status == OperationSucceeded && fullyCollected(s.payment) {
+		entry := OutboxEntry{
+			Scope: s.payment.Scope, ID: s.payment.ID, PaymentID: s.payment.ID, OrderID: s.payment.OrderID,
+			OperationID: s.op.ID, Version: s.payment.Version, At: change.At,
+		}
+		if err := tx.Enqueue(entry); err != nil {
+			return state{}, err
+		}
+	}
+	return s, nil
 }
 
 // Older reservations may contribute independent cumulative facts. Their

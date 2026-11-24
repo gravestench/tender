@@ -4,8 +4,10 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"maps"
 	"slices"
+	"time"
 
 	"github.com/gravestench/tender"
 	"github.com/gravestench/tender/store/internal/binding"
@@ -15,7 +17,13 @@ type key struct {
 	scope tender.Scope
 	id    string
 }
+type inboxEvent struct {
+	evidence  json.RawMessage
+	processed bool
+}
+
 type memoryTx struct {
+	events     map[tender.VerifiedEventKey]inboxEvent
 	payments   map[key]tender.Payment
 	operations map[key]tender.OperationRecord
 	history    []tender.AuditEntry
@@ -29,7 +37,7 @@ type Memory struct {
 }
 
 func NewMemory() *Memory {
-	return &Memory{lock: make(chan struct{}, 1), state: memoryTx{payments: make(map[key]tender.Payment), operations: make(map[key]tender.OperationRecord)}}
+	return &Memory{lock: make(chan struct{}, 1), state: memoryTx{events: make(map[tender.VerifiedEventKey]inboxEvent), payments: make(map[key]tender.Payment), operations: make(map[key]tender.OperationRecord)}}
 }
 
 func (m *Memory) acquire(ctx context.Context) error {
@@ -50,6 +58,7 @@ func (m *Memory) Transact(ctx context.Context, fn func(tender.Tx) error) error {
 		return err
 	}
 	tx := memoryTx{
+		events:   maps.Clone(m.state.events),
 		payments: maps.Clone(m.state.payments), operations: maps.Clone(m.state.operations),
 		history: slices.Clone(m.state.history), outbox: slices.Clone(m.state.outbox),
 	}
@@ -230,4 +239,31 @@ func (m *Memory) Outbox(ctx context.Context, scope tender.Scope) ([]tender.Outbo
 		}
 	}
 	return rows, nil
+}
+
+func (t *memoryTx) InsertVerifiedEvent(key tender.VerifiedEventKey, evidence json.RawMessage) error {
+	if !json.Valid(evidence) {
+		return tender.ErrValidation
+	}
+	if _, found := t.events[key]; found {
+		return tender.ErrConflict
+	}
+	t.events[key] = inboxEvent{evidence: slices.Clone(evidence)}
+	return nil
+}
+
+func (t *memoryTx) ProcessVerifiedEvent(key tender.VerifiedEventKey, _ time.Time, apply func(json.RawMessage) error) error {
+	event, found := t.events[key]
+	if !found {
+		return tender.ErrNotFound
+	}
+	if event.processed {
+		return nil
+	}
+	if err := apply(slices.Clone(event.evidence)); err != nil {
+		return err
+	}
+	event.processed = true
+	t.events[key] = event
+	return nil
 }

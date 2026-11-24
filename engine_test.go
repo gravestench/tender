@@ -1,7 +1,9 @@
 package tender_test
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"sync/atomic"
 	"testing"
@@ -897,5 +899,47 @@ func TestRetryCreateRejectsAmbiguousTransport(t *testing.T) {
 	next.Key = "retry"
 	if _, err := e.RetryCreate(t.Context(), r.Operation.ID, next); !errors.Is(err, tender.ErrConflict) || p.calls.Load() != 1 {
 		t.Fatalf("retried ambiguous create: %v %d", err, p.calls.Load())
+	}
+}
+
+func TestVerifiedInboxBindsPersistedIdentity(t *testing.T) {
+	ctx := t.Context()
+	db := store.NewMemory()
+	var r tender.ProviderRequest
+	p := &processor{execute: func(_ context.Context, req tender.ProviderRequest) (tender.Observation, error) {
+		r = req
+		return tender.Observation{}, tender.ErrUnknownOutcome
+	}}
+	e := openEngine(t, db, p, shop)
+	if _, err := e.Create(ctx, purchase()); !errors.Is(err, tender.ErrUnknownOutcome) {
+		t.Fatal(err)
+	}
+	key := tender.VerifiedEventKey{Scope: shop, Provider: "acquirer", MerchantAccount: "merchant-account", ID: "event-1"}
+	body := json.RawMessage(`{"verified":"event-1"}`)
+	if err := db.Transact(ctx, func(tx tender.Tx) error { return tx.(tender.VerifiedEventTx).InsertVerifiedEvent(key, body) }); err != nil {
+		t.Fatal(err)
+	}
+	original := tender.VerifiedEvent{ID: key.ID, Provider: key.Provider, Observation: observed(r, tender.PaymentCaptured, tender.Funds{Authorized: 100, Captured: 100})}
+	for _, change := range []func(*tender.VerifiedEvent){func(v *tender.VerifiedEvent) { v.ID = "other" }, func(v *tender.VerifiedEvent) { v.Provider = "other" }, func(v *tender.VerifiedEvent) { v.Observation.Scope.MerchantID = "other" }, func(v *tender.VerifiedEvent) { v.Observation.MerchantAccount = "other" }} {
+		err := e.ProcessVerifiedEvent(ctx, key.ID, func(b json.RawMessage) (tender.VerifiedEvent, error) {
+			if !bytes.Equal(b, body) {
+				t.Fatalf("wrong inbox record: %q", b)
+			}
+			v := original
+			change(&v)
+			return v, nil
+		})
+		if !errors.Is(err, tender.ErrConflict) {
+			t.Fatalf("mismatched signed event consumed: %v", err)
+		}
+	}
+	if err := e.ProcessVerifiedEvent(ctx, key.ID, func(json.RawMessage) (tender.VerifiedEvent, error) { return original, nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.ProcessVerifiedEvent(ctx, key.ID, func(json.RawMessage) (tender.VerifiedEvent, error) {
+		t.Fatal("processed event normalized a second time")
+		return tender.VerifiedEvent{}, nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -6,8 +6,11 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -57,12 +60,18 @@ func postgresFixture(t *testing.T) func() *sql.DB {
 		return db
 	}
 	db := open()
-	migration, err := postgres.Migrations.ReadFile("migrations/001_initial.up.sql")
+	paths, err := fs.Glob(postgres.Migrations, "migrations/*.up.sql")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.ExecContext(t.Context(), string(migration)); err != nil {
-		t.Fatal(err)
+	for _, path := range paths {
+		migration, err := postgres.Migrations.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(t.Context(), string(migration)); err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
 	}
 	db.Close()
 	return open
@@ -452,5 +461,164 @@ func TestPostgresConflictingOperationsAbsentKeys(t *testing.T) {
 	first, second := <-outcomes, <-outcomes
 	if callbacks.Load() != 2 || !(first == nil && errors.Is(second, tender.ErrConflict) || second == nil && errors.Is(first, tender.ErrConflict)) {
 		t.Fatalf("conflicting absent reads returned %v and %v in %d callbacks", first, second, callbacks.Load())
+	}
+}
+
+func TestPostgresLongOpaqueReferences(t *testing.T) {
+	open := postgresFixture(t)
+	ctx := t.Context()
+	db := open()
+	s := postgres.New(db)
+	var bytes [3200]byte
+	rand.Read(bytes[:])
+	ref := base64.RawURLEncoding.EncodeToString(bytes[:])
+	opRef := "op-" + ref
+	p := storageProvider{execute: func(r tender.ProviderRequest) (tender.Observation, error) {
+		o := storageObservation(r, tender.PaymentCaptured, tender.Funds{Authorized: 100, Captured: 100})
+		o.ProviderReference = ref
+		o.OperationReference = opRef
+		return o, nil
+	}}
+	got, err := storageEngine(t, db, p, nil).Create(ctx, dbPurchase)
+	if err != nil {
+		t.Fatalf("successful external charge could not commit: %v", err)
+	}
+	err = s.Transact(ctx, func(tx tender.Tx) error {
+		o, err := tx.OperationByReference(dbScope, got.Payment.ID, opRef)
+		if err != nil {
+			return err
+		}
+		if o.ProviderReference != opRef || got.Payment.ProviderReference != ref {
+			return fmt.Errorf("reference truncated")
+		}
+		_, err = tx.OperationByReference(dbScope, got.Payment.ID, opRef+"x")
+		return err
+	})
+	if !errors.Is(err, tender.ErrNotFound) {
+		t.Fatalf("exact lookup: %v", err)
+	}
+	duplicate := got.Payment
+	duplicate.ID = "p2"
+	duplicate.OrderID = "o2"
+	duplicate.AttemptID = "a2"
+	if err := s.Transact(ctx, func(tx tender.Tx) error { return tx.InsertPayment(duplicate) }); !errors.Is(err, tender.ErrConflict) {
+		t.Fatalf("same route duplicate: %v", err)
+	}
+	duplicate.MerchantAccount = "other"
+	if err := s.Transact(ctx, func(tx tender.Tx) error { return tx.InsertPayment(duplicate) }); err != nil {
+		t.Fatalf("independent account reference: %v", err)
+	}
+}
+
+func TestPostgresReconciliationRoute(t *testing.T) {
+	open := postgresFixture(t)
+	db := open()
+	ctx := t.Context()
+	s := postgres.New(db)
+	for _, acct := range []string{"one", "two"} {
+		p := tender.Payment{Scope: dbScope, ID: acct, OrderID: acct, AttemptID: acct, Provider: "processor", MerchantAccount: acct, ProviderReference: "same-reference", Amount: dbPurchase.Amount, Version: 1}
+		if err := s.Transact(ctx, func(tx tender.Tx) error { return tx.InsertPayment(p) }); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO tender_reconciliation_runs(merchant_id,environment,provider,merchant_account,run_id,report_id) VALUES ('shop','MOCK','processor','one','run','report')`); err != nil {
+		t.Fatal(err)
+	}
+	const match = `INSERT INTO tender_reconciliation_history(merchant_id,environment,provider,merchant_account,run_id,line_id,payment_id,outcome,evidence) VALUES ('shop','MOCK','processor','one','run','line',$1,'matched','{}')`
+	if _, err := db.ExecContext(ctx, match, "two"); err == nil {
+		t.Fatal("report from account one matched a payment from account two")
+	}
+	if _, err := db.ExecContext(ctx, match, "one"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPostgresAtomicVerifiedReceipt(t *testing.T) {
+	open := postgresFixture(t)
+	ctx := t.Context()
+	db := open()
+	var capture tender.Observation
+	p := storageProvider{execute: func(r tender.ProviderRequest) (tender.Observation, error) {
+		if r.Operation.Kind == tender.OpRefund {
+			return storageObservation(r, tender.PaymentCaptured, tender.Funds{Authorized: 100, Captured: 100, Refunded: 30}), nil
+		}
+		capture = storageObservation(r, tender.PaymentCaptured, tender.Funds{Authorized: 100, Captured: 100})
+		return tender.Observation{}, tender.ErrUnknownOutcome
+	}}
+	e := storageEngine(t, db, p, nil)
+	if _, err := e.Create(ctx, dbPurchase); !errors.Is(err, tender.ErrUnknownOutcome) {
+		t.Fatal(err)
+	}
+	wire := tender.VerifiedEvent{ID: "capture-event", Provider: "processor", Observation: capture}
+	evidence, err := json.Marshal(wire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := tender.VerifiedEventKey{Scope: dbScope, Provider: "processor", MerchantAccount: "account", ID: wire.ID}
+	err = postgres.New(db).Transact(ctx, func(tx tender.Tx) error { return tx.(tender.VerifiedEventTx).InsertVerifiedEvent(key, evidence) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	process := func() error {
+		return e.ProcessVerifiedEvent(ctx, "capture-event", func(b json.RawMessage) (tender.VerifiedEvent, error) {
+			var event tender.VerifiedEvent
+			err := json.Unmarshal(b, &event)
+			return event, err
+		})
+	}
+	if _, err := db.ExecContext(ctx, `ALTER TABLE tender_outbox ADD CONSTRAINT reject_outbox CHECK (false)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := process(); err == nil {
+		t.Fatal("outbox failure acknowledged verified capture")
+	}
+	var applied bool
+	const check = `SELECT processed_at IS NOT NULL FROM tender_provider_events WHERE event_id='capture-event'`
+	if err := db.QueryRowContext(ctx, check).Scan(&applied); err != nil || applied {
+		t.Fatalf("failed event marked applied: %t %v", applied, err)
+	}
+	if _, err := db.ExecContext(ctx, `ALTER TABLE tender_outbox DROP CONSTRAINT reject_outbox`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `ALTER TABLE tender_provider_events ADD CONSTRAINT fail_receipt CHECK (processed_at IS NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := process(); err == nil {
+		t.Fatal("receipt failure left capture applied")
+	}
+	before, err := e.Get(ctx, dbPurchase.PaymentID)
+	if err != nil || before.Version != 1 || before.Funds.Captured != 0 {
+		t.Fatalf("capture survived receipt failure: %+v, %v", before, err)
+	}
+	notices, err := postgres.New(db).Outbox(ctx, dbScope)
+	if err != nil || len(notices) != 0 {
+		t.Fatalf("outbox survived receipt failure: %+v %v", notices, err)
+	}
+	if _, err := db.ExecContext(ctx, `ALTER TABLE tender_provider_events DROP CONSTRAINT fail_receipt`); err != nil {
+		t.Fatal(err)
+	}
+	if err := process(); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	db = open()
+	e = storageEngine(t, db, p, nil)
+	req := tender.Request{PaymentID: dbPurchase.PaymentID, Key: "refund", Amount: tender.Money{Minor: 30, Currency: "USD"}}
+	if _, err := e.Refund(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	if err := process(); err != nil {
+		t.Fatalf("capture delivery replay after refund: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, check).Scan(&applied); err != nil || !applied {
+		t.Fatalf("successful event lacks receipt: %t %v", applied, err)
+	}
+	got, err := e.Get(ctx, dbPurchase.PaymentID)
+	if err != nil || got.Funds.Refunded != 30 || got.Version != 3 {
+		t.Fatalf("replay changed payment: %+v, %v", got, err)
+	}
+	out, err := postgres.New(db).Outbox(ctx, dbScope)
+	if err != nil || len(out) != 1 {
+		t.Fatalf("collection notices %v, %v", out, err)
 	}
 }
