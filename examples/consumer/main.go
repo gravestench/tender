@@ -66,6 +66,9 @@ type app struct {
 
 type links struct{ Origin, Guest, Account string }
 
+// Each optional MOCK checkout registers its own mounts during package initialization.
+var mockCheckoutInstallers = map[string]func(*app, *http.ServeMux, tender.Store) (func(), error){}
+
 func main() {
 	addr := flag.String("listen", "127.0.0.1:8080", "loopback IP and port")
 	env := flag.String("environment", "MOCK", "MOCK or SANDBOX (Adyen test merchant only)")
@@ -77,7 +80,8 @@ func main() {
 
 func run(addr, env string) error {
 	provider := os.Getenv("TENDER_CONSUMER_PROVIDER")
-	if provider != "" && provider != "adyen" {
+	installMock := mockCheckoutInstallers[provider]
+	if provider != "" && provider != "adyen" && installMock == nil {
 		return errors.New("consumer: unknown checkout provider")
 	}
 	if env != string(tender.EnvironmentMock) && !(provider == "adyen" && env == string(tender.EnvironmentSandbox)) {
@@ -114,6 +118,12 @@ func run(addr, env string) error {
 	a := &app{scope: tender.Scope{MerchantID: scope.MerchantID, Environment: tender.Environment(env)}, market: market, ledger: db, origin: origin, sessions: make(map[string]session), tickets: make(map[string]order)}
 	if provider == "adyen" {
 		cleanup, err := a.installCardCheckout(mux, storage)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+	} else if installMock != nil {
+		cleanup, err := installMock(a, mux, storage)
 		if err != nil {
 			return err
 		}
@@ -312,7 +322,7 @@ func (a *app) read(ctx context.Context, o order) (orderStatus, bool, error) {
 		return st, false, errors.New("order binding changed")
 	}
 	st.PaymentID, st.Status = p.ID, string(p.Status)
-	if a.card != nil {
+	if a.card != nil || mockCheckoutInstallers[a.provider] != nil {
 		st.Funds = &p.Funds
 	}
 	if a.ledger != nil {

@@ -169,62 +169,14 @@ func (a *app) installCardCheckout(mux *http.ServeMux, storage tender.Store) (fun
 		})
 	}
 	mux.HandleFunc("POST /operator/orders/{order}/{operation}", a.operator)
-	ctx, stop := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		for {
-			if ctx.Err() != nil {
-				return
-			}
-			a.processCardEvents(ctx, wh)
-			select {
-			case <-ctx.Done():
-				return
-			case <-wake:
-			case <-ticker.C:
-			}
-		}
-	}()
+	stop := a.startCheckoutWorker(wake, wh)
 	success = true
 	return func() {
 		stop()
-		<-done
 		if sim != nil {
 			sim.Close()
 		}
 	}, nil
-}
-
-// The inbox survives dropped wakes and restarts. Close the reader before using
-// more connections. Unmatched or temporarily conflicting receipts remain pending.
-func (a *app) processCardEvents(ctx context.Context, h *webhook.Adyen) {
-	rows, err := a.ledger.QueryContext(ctx, `SELECT event_id FROM tender_provider_events WHERE merchant_id=$1 AND environment=$2 AND provider='adyen' AND merchant_account=$3 AND processed_at IS NULL ORDER BY received_at,event_id`, a.scope.MerchantID, a.scope.Environment, a.account)
-	if err != nil {
-		return
-	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if rows.Scan(&id) != nil {
-			rows.Close()
-			return
-		}
-		ids = append(ids, id)
-	}
-	err = rows.Err()
-	rows.Close()
-	if err != nil {
-		return
-	}
-	for _, id := range ids {
-		_ = h.Process(ctx, id)
-	}
-	for _, o := range orders {
-		_ = a.project(ctx, o)
-	}
 }
 
 func decodeStrict(r io.Reader, out any) bool {
