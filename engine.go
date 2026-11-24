@@ -603,12 +603,22 @@ func (e *Engine) applyTx(tx Tx, original state, o Observation, source string) (s
 		return state{}, err
 	}
 
+	failureReference := o.OperationReference
+	if o.AutomaticCaptureReference != "" && !o.CaptureFailure {
+		return state{}, ErrConflict
+	}
 	if o.CaptureFailure {
+		manual := s.op.Kind == OpCapture && o.OperationReference != "" && o.AutomaticCaptureReference == ""
+		automatic := s.payment.Market.Method == MethodACH && (s.op.Kind == OpCreate || s.op.Kind == OpConfirm) &&
+			o.AutomaticCaptureReference != "" && o.AutomaticCaptureReference != o.ProviderReference && o.OperationReference == ""
+		if automatic {
+			failureReference = o.AutomaticCaptureReference
+		}
 		status := OperationFailed
 		if s.op.Status == OperationSucceeded {
 			status = OperationSucceeded
 		}
-		if source != "webhook" || s.op.Kind != OpCapture || o.ProviderReference == "" || o.OperationReference == "" ||
+		if source != "webhook" || (!manual && !automatic) || o.ProviderReference == "" ||
 			o.Snapshot.Status != PaymentCaptureFailed || o.Snapshot.Funds != s.payment.Funds || o.Status != status {
 			return state{}, ErrConflict
 		}
@@ -663,7 +673,7 @@ func (e *Engine) applyTx(tx Tx, original state, o Observation, source string) (s
 		notice := CaptureFailureNotice{
 			Scope: s.payment.Scope, Provider: s.payment.Provider, MerchantAccount: s.payment.MerchantAccount,
 			PaymentID: s.payment.ID, OrderID: s.payment.OrderID, OperationID: s.op.ID,
-			ProviderReference: o.ProviderReference, OperationReference: o.OperationReference, Amount: o.Amount, At: at,
+			ProviderReference: o.ProviderReference, OperationReference: failureReference, Amount: o.Amount, At: at,
 		}
 		if err := review.EnqueueCaptureFailure(notice); err != nil {
 			return state{}, err

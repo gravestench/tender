@@ -158,6 +158,15 @@ func ApplySettlement(ctx context.Context, db tender.Store, engine *tender.Engine
 		snap.Action = tender.CustomerAction{}
 		switch l.Type {
 		case "Settled":
+			// A report worker can run before the failure worker. Refuse a
+			// contradictory settlement until the host resolves the failed debit.
+			failed, err := matchingReceipt(tx, p, l, "CAPTURE_FAILED")
+			if err != nil {
+				return tender.VerifiedEvent{}, err
+			}
+			if failed || p.Status == tender.PaymentCaptureFailed {
+				return tender.VerifiedEvent{}, tender.ErrConflict
+			}
 			snap.Funds.Settled = p.Amount.Minor
 			if snap.Funds.Returned == 0 {
 				held, err := matchingReceipt(tx, p, l, "CHARGEBACK")
@@ -169,10 +178,20 @@ func ApplySettlement(ctx context.Context, db tender.Store, engine *tender.Engine
 				}
 			}
 		case "Chargeback":
+			found, err := matchingReceipt(tx, p, l, "CHARGEBACK")
+			if err != nil {
+				return tender.VerifiedEvent{}, err
+			}
+			if !found {
+				return tender.VerifiedEvent{}, tender.ErrConflict
+			}
 			snap.Funds.Returned = p.Amount.Minor
 		}
 		snap.VerifiedMethod = tender.MethodACH
-		if snap.Funds.Returned > 0 {
+		if p.Status == tender.PaymentCaptureFailed {
+			snap.Status = p.Status
+			snap.ProviderStatus = p.ProviderStatus
+		} else if snap.Funds.Returned > 0 {
 			snap.Status = tender.PaymentReturned
 			snap.ProviderStatus = "CHARGEBACK"
 		} else {
@@ -191,6 +210,14 @@ func matchingReceipt(tx tender.EventRecords, p tender.Payment, l SettlementLine,
 		return false, tender.ErrUnsupported
 	}
 	fields := map[string]string{"eventCode": code, "merchantReference": l.MerchantReference, "success": "true"}
+	if code == "CAPTURE_FAILED" {
+		// CAPTURE_FAILED identifies a rejected modification. The signed
+		// event code is sufficient to withhold collection pending review.
+		delete(fields, "success")
+	}
+	if code == "CHARGEBACK" && l.Type == "Chargeback" {
+		fields["pspReference"] = l.Modification
+	}
 	if code == "AUTHORISATION" {
 		fields["pspReference"] = l.PSP
 		fields["originalReference"] = ""
@@ -209,7 +236,7 @@ func matchingReceipt(tx tender.EventRecords, p tender.Payment, l SettlementLine,
 				Currency string
 			}
 		}
-		if json.Unmarshal(row, &e) != nil || e.MerchantAccountCode != p.MerchantAccount || e.PspReference == "" || code == "CHARGEBACK" && e.PspReference == l.PSP || e.Amount.Value != p.Amount.Minor || e.Amount.Currency != p.Amount.Currency {
+		if json.Unmarshal(row, &e) != nil || e.MerchantAccountCode != p.MerchantAccount || e.PspReference == "" || code != "AUTHORISATION" && e.PspReference == l.PSP || e.Amount.Value != p.Amount.Minor || e.Amount.Currency != p.Amount.Currency {
 			return false, tender.ErrConflict
 		}
 	}

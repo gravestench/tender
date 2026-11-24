@@ -62,7 +62,7 @@ type Snapshot struct {
 	ProviderStatus string
 }
 
-func (s Snapshot) validate(limit int64, at time.Time) error {
+func (s Snapshot) validate(limit int64, at time.Time, method PaymentMethod) error {
 	if !s.Funds.within(limit) {
 		return fmt.Errorf("%w: inconsistent financial totals", ErrValidation)
 	}
@@ -78,7 +78,7 @@ func (s Snapshot) validate(limit int64, at time.Time) error {
 	case PaymentCreated, PaymentPending, PaymentRequiresAction, PaymentDeclined, PaymentFailed:
 		valid = s.Funds == (Funds{})
 	case PaymentCaptureFailed:
-		valid = s.Funds.Authorized > 0
+		valid = s.Funds.Authorized > 0 || method == MethodACH
 	case PaymentAuthorized:
 		valid = s.Funds.Authorized > 0 && s.Funds.Captured == 0
 	case PaymentPartiallyCaptured:
@@ -98,11 +98,11 @@ func (s Snapshot) validate(limit int64, at time.Time) error {
 	return nil
 }
 
-func (s Snapshot) canAdvance(next Snapshot) bool {
+func (s Snapshot) canAdvance(next Snapshot, method PaymentMethod) bool {
 	if !next.Funds.includes(s.Funds) {
 		return false
 	}
-	if next.Status == PaymentCaptureFailed && s.Funds.Authorized > 0 {
+	if next.Status == PaymentCaptureFailed && (s.Funds.Authorized > 0 || method == MethodACH) {
 		return true
 	}
 	switch s.Status {
@@ -200,7 +200,7 @@ func (p *Payment) Apply(next Snapshot, at time.Time) (Change, error) {
 		current.Status = PaymentPartiallyCaptured
 	}
 	next = next.principalSnapshot(current.Status)
-	if !current.canAdvance(next) {
+	if !current.canAdvance(next, p.Market.Method) {
 		return Change{}, fmt.Errorf("%w: payment transition would reverse a recorded outcome", ErrValidation)
 	}
 	return p.record(next, at, Correction{})
@@ -224,7 +224,7 @@ func (p *Payment) record(next Snapshot, at time.Time, basis Correction) (Change,
 	if err := p.Amount.ValidatePurchase(); err != nil {
 		return Change{}, err
 	}
-	if err := next.validate(p.Amount.Minor, at); err != nil {
+	if err := next.validate(p.Amount.Minor, at, p.Market.Method); err != nil {
 		return Change{}, err
 	}
 	next.ProviderStatus = sanitizeStatus(next.ProviderStatus)

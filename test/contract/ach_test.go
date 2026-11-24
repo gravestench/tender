@@ -4,6 +4,7 @@ package contract_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -82,6 +83,26 @@ func TestACHContract(t *testing.T) {
 			}
 			return v
 		}
+		if loss == "immediate-bank-rejection" {
+			failure := eventFields{psp: "CAPTUREFAIL00001", original: "AUTOBANK00000001", account: testAccount, ref: action.Reference, value: "1234", currency: "USD", code: "CAPTURE_FAILED", success: "false"}
+			post("/notifications", string(notification(failure, true)), 202)
+			select {
+			case id := <-inbox:
+				if err := handler.Process(ctx, id); err != nil {
+					t.Fatal("initial signed bank failure", err)
+				}
+			case <-time.After(4 * time.Second):
+				t.Fatal("failure missing")
+			}
+			p, err := engine.Get(ctx, "debit")
+			if err != nil || p.Status != tender.PaymentCaptureFailed || p.Funds != (tender.Funds{}) || p.ProviderReference != failure.original {
+				t.Fatal("immediate bank rejection", p, err)
+			}
+			if _, err := adapter.CheckoutSession(p); !errors.Is(err, tender.ErrUnsupported) {
+				t.Fatal("reopened a failed debit", err)
+			}
+			return
+		}
 		post("/sim/mock/consent/"+action.ID+"/approve", `{"accountNumber":"synthetic-sentinel"}`, 400)
 		raw := post("/sim/mock/consent/"+action.ID+"/approve", "", 200)
 		var receipt struct{ SessionResult string }
@@ -115,13 +136,13 @@ func TestACHContract(t *testing.T) {
 			if !errors.Is(err, tender.ErrUnknownOutcome) {
 				t.Fatal("lost session result", err)
 			}
-		} else if loss == "" {
+		} else if loss == "" || loss == "capture-failed" || loss == "capture-failed-late" {
 			pending, err = engine.Confirm(ctx, req)
 			if err != nil || pending.Payment.Status != tender.PaymentPending || pending.Payment.Funds != (tender.Funds{}) || returnFirst != (pending.Payment.ProviderReference == "") {
 				t.Fatal("session result", pending, err)
 			}
 		}
-		if loss != "report-first" {
+		if loss != "report-first" && loss != "capture-failed-unbound" {
 			if err = handler.Process(ctx, authID); err != nil {
 				t.Fatal("authorization", err)
 			}
@@ -129,7 +150,7 @@ func TestACHContract(t *testing.T) {
 			if err != nil || pending.Payment.ProviderReference == "" {
 				t.Fatal("signed authorization did not bind PSP", err)
 			}
-			if loss != "" {
+			if loss == "browser" || loss == "result" {
 				if _, err := adapter.CheckoutSession(pending.Payment); !errors.Is(err, tender.ErrUnsupported) {
 					t.Fatal("reopened already submitted bank consent", err)
 				}
@@ -147,7 +168,7 @@ func TestACHContract(t *testing.T) {
 		}
 		defer r.Body.Close()
 		line, err := ach.ReadSettlement(r.Body)
-		if err != nil || line.Gross != 1234 || line.Net != 1209 || loss != "report-first" && line.PSP != pending.Payment.ProviderReference || line.Modification == "" || line.MerchantReference != action.Reference {
+		if err != nil || line.Gross != 1234 || line.Net != 1209 || loss != "report-first" && loss != "capture-failed-unbound" && line.PSP != pending.Payment.ProviderReference || line.Modification == "" || line.MerchantReference != action.Reference {
 			t.Fatal("settlement mapping", line, err)
 		}
 		apply := func(l ach.SettlementLine) error {
@@ -167,6 +188,71 @@ func TestACHContract(t *testing.T) {
 		wrong.Account = "another"
 		if apply(wrong) == nil {
 			t.Fatal("cross-account report accepted")
+		}
+		if strings.HasPrefix(loss, "capture-failed") {
+			late := loss == "capture-failed-late"
+			if late {
+				if err := apply(line); err != nil {
+					t.Fatal(err)
+				}
+			}
+			failure := eventFields{psp: "CAPTUREFAIL00001", original: line.PSP, account: testAccount, ref: action.Reference, value: "1234", currency: "USD", code: "CAPTURE_FAILED", success: "true"}
+			cross := failure
+			cross.original = "OTHERPAYMENT0001"
+
+			post("/notifications", string(notification(cross, true)), 202)
+			if err := handler.Process(ctx, next()); !errors.Is(err, tender.ErrConflict) && !errors.Is(err, tender.ErrNotFound) {
+				t.Errorf("wrong payment failure %v", err)
+			}
+			// Reason and error code are outside the Standard item HMAC. They
+			// must not become a permanent account classification in the ledger.
+			body := string(bytes.Replace(notification(failure, true), []byte(`"additionalData":{`), []byte(`"reason":"1063_101","additionalData":{`), 1))
+			post("/notifications", body, 202)
+			id := next()
+			if !late {
+				if err := apply(line); !errors.Is(err, tender.ErrConflict) {
+					t.Errorf("settlement raced a received capture failure: %v", err)
+				}
+			}
+			for range 2 {
+				if err := handler.Process(ctx, id); err != nil {
+					t.Fatalf("processing correlated automatic capture failure: %v", err)
+				}
+			}
+			p, err := engine.Get(ctx, "debit")
+			want := tender.Funds{}
+			wantCount := 0
+			if late {
+				want.Settled = 1234
+				wantCount = 1
+			}
+			if err != nil || p.Status != tender.PaymentCaptureFailed || p.ProviderStatus != "CAPTURE_FAILED" || p.Funds != want || p.Action != (tender.CustomerAction{}) {
+				t.Fatal("capture failure lost history or left consent open", p, err)
+			}
+			req.Key = "retry"
+			if _, err := engine.Confirm(ctx, req); !errors.Is(err, tender.ErrConflict) {
+				t.Fatal("held debit allowed a retry", err)
+			}
+			out, err := db.Outbox(ctx, dbScope)
+			if err != nil || len(out) != wantCount {
+				t.Fatal("held debit delivered", out, err)
+			}
+			queue := db.(interface {
+				CaptureFailures(context.Context, tender.Scope) ([]tender.CaptureFailureNotice, error)
+			})
+			review, err := queue.CaptureFailures(ctx, dbScope)
+			if err != nil || len(review) != 1 || review[0].OperationReference != failure.psp || review[0].ProviderReference != line.PSP || review[0].PaymentID != "debit" {
+				t.Fatal("missing reviewable capture failure", review, err)
+			}
+			return
+		}
+		unverified := line
+		unverified.Type = "Chargeback"
+		unverified.Modification = "NORETURN00000001"
+		unverified.Gross = -1234
+		unverified.Net = -1234
+		if err := apply(unverified); !errors.Is(err, tender.ErrConflict) {
+			t.Error("return with no matching signed receipt applied", err)
 		}
 		var returnID string
 		if returnFirst {
@@ -211,6 +297,11 @@ func TestACHContract(t *testing.T) {
 		if err != nil || returned.Net != -1234 || returned.Gross != -1234 || returned.PSP != line.PSP {
 			t.Fatal("chargeback report", returned, err)
 		}
+		mismatch := returned
+		mismatch.Modification = "WRONGRETURN00001"
+		if err := apply(mismatch); !errors.Is(err, tender.ErrConflict) {
+			t.Error("unrelated chargeback modification accepted", err)
+		}
 		if err = apply(returned); err != nil {
 			t.Fatal(err)
 		}
@@ -228,6 +319,9 @@ func TestACHContract(t *testing.T) {
 	t.Run("lost-browser-result", func(t *testing.T) { run(t, store.NewMemory(), false, "browser") })
 	t.Run("lost-host-result", func(t *testing.T) { run(t, store.NewMemory(), false, "result") })
 	t.Run("settlement-before-auth-worker", func(t *testing.T) { run(t, store.NewMemory(), false, "report-first") })
+	for _, scenario := range []string{"immediate-bank-rejection", "capture-failed", "capture-failed-late", "capture-failed-unbound"} {
+		t.Run(scenario, func(t *testing.T) { run(t, store.NewMemory(), false, scenario) })
+	}
 	t.Run("postgres", func(t *testing.T) {
 		dsn := os.Getenv("TENDER_TEST_DATABASE_URL")
 		if dsn == "" {
@@ -236,6 +330,12 @@ func TestACHContract(t *testing.T) {
 		if !adyenLocalDatabase(dsn) {
 			t.Fatal("nonlocal SQL")
 		}
-		run(t, postgres.New(postgresFixture(t)()), false, "")
+		for _, scenario := range []string{"", "capture-failed", "capture-failed-late", "capture-failed-unbound"} {
+			name := scenario
+			if name == "" {
+				name = "settled-and-returned"
+			}
+			t.Run(name, func(t *testing.T) { run(t, postgres.New(postgresFixture(t)()), false, scenario) })
+		}
 	})
 }

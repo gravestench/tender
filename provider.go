@@ -182,7 +182,11 @@ func (r *ProviderRequest) BindEvidence(digest [32]byte) error {
 // The engine binds references and checks authority before applying a snapshot.
 type Observation struct {
 	// CaptureFailure records authenticated scheme rejection of this capture.
-	CaptureFailure                        bool
+	CaptureFailure bool
+	// AutomaticCaptureReference identifies a failed provider-initiated bank
+	// capture. Its PSP belongs in the review notice, separately from the
+	// host session operation's already bound provider reference.
+	AutomaticCaptureReference             string
 	Scope                                 Scope
 	MerchantAccount                       string
 	PaymentID, AttemptID, OperationID     string

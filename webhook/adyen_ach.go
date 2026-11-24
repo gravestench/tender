@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"encoding/json"
 	"errors"
 
 	"github.com/gravestench/tender"
@@ -10,7 +11,7 @@ import (
 // result exchange binds its own operation to that same merchant reference.
 func achObservation(tx tender.EventRecords, p tender.Payment, create tender.OperationRecord, e evidence) (tender.Observation, error) {
 	var o tender.Observation
-	if e.Code != "AUTHORISATION" && e.Code != "CHARGEBACK" {
+	if e.Code != "AUTHORISATION" && e.Code != "CHARGEBACK" && e.Code != "CAPTURE_FAILED" {
 		return o, tender.ErrUnsupported
 	}
 	m := tender.Money{Minor: *e.Amount.Value, Currency: e.Amount.Currency}
@@ -55,10 +56,31 @@ func achObservation(tx tender.EventRecords, p tender.Payment, create tender.Oper
 				o.Status = tender.OperationSucceeded
 				o.OperationReference = e.Ref
 			}
-		} else if p.Status != tender.PaymentPending && p.Status != tender.PaymentSettled && p.Status != tender.PaymentReturned {
+		} else if p.Status != tender.PaymentPending && p.Status != tender.PaymentSettled && p.Status != tender.PaymentReturned && p.Status != tender.PaymentCaptureFailed {
 			return o, tender.ErrConflict
 		}
 		o.ProviderReference = e.PSP
+	case "CAPTURE_FAILED":
+		// The signed capture PSP is distinct from both the original payment
+		// and the session/receipt operation reference. Its explanatory reason
+		// and bank-specific decline code are outside the Standard item HMAC.
+		if e.Original == "" || e.Original == e.PSP || p.ProviderReference != "" && e.Original != p.ProviderReference {
+			return o, tender.ErrConflict
+		}
+		if p.ProviderReference == "" {
+			if err := checkACHFailureOriginal(tx, p, e); err != nil {
+				return o, err
+			}
+		}
+		o.ProviderReference = e.Original
+		o.CaptureFailure = true
+		o.AutomaticCaptureReference = e.PSP
+		o.Snapshot.Status = tender.PaymentCaptureFailed
+		o.Snapshot.ProviderStatus = "CAPTURE_FAILED"
+		o.Snapshot.Action = tender.CustomerAction{}
+		if op.Status != tender.OperationSucceeded {
+			o.Status = tender.OperationFailed
+		}
 	case "CHARGEBACK":
 		if e.Success != "true" || e.Original == "" || e.Original != p.ProviderReference || e.PSP == e.Original || op.Status != tender.OperationSucceeded {
 			return o, tender.ErrConflict
@@ -67,6 +89,38 @@ func achObservation(tx tender.EventRecords, p tender.Payment, create tender.Oper
 		o.Snapshot.Status = tender.PaymentReturned
 		o.Snapshot.Funds.Returned = m.Minor
 		o.Snapshot.ProviderStatus = "CHARGEBACK"
+		if p.Status == tender.PaymentCaptureFailed {
+			o.Snapshot.Status = p.Status
+			o.Snapshot.ProviderStatus = p.ProviderStatus
+		}
 	}
 	return o, nil
+}
+
+// A session may include multiple attempted debits. Before the host binds its
+// PSP, a stored positive authorization takes precedence over a failed sibling.
+func checkACHFailureOriginal(tx tender.EventRecords, p tender.Payment, failure evidence) error {
+	reader, ok := tx.(tender.VerifiedEvidenceReader)
+	if !ok {
+		return tender.ErrUnsupported
+	}
+	rows, err := reader.MatchingVerifiedEvidence(p.Scope, p.Provider, p.MerchantAccount, map[string]string{"eventCode": "AUTHORISATION", "success": "true", "merchantReference": failure.Ref, "originalReference": ""})
+	if err != nil {
+		return err
+	}
+	for _, row := range rows {
+		var auth evidence
+		if json.Unmarshal(row, &auth) != nil || auth.Amount.Value == nil {
+			return tender.ErrConflict
+		}
+		if auth.PSP == failure.Original && auth.Account == failure.Account && auth.Amount.Currency == failure.Amount.Currency && *auth.Amount.Value == *failure.Amount.Value {
+			return nil
+		}
+	}
+	if len(rows) > 0 {
+		return tender.ErrConflict
+	}
+	// Even without an authorization, an authenticated failure naming this
+	// session and its original PSP is sufficient to stop collection for review.
+	return nil
 }
