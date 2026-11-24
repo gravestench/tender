@@ -43,6 +43,22 @@ func localTestDatabaseConfig(dsn string) (*pgx.ConnConfig, error) {
 	return cfg, nil
 }
 
+// A dedicated single-session PGlite socket can retain an interrupted child's
+// transaction after the child exits. Native PostgreSQL rolls it back on disconnect.
+func connectDemo(ctx context.Context, cfg *pgx.ConnConfig) (*pgx.Conn, error) {
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if os.Getenv("TENDER_TEST_PGLITE") == "1" {
+		if _, err = conn.Exec(ctx, "ROLLBACK"); err != nil {
+			conn.Close(ctx)
+			return nil, err
+		}
+	}
+	return conn, nil
+}
+
 func demoSchema(t *testing.T, hostSQL ...string) (string, string, *pgx.ConnConfig) {
 	t.Helper()
 	dsn := os.Getenv("TENDER_TEST_DATABASE_URL")
@@ -54,7 +70,7 @@ func demoSchema(t *testing.T, hostSQL ...string) (string, string, *pgx.ConnConfi
 		t.Fatal(err)
 	}
 	ctx := t.Context()
-	conn, err := pgx.ConnectConfig(ctx, cfg)
+	conn, err := connectDemo(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +81,7 @@ func demoSchema(t *testing.T, hostSQL ...string) (string, string, *pgx.ConnConfi
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		conn, err := pgx.ConnectConfig(context.Background(), cfg)
+		conn, err := connectDemo(context.Background(), cfg)
 		if err != nil {
 			t.Error(err)
 			return

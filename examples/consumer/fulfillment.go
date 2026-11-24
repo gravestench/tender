@@ -10,6 +10,7 @@ import (
 
 	"github.com/gravestench/tender"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -80,6 +81,28 @@ FOR UPDATE OF n,p`, a.scope.MerchantID, a.scope.Environment, o.PaymentID, o.ID).
 	if p.Market != a.market || p.Provider != a.provider || p.MerchantAccount != a.account || p.Amount != o.Total || p.Status != tender.PaymentCaptured ||
 		p.Funds.Captured != o.Total.Minor || p.Funds.Refunded != 0 || p.Funds.Returned != 0 || p.Funds.Disputed != 0 {
 		return nil // Hold the notice for host review after any conflicting facts.
+	}
+	if p.Provider == "adyen" {
+		// In this two-order example the inbox table lock orders the final
+		// delivery decision against receipt INSERTs, including on restart.
+		// Never wait while holding the payment lock. A writer that already
+		// won this race leaves the notice for the next projection pass.
+		if _, err = tx.ExecContext(ctx, "LOCK TABLE tender_provider_events IN SHARE MODE NOWAIT"); err != nil {
+			var busy *pgconn.PgError
+			if errors.As(err, &busy) && busy.Code == "55P03" {
+				return nil
+			}
+			return err
+		}
+		var adverse bool
+		err = tx.QueryRowContext(ctx, `SELECT EXISTS (
+ SELECT FROM tender_provider_events
+ WHERE merchant_id=$1 AND environment=$2 AND provider='adyen' AND merchant_account=$3
+ AND evidence->>'eventCode'='CAPTURE_FAILED' AND evidence->>'originalReference'=$4
+ AND evidence#>>'{amount,currency}'=$5)`, p.Scope.MerchantID, p.Scope.Environment, p.MerchantAccount, p.ProviderReference, p.Amount.Currency).Scan(&adverse)
+		if err != nil || adverse {
+			return err
+		}
 	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO consumer_fulfillments (merchant_id,environment,order_id,payment_id,entry_id) VALUES ($1,$2,$3,$4,$5)`, a.scope.MerchantID, a.scope.Environment, o.ID, o.PaymentID, entryID); err != nil {
 		return err

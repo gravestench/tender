@@ -3,8 +3,16 @@
 package e2e_test
 
 import (
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"os/exec"
@@ -13,7 +21,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gravestench/tender"
+	"github.com/gravestench/tender/providers/adyen"
+	"github.com/gravestench/tender/store/postgres"
+	"github.com/gravestench/tender/webhook"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 )
 
 const operatorFixture = "local-test-operator-credential-only"
@@ -225,7 +238,7 @@ func TestAdyenCheckout(t *testing.T) {
 
 func inspectDemo(t *testing.T, cfg *pgx.ConnConfig, schema string) *pgx.Conn {
 	t.Helper()
-	conn, err := pgx.ConnectConfig(t.Context(), cfg)
+	conn, err := connectDemo(t.Context(), cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -273,4 +286,124 @@ func confirmationPath(t *testing.T, p page) string {
 		t.Fatal("no current confirmation form")
 	}
 	return m[1]
+}
+
+// A restarted projector can run before the inbox worker. Force that ordering
+// by making worker completion fail transactionally until the second restart.
+func TestAdyenCheckoutCaptureFailureAtFulfillment(t *testing.T) {
+	for _, late := range []bool{false, true} {
+		t.Run(map[bool]string{false: "receipt before delivery", true: "receipt after delivery"}[late], func(t *testing.T) {
+			dsn, schema, cfg := demoSchema(t)
+			opts := []string{"TENDER_CONSUMER_PROVIDER=adyen", "TENDER_CONSUMER_OPERATOR_KEY=" + operatorFixture, "TENDER_CONSUMER_DATABASE_URL=" + dsn, "TENDER_CONSUMER_SCHEMA=" + schema}
+			t.Run("collect", func(t *testing.T) {
+				d := launch(t, opts...)
+				c := client(t, d.Origin)
+				p := request(t, c, "GET", d.Guest, "", nil)
+				target := d.Origin + p.path
+				f := url.Values{"csrf": {token(t, p)}}
+				prep := request(t, c, "POST", target, d.Origin, f)
+				request(t, c, "POST", d.Origin+confirmationPath(t, prep), d.Origin, f)
+				st := status(t, c, target)
+				if operatorRequest(t, c, d.Origin+"/operator/orders/"+st.OrderID+"/capture") != 202 {
+					t.Fatal("capture failed")
+				}
+				waitCard(t, c, target, "captured", true)
+			})
+			if t.Failed() {
+				return
+			}
+			t.Run("verify and persist failure", func(t *testing.T) {
+				conn := inspectDemo(t, cfg, schema)
+				var psp, original, reference string
+				err := conn.QueryRow(t.Context(), `SELECT evidence->>'pspReference',evidence->>'originalReference',evidence->>'merchantReference' FROM tender_provider_events WHERE evidence->>'eventCode'='CAPTURE' AND processed_at IS NOT NULL`).Scan(&psp, &original, &reference)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !late {
+					// Restore the exact durable state after capture commit and before host delivery.
+					if _, err = conn.Exec(t.Context(), "DELETE FROM consumer_fulfillments"); err != nil {
+						t.Fatal(err)
+					}
+					if _, err = conn.Exec(t.Context(), "UPDATE tender_outbox SET consumed_at=NULL"); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if _, err = conn.Exec(t.Context(), "ALTER TABLE tender_capture_failures ADD CONSTRAINT delay_processing CHECK (false)"); err != nil {
+					t.Fatal(err)
+				}
+				conn.Close(t.Context())
+				poolCfg := cfg.Copy()
+				db := stdlib.OpenDB(*poolCfg, stdlib.OptionAfterConnect(func(ctx context.Context, c *pgx.Conn) error {
+					_, err := c.Exec(ctx, "SET search_path TO "+pgx.Identifier{schema}.Sanitize())
+					return err
+				}))
+				defer db.Close()
+				storage := postgres.New(db)
+				scope := tender.Scope{MerchantID: "consumer-demo", Environment: tender.EnvironmentMock}
+				const account = "TenderFixture"
+				adapter, err := adyen.New(adyen.Config{Environment: tender.EnvironmentMock, Origin: "http://127.0.0.1", ReturnURL: "http://127.0.0.1/return", BaseURL: "http://127.0.0.1/v72", APIKey: "fixture", MerchantAccount: account})
+				if err != nil {
+					t.Fatal(err)
+				}
+				engine, err := tender.NewEngine(tender.EngineConfig{Store: storage, Provider: adapter, ProviderName: "adyen", Scope: scope, Market: tender.Market{Country: "US", Currency: "USD", Method: tender.MethodVisa}, MerchantAccount: account})
+				if err != nil {
+					t.Fatal(err)
+				}
+				key := sha256.Sum256([]byte("Tender offline Adyen fixture only"))
+				h, err := webhook.NewAdyen(webhook.AdyenConfig{Store: storage, Engine: engine, Scope: scope, MerchantAccount: account, HMACKeys: []string{hex.EncodeToString(key[:])}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				mac := hmac.New(sha256.New, key[:])
+				fmt.Fprint(mac, strings.Join([]string{psp, original, account, reference, "2599", "USD", "CAPTURE_FAILED", "true"}, ":"))
+				item := map[string]any{"pspReference": psp, "originalReference": original, "merchantAccountCode": account, "merchantReference": reference, "amount": map[string]any{"currency": "USD", "value": 2599}, "eventCode": "CAPTURE_FAILED", "success": "true", "additionalData": map[string]string{"hmacSignature": base64.StdEncoding.EncodeToString(mac.Sum(nil))}}
+				body, _ := json.Marshal(map[string]any{"live": "false", "notificationItems": []any{map[string]any{"NotificationRequestItem": item}}})
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, httptest.NewRequest("POST", "/webhooks/adyen", bytes.NewReader(body)))
+				if rec.Code != 202 {
+					t.Fatalf("signed event receipt: %d", rec.Code)
+				}
+			})
+			if t.Failed() {
+				return
+			}
+			t.Run("restart before processing", func(t *testing.T) {
+				d := launch(t, opts...)
+				c := client(t, d.Origin)
+				p := request(t, c, "GET", d.Guest, "", nil)
+				got := status(t, c, d.Origin+p.path)
+				if got.Status != "captured" || got.Fulfilled != late {
+					t.Fatalf("receipt already durable, processing held: status %s fulfilled %t", got.Status, got.Fulfilled)
+				}
+			})
+			t.Run("resume worker", func(t *testing.T) {
+				conn := inspectDemo(t, cfg, schema)
+				if _, err := conn.Exec(t.Context(), "ALTER TABLE tender_capture_failures DROP CONSTRAINT delay_processing"); err != nil {
+					t.Fatal(err)
+				}
+			})
+			t.Run("processed", func(t *testing.T) {
+				d := launch(t, opts...)
+				c := client(t, d.Origin)
+				p := request(t, c, "GET", d.Guest, "", nil)
+				waitCard(t, c, d.Origin+p.path, "capture_failed", late)
+			})
+			conn := inspectDemo(t, cfg, schema)
+			var reviews, consumed int
+			wantConsumed := 0
+			if late {
+				wantConsumed = 1
+			}
+			if err := conn.QueryRow(t.Context(), `SELECT (SELECT count(*) FROM tender_capture_failures WHERE reviewed_at IS NULL),(SELECT count(*) FROM tender_outbox WHERE consumed_at IS NOT NULL)`).Scan(&reviews, &consumed); err != nil || reviews != 1 || consumed != wantConsumed {
+				t.Fatalf("review %d, consumed %d, err %v", reviews, consumed, err)
+			}
+		})
+	}
+}
+
+func TestAdyenCheckoutBrowserPolicy(t *testing.T) {
+	cmd := exec.CommandContext(t.Context(), "node", "--test", "../../examples/consumer/browser-guard.test.cjs")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("checkout browser policy: %s: %v", out, err)
+	}
 }

@@ -243,6 +243,12 @@ func TestAdyenContract(t *testing.T) {
 				r.Token = fmt.Sprintf(`{"details":{"threeDSResult":%q}}`, action.Action.Token)
 				res, err = h.e.Confirm(t.Context(), r)
 			}
+			if tc.first == "IdentifyShopper" && res.Payment.ProviderStatus != "FingerprintUnavailable" {
+				t.Fatalf("fingerprint discriminator = %q", res.Payment.ProviderStatus)
+			}
+			if tc.first != "IdentifyShopper" && tc.want == tender.PaymentPending && res.Payment.ProviderStatus != "ActionUnavailable" {
+				t.Fatalf("unrelated blocked action misclassified as %q", res.Payment.ProviderStatus)
+			}
 			if (err != nil && !errors.Is(err, tender.ErrDeclined)) || res.Payment.Status != tc.want || res.Payment.Action.Data != "" {
 				t.Fatalf("gated outcome = %+v %v", res, err)
 			}

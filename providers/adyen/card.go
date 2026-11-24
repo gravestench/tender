@@ -215,7 +215,11 @@ func (a *Adapter) confirm(ctx context.Context, r tender.ProviderRequest, o tende
 			return a.action(o, CardAction{Type: "threeDS2", Reference: ref, Action: &n})
 		}
 		o.Status = tender.OperationPending
-		o.Snapshot = tender.Snapshot{Status: tender.PaymentPending, ProviderStatus: "ActionUnavailable"}
+		blocked := "ActionUnavailable"
+		if reply.ResultCode == "IdentifyShopper" && strict(string(reply.Action), &n) && n.Type == "threeDS2" && n.Subtype == "fingerprint" && n.PaymentMethodType == "scheme" && strings.TrimSpace(n.Token) != "" && strings.TrimSpace(n.PaymentData) != "" {
+			blocked = "FingerprintUnavailable"
+		}
+		o.Snapshot = tender.Snapshot{Status: tender.PaymentPending, ProviderStatus: blocked}
 		return o, nil
 	}
 	switch reply.ResultCode {

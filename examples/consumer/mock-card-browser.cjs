@@ -1,10 +1,7 @@
 const assert = require("node:assert/strict");
 const { chromium } = require(process.env.TENDER_PLAYWRIGHT || "playwright");
 (async () => {
-  const browser = await chromium.launch({
-    executablePath: process.env.TENDER_CHROMIUM || undefined,
-    args: ["--disable-background-networking", "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1", "--no-proxy-server"],
-  });
+  const browser = await require("./browser-guard.cjs").launchBrowser(chromium,[process.env.TENDER_ORIGIN]);
   try {
     const mobile = process.env.TENDER_VIEW === "RedirectShopper";
     const viewport = mobile ? {width:390,height:844} : {width:1200,height:900};

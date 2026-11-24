@@ -8,15 +8,15 @@ Updated November 24, 2026. The verified checkout slice uses the v72 Advanced flo
 | Mastercard cancellation | Direct synthetic challenge survived refresh. A stale form could not advance the challenge. A fresh details request authorized the payment. Signed cancellation voided it with zero fulfillments. | BLOCKED |
 | Decline and abandoned order | Refused payment displayed declined. An abandoned prepared order survived restart. Advancing its stored deadline disabled submission without creating a collection. | BLOCKED |
 | Browser containment | Chromium on a 390 × 844 mobile-emulated viewport refreshed and submitted the synthetic Adyen checkout on one loopback origin. A provider redirect displayed the review state without a new page or external request. A 1200 × 900 desktop Chromium instance exercised the blocked unknown action. Desktop Chromium also submitted the original synthetic checkout. Both fixtures checked for credential inputs while the active form was visible. | Physical mobile browsers, hosted fields, issuer UI and desktop sandbox remain BLOCKED. |
-| Native 3DS | The adapter, action gate and mock handle only direct native challenges. Unknown actions, redirects and fingerprint actions stop in checkout. A popup action mode fails the host policy. | BLOCKED for direct challenge. Adyen's fingerprint-dependent frictionless case is **unsupported**. |
-| SQL and webhooks | pgx ran the Tender migrations and host ledger on PostgreSQL 17.5 WASM/PGlite. HMAC-verified HTTP deliveries drove the SQL inbox and fulfillment. | Native multi-session PostgreSQL, merchant-generated webhooks and Customer Area reconciliation are outstanding. |
+| Native 3DS | The adapter, action gate and mock handle only direct native challenges. The protected runner requires the exact `FingerprintUnavailable` provider observation when it checks a blocked fingerprint. Unknown actions, redirects and fingerprint actions stop in checkout. A popup action mode fails the host policy. | BLOCKED for direct challenge. Adyen's fingerprint-dependent frictionless case is **unsupported**. |
+| SQL and webhooks | pgx ran the Tender migrations and host ledger on PostgreSQL 17.5 WASM/PGlite. HMAC-verified deliveries drove the SQL inbox and fulfillment. A restart with an unprocessed, verified capture failure held the collection notice. A failure arriving after delivery kept the single delivery and created a compensation review item. | Native multi-session PostgreSQL, merchant-generated webhooks and Customer Area reconciliation are outstanding. |
 | Independent module | The consumer builds with `GOWORK=off` and the development module replacement. | Published-tag import awaits a qualified tag. |
 
 The sandbox integration pins both 6.45.2 test-CDN resources with SHA-384 integrity values. Card numbers and security codes belong in the provider's hosted fields. The host projects encrypted JWE fields and the allowed browser metadata into a transient confirmation. The SDK runs in an iframe with a response sandbox that omits top navigation and popup permissions. A direct challenge additionally needs a complete native token, the approved test ACS origin and Adyen's test notification origin. The SDK fingerprint component can dispatch a redirect itself. It is excluded from the supported browser actions. [Pinned Card source](https://github.com/Adyen/adyen-web/blob/v6.45.2/packages/lib/src/components/Card/Card.tsx) · [Pinned SDK](https://checkoutshopper-test.cdn.adyen.com/checkoutshopper/sdk/6.45.2/adyen.js) · [Official embedding guidance](https://docs.adyen.com/standard/integration/drop-in/best-practices)
 
 ## Reproduce the offline evidence
 
-Supply a disposable local PostgreSQL instance in `TENDER_TEST_DATABASE_URL` with schema creation privileges. Install Chromium and Playwright before the offline run. `TENDER_PLAYWRIGHT` and `TENDER_CHROMIUM` can point to existing installations. Each SQL checkout case owns and removes a fresh schema. Follow the [consumer setup](../../examples/consumer/README.md).
+Supply a disposable local PostgreSQL instance in `TENDER_TEST_DATABASE_URL` with schema creation privileges. For a dedicated single-session PGlite server, set `TENDER_TEST_PGLITE=1` so the test harness rolls back an interrupted child's transaction on reconnect. Install Chromium, Playwright and OpenSSL before the offline run. OpenSSL generates temporary certificates for the local HTTPS redirect tests. `TENDER_PLAYWRIGHT` and `TENDER_CHROMIUM` can point to existing installations. Each SQL checkout case owns and removes a fresh schema. Follow the [consumer setup](../../examples/consumer/README.md).
 
 ```sh
 GOPROXY=off go test -count=1 -tags=e2e ./test/e2e/... -run TestAdyenCheckout
@@ -27,13 +27,22 @@ GOPROXY=off go test -race -count=1 -tags=e2e,integration ./test/e2e/...
 
 ## Run a protected sandbox qualification
 
-Configure the test merchant, registered HTTPS origin, callback and shopper described in the consumer README. The explicit command fails with **BLOCKED** when the API key, public test client key, merchant account, webhook HMAC key or registered origin is missing. No merchant credential, transaction, callback delivery or portal export was available for this record.
+Configure the test merchant, controlled HTTPS origins, callbacks and shopper described in the consumer README. The first phase exercises the browser and the second reads accounting evidence after the operator captures and refunds. Missing credentials, registered origins, grants or required evidence produce a visible **BLOCKED** failure. Official merchant evidence remains outstanding.
 
 ```sh
-PAYMENTS_ENV=sandbox go test -count=1 -tags=sandbox ./test/sandbox/... -run TestAdyen
+PAYMENTS_ENV=sandbox go test -count=1 -tags=sandbox ./test/sandbox/... -run '^TestAdyenSandboxBrowser$'
 ```
 
-The browser cases can also run individually using Go's subtest filter. Provision a fresh order for each, using a separate schema when changing card route. Set the matching one-use HTTPS ticket variable only in the protected runner. The browser receives the public client key and test URL. It verifies the secured iframe origin before entering the published test values and monitors top-level navigation and popup creation. No recording or request-body logging is required.
+Run two consumer instances for the browser phase. Give each its own migrated schema and registered HTTPS origin. The same public test client key must allow both origins. Point each origin's reverse proxy and signed Standard callback at the corresponding listener. Start the following commands in separate terminals with the protected merchant settings from the consumer README.
+
+```sh
+TENDER_CONSUMER_PROVIDER=adyen TENDER_ADYEN_BRAND=visa TENDER_CONSUMER_SCHEMA=visa_demo \
+  TENDER_ADYEN_ORIGIN="$TENDER_ADYEN_VISA_ORIGIN" go run . -environment SANDBOX -listen 127.0.0.1:8081
+TENDER_CONSUMER_PROVIDER=adyen TENDER_ADYEN_BRAND=mc TENDER_CONSUMER_SCHEMA=mc_demo \
+  TENDER_ADYEN_ORIGIN="$TENDER_ADYEN_MC_ORIGIN" go run . -environment SANDBOX -listen 127.0.0.1:8082
+```
+
+In the protected runner, set `TENDER_ADYEN_VISA_ORIGIN` and `TENDER_ADYEN_MC_ORIGIN` to those two explicitly registered HTTPS origins. Assign the Visa guest URL to `TENDER_ADYEN_VISA_CHALLENGE_TICKET`, the Mastercard guest URL to `TENDER_ADYEN_MC_FRICTIONLESS_TICKET`, and its account URL to `TENDER_ADYEN_MC_PURCHASE_TICKET`. The browser tests consume those three grants on separate orders. The runner reads the component's own state response, verifies the secured iframe origin, and restricts each outbound destination and every top-level navigation. Each case can also run separately with Go's subtest filter.
 
 | Browser subtest | Registered route and ticket | Expected observation |
 | --- | --- | --- |
@@ -43,6 +52,12 @@ The browser cases can also run individually using Go's subtest filter. Provision
 
 Set test Dynamic 3-D Secure rules to trigger the stated challenge or fingerprint case. Use the documented non-challenge test settings for the ordinary purchase. A different issuer origin, a forced redirect, or a merchant response lacking authoritative scheme brand requires investigating the observed result before enabling that route. [Official 3DS cases](https://docs.adyen.com/development-resources/testing/3d-secure-2-authentication/) · [Official test cards](https://docs.adyen.com/development-resources/test-cards-and-credentials/test-card-numbers/)
 
-After a sandbox authorization, use the private merchant route to capture the order. Wait for its signed event and host fulfillment, then refund it and wait for the signed refund. Download the corresponding Payment accounting report from the **test** Customer Area with the additional **Modification Psp Reference** column. Run `TestAdyenSandboxPortal` separately once the report is ready. Set `TENDER_ADYEN_ACCOUNTING_CSV` to that local export, `TENDER_ADYEN_EVIDENCE_ORDER` to the order ID, and supply the matching consumer schema and read-access DSN. The read-only comparison requires the provider PSP, signed merchant reference, brand, currency, authorized amount and separately matched capture/refund modification PSPs. It also requires processed successful AUTHORISATION, CAPTURE and REFUND events and exactly one fulfillment. Run for each qualified brand and retain the dated result, API/SDK version, browser/device and redacted PSP references with the merchant. [Adyen Payment accounting report](https://docs.adyen.com/reporting/invoice-reconciliation/payment-accounting-report)
+After a sandbox authorization, use the private merchant route to capture the order. Wait for its signed event and host fulfillment, then refund it and wait for the signed refund. Download the corresponding Payment accounting report from the **test** Customer Area with the additional **Modification Psp Reference** column. Run `TestAdyenSandboxPortal` separately once the report is ready. Set `TENDER_ADYEN_ACCOUNTING_CSV` to that local export, `TENDER_ADYEN_EVIDENCE_ORDER` to the order ID, and supply the matching consumer schema and read-access DSN. The read-only comparison requires the provider PSP, signed merchant reference, brand, currency, authorized amount and separately matched capture/refund modification PSPs. It requires processed successful AUTHORISATION, CAPTURE and REFUND events and exactly one fulfillment. Export the entire payment history including adverse entries. In USD payment currency, the Authorised row credits the authorized register, SentForSettle debits that register and credits the captured register, and SentForRefund debits the captured register. Amounts must equal the trusted order total. Settled and Refunded entries, when present, must clear the corresponding captured register movement. An adverse, duplicate or contradictory row fails the comparison. Run for each qualified brand and retain the dated result, API/SDK version, browser/device and redacted PSP references with the merchant. [Adyen Payment accounting report](https://docs.adyen.com/reporting/invoice-reconciliation/payment-accounting-report)
+
+```sh
+PAYMENTS_ENV=sandbox go test -count=1 -tags=sandbox ./test/sandbox/... -run '^TestAdyenSandboxPortal$'
+```
+
+A combined `-run TestAdyen` run requires three fresh browser grants plus a previously captured and refunded order in the configured evidence schema with its completed report. For a new merchant qualification use the two phases above so the report can be generated after the browser run.
 
 General report import, settlement, post-refund reversal and downstream delivery compensation remain separate capabilities. Credentialed verification and a clean independent import against a published version remain release gates. [Adapter coverage](../providers/adyen.md)

@@ -322,7 +322,7 @@ func (a *app) cardView(w http.ResponseWriter, r *http.Request, o order, s sessio
 		Sandbox, Review                    bool
 		Version                            uint64
 	}{Order: o.ID, Price: fmt.Sprintf("$%d.%02d %s", o.Total.Minor/100, o.Total.Minor%100, o.Total.Currency), Status: st, CSRF: s.csrf, Action: a.cardAction(p).Type, Sandbox: a.scope.Environment == tender.EnvironmentSandbox, Version: p.Version}
-	data.Review = p.Status == tender.PaymentCaptureFailed || p.ProviderStatus == "ActionUnavailable" || (p.Status == tender.PaymentRequiresAction && data.Action == "")
+	data.Review = p.Status == tender.PaymentCaptureFailed || p.ProviderStatus == "ActionUnavailable" || p.ProviderStatus == "FingerprintUnavailable" || (p.Status == tender.PaymentRequiresAction && data.Action == "")
 	w.Header().Set("X-CSRF-Token", s.csrf)
 	w.Header().Set("Referrer-Policy", "same-origin")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

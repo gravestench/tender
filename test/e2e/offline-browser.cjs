@@ -2,10 +2,7 @@ const assert = require("node:assert/strict");
 const { chromium } = require(process.env.TENDER_PLAYWRIGHT || "playwright");
 
 (async () => {
-  const browser = await chromium.launch({
-    executablePath: process.env.TENDER_CHROMIUM || undefined,
-    args: ["--disable-background-networking", "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1", "--no-proxy-server"],
-  });
+  const browser = await require("../../examples/consumer/browser-guard.cjs").launchBrowser(chromium,[process.env.TENDER_ORIGIN]);
   try {
     const origin = process.env.TENDER_ORIGIN;
     const ctx = await browser.newContext({serviceWorkers: "block"});
