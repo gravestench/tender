@@ -1,4 +1,4 @@
-// Command consumer is a loopback-only synthetic checkout owned by a host app.
+// Command consumer serves host-owned synthetic and Adyen test checkouts.
 package main
 
 import (
@@ -52,19 +52,23 @@ type session struct {
 }
 
 type app struct {
-	engine   *tender.Engine
-	ledger   *sql.DB
-	origin   string
-	mu       sync.Mutex
-	tickets  map[string]order
-	sessions map[string]session
+	engine            *tender.Engine
+	scope             tender.Scope
+	market            tender.Market
+	provider, account string
+	card              *cardCheckout
+	ledger            *sql.DB
+	origin            string
+	mu                sync.Mutex
+	tickets           map[string]order
+	sessions          map[string]session
 }
 
 type links struct{ Origin, Guest, Account string }
 
 func main() {
 	addr := flag.String("listen", "127.0.0.1:8080", "loopback IP and port")
-	env := flag.String("environment", "MOCK", "only MOCK has a fixture and checkout policy")
+	env := flag.String("environment", "MOCK", "MOCK or SANDBOX (Adyen test merchant only)")
 	flag.Parse()
 	if err := run(*addr, *env); err != nil {
 		log.Fatal(err)
@@ -72,7 +76,11 @@ func main() {
 }
 
 func run(addr, env string) error {
-	if env != string(tender.EnvironmentMock) {
+	provider := os.Getenv("TENDER_CONSUMER_PROVIDER")
+	if provider != "" && provider != "adyen" {
+		return errors.New("consumer: unknown checkout provider")
+	}
+	if env != string(tender.EnvironmentMock) && !(provider == "adyen" && env == string(tender.EnvironmentSandbox)) {
 		return errors.New("consumer: checkout is available only for the MOCK fixture")
 	}
 	host, _, err := net.SplitHostPort(addr)
@@ -86,11 +94,12 @@ func run(addr, env string) error {
 	}
 	defer listener.Close()
 	origin := "http://" + listener.Addr().String()
-	sim, err := mockserver.New(mockserver.Config{PublicBaseURL: origin + "/simulator", Routes: fixtureRoutes})
-	if err != nil {
-		return err
+	if env == string(tender.EnvironmentSandbox) {
+		origin = os.Getenv("TENDER_ADYEN_ORIGIN")
+		if !sandboxOrigin(origin) {
+			return errors.New("consumer: configure the registered HTTPS sandbox origin")
+		}
 	}
-	defer sim.Close()
 	var storage tender.Store = store.NewMemory()
 	var db *sql.DB
 	if dsn := os.Getenv("TENDER_CONSUMER_DATABASE_URL"); dsn != "" {
@@ -101,11 +110,30 @@ func run(addr, env string) error {
 		defer db.Close()
 		storage = postgres.New(db)
 	}
-	engine, err := tender.NewEngine(tender.EngineConfig{Store: storage, Provider: fixture{sim}, Scope: scope, Market: market, ProviderName: "synthetic", MerchantAccount: "fixture"})
-	if err != nil {
-		return err
+	mux := http.NewServeMux()
+	a := &app{scope: tender.Scope{MerchantID: scope.MerchantID, Environment: tender.Environment(env)}, market: market, ledger: db, origin: origin, sessions: make(map[string]session), tickets: make(map[string]order)}
+	if provider == "adyen" {
+		cleanup, err := a.installCardCheckout(mux, storage)
+		if err != nil {
+			return err
+		}
+		defer cleanup()
+	} else {
+		sim, err := mockserver.New(mockserver.Config{PublicBaseURL: origin + "/simulator", Routes: fixtureRoutes})
+		if err != nil {
+			return err
+		}
+		defer sim.Close()
+		a.provider, a.account = "synthetic", "fixture"
+		a.engine, err = tender.NewEngine(tender.EngineConfig{Store: storage, Provider: fixture{sim}, Scope: a.scope, Market: a.market, ProviderName: a.provider, MerchantAccount: a.account})
+		if err != nil {
+			return err
+		}
+		mux.Handle("/simulator/", http.StripPrefix("/simulator", sim.Handler()))
+		mux.HandleFunc("GET /orders/{order}", a.owned(a.view))
+		mux.HandleFunc("POST /orders/{order}", a.owned(a.submit))
+		mux.HandleFunc("POST /orders/{order}/confirm", a.owned(a.confirm))
 	}
-	a := &app{engine: engine, ledger: db, origin: origin, sessions: make(map[string]session), tickets: make(map[string]order)}
 	// Restart recovery runs before browsing is possible. No client result can
 	// trigger a delivery without a current payment and a committed outbox row.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -117,19 +145,15 @@ func run(addr, env string) error {
 	}
 	guest, account := rand.Text(), rand.Text()
 	a.tickets[guest], a.tickets[account] = orders[0], orders[1]
-	mux := http.NewServeMux()
-	mux.Handle("/simulator/", http.StripPrefix("/simulator", sim.Handler()))
 	mux.HandleFunc("GET /session/{ticket}", a.login)
-	mux.HandleFunc("GET /orders/{order}", a.owned(a.view))
 	mux.HandleFunc("GET /orders/{order}/status", a.owned(a.status))
-	mux.HandleFunc("POST /orders/{order}", a.owned(a.submit))
-	mux.HandleFunc("POST /orders/{order}/confirm", a.owned(a.confirm))
+	publicURL, _ := url.Parse(origin)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Content-Security-Policy", "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
-		if r.Host != listener.Addr().String() {
+		if r.Host != publicURL.Host {
 			http.Error(w, "invalid host", 403)
 			return
 		}
@@ -159,7 +183,7 @@ func (a *app) login(w http.ResponseWriter, r *http.Request) {
 	key := rand.Text()
 	a.sessions[key] = session{o.Owner, rand.Text(), time.Now().Add(time.Hour)}
 	a.mu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: "demo_session", Value: key, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, MaxAge: 3600})
+	http.SetCookie(w, &http.Cookie{Name: "demo_session", Value: key, Path: "/", HttpOnly: true, Secure: a.scope.Environment == tender.EnvironmentSandbox, SameSite: http.SameSiteStrictMode, MaxAge: 3600})
 	http.Redirect(w, r, "/orders/"+o.ID, http.StatusSeeOther)
 }
 
@@ -271,6 +295,7 @@ func (a *app) finish(w http.ResponseWriter, r *http.Request, o order, err error)
 type orderStatus struct {
 	OrderID, PaymentID, Currency, Status string
 	Minor                                int64
+	Funds                                *tender.Funds `json:",omitempty"`
 	Fulfilled                            bool
 }
 
@@ -287,8 +312,11 @@ func (a *app) read(ctx context.Context, o order) (orderStatus, bool, error) {
 		return st, false, errors.New("order binding changed")
 	}
 	st.PaymentID, st.Status = p.ID, string(p.Status)
+	if a.card != nil {
+		st.Funds = &p.Funds
+	}
 	if a.ledger != nil {
-		err = a.ledger.QueryRowContext(ctx, `SELECT EXISTS (SELECT FROM consumer_fulfillments WHERE merchant_id=$1 AND environment=$2 AND order_id=$3 AND payment_id=$4)`, scope.MerchantID, scope.Environment, o.ID, p.ID).Scan(&st.Fulfilled)
+		err = a.ledger.QueryRowContext(ctx, `SELECT EXISTS (SELECT FROM consumer_fulfillments WHERE merchant_id=$1 AND environment=$2 AND order_id=$3 AND payment_id=$4)`, a.scope.MerchantID, a.scope.Environment, o.ID, p.ID).Scan(&st.Fulfilled)
 	}
 	return st, allowAction(p), err
 }

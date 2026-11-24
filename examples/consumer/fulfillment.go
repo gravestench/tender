@@ -66,7 +66,7 @@ SELECT n.seq, n.entry_id, p.record
 FROM tender_outbox n JOIN tender_payments p USING (merchant_id, environment, payment_id)
 WHERE n.merchant_id=$1 AND n.environment=$2 AND n.payment_id=$3
   AND p.order_id=$4 AND n.record->>'OrderID'=$4 AND n.consumed_at IS NULL
-FOR UPDATE OF n,p`, scope.MerchantID, scope.Environment, o.PaymentID, o.ID).Scan(&seq, &entryID, &raw)
+FOR UPDATE OF n,p`, a.scope.MerchantID, a.scope.Environment, o.PaymentID, o.ID).Scan(&seq, &entryID, &raw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -77,11 +77,11 @@ FOR UPDATE OF n,p`, scope.MerchantID, scope.Environment, o.PaymentID, o.ID).Scan
 	if err = json.Unmarshal(raw, &p); err != nil {
 		return err
 	}
-	if p.Market != market || p.Provider != "synthetic" || p.MerchantAccount != "fixture" || p.Amount != o.Total || p.Status != tender.PaymentCaptured ||
+	if p.Market != a.market || p.Provider != a.provider || p.MerchantAccount != a.account || p.Amount != o.Total || p.Status != tender.PaymentCaptured ||
 		p.Funds.Captured != o.Total.Minor || p.Funds.Refunded != 0 || p.Funds.Returned != 0 || p.Funds.Disputed != 0 {
 		return nil // Hold the notice for host review after any conflicting facts.
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO consumer_fulfillments (merchant_id,environment,order_id,payment_id,entry_id) VALUES ($1,$2,$3,$4,$5)`, scope.MerchantID, scope.Environment, o.ID, o.PaymentID, entryID); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO consumer_fulfillments (merchant_id,environment,order_id,payment_id,entry_id) VALUES ($1,$2,$3,$4,$5)`, a.scope.MerchantID, a.scope.Environment, o.ID, o.PaymentID, entryID); err != nil {
 		return err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE tender_outbox SET consumed_at=CURRENT_TIMESTAMP WHERE seq=$1`, seq); err != nil {

@@ -16,7 +16,8 @@ func TestMockDatabaseRejectsExternalHosts(t *testing.T) {
 		}
 	}
 }
-func TestOnlyMockHasCheckoutPolicy(t *testing.T) {
+func TestSyntheticCheckoutRequiresMock(t *testing.T) {
+	t.Setenv("TENDER_CONSUMER_PROVIDER", "")
 	for _, env := range []string{"SANDBOX", "LIVE", ""} {
 		if err := run("127.0.0.1:invalid", env); err == nil || err.Error() != "consumer: checkout is available only for the MOCK fixture" {
 			t.Errorf("environment %q: %v", env, err)

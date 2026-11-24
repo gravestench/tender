@@ -19,6 +19,9 @@ const { chromium } = require(process.env.TENDER_PLAYWRIGHT || "playwright");
     const page = await ctx.newPage();
     await page.goto(process.env.TENDER_GUEST);
     const checkout = page.url();
+    await page.getByLabel("Scenario").waitFor();
+    assert.equal(await page.locator('input:not([type="hidden"])').count(), 0);
+    assert.equal(await page.locator("iframe").count(), 0);
     await page.getByLabel("Scenario").selectOption("collected");
     const submitted = page.waitForResponse(response => response.request().method() === "POST");
     await page.getByRole("button", {name: "Run simulation"}).click();
@@ -28,7 +31,6 @@ const { chromium } = require(process.env.TENDER_PLAYWRIGHT || "playwright");
     assert.equal(page.url(), checkout);
     assert.equal(ctx.pages().length, 1);
     assert.deepEqual(external, []);
-    assert.equal(await page.locator('input:not([type="hidden"])').count(), 0);
   } finally {
     await browser.close();
   }
