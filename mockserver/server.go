@@ -101,15 +101,15 @@ func New(cfg Config) (*Server, error) {
 	}
 	go s.deliver()
 	if cfg.Routes != nil {
-		var handler http.Handler
+		installed := false
 		// An unsuccessful factory (including a panic) can already have
 		// enqueued callbacks. Resolve their receipts before leaving New.
 		defer func() {
-			if handler == nil {
+			if !installed {
 				s.Close()
 			}
 		}()
-		handler = cfg.Routes(s)
+		handler := cfg.Routes(s)
 		if handler == nil {
 			return nil, errors.New("mockserver: nil fixture handler")
 		}
@@ -119,6 +119,7 @@ func New(cfg Config) (*Server, error) {
 			return nil, errors.New("mockserver: fixture closed during setup")
 		}
 		s.handler = handler
+		installed = true
 	}
 	return s, nil
 }
