@@ -181,3 +181,9 @@ type Provider interface {
 type IdempotentReplayProvider interface {
 	ReplayIdentity(ProviderRequest) (fingerprint string, window time.Duration)
 }
+
+// StoreRequirements checks transactional capabilities a provider needs for an
+// operation's full lifecycle. The engine checks them before external dispatch.
+type StoreRequirements interface {
+	CheckStore(OperationKind, Tx) error
+}

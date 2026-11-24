@@ -14,9 +14,12 @@ const ErrNotFound ErrorKind = "not_found"
 type OperationRecord struct {
 	Operation
 	PaymentVersion uint64
-	Failure        ErrorKind
-	FailureStatus  string
-	RetryAfter     time.Duration
+	// DispatchUntil leases one same-key HTTP call on replayable operations.
+	// A recovery takeover marks the operation unknown before leaving storage.
+	DispatchUntil time.Time
+	Failure       ErrorKind
+	FailureStatus string
+	RetryAfter    time.Duration
 	// RetryNotBefore survives restarts. SuccessorID is set at most once when
 	// a definitive no-effect rejection permits a new reservation on the claim.
 	RetryNotBefore time.Time

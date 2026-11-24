@@ -187,6 +187,22 @@ func (a *Adapter) Execute(ctx context.Context, r tender.ProviderRequest) (tender
 func (a *Adapter) Query(context.Context, tender.ProviderRequest) (tender.Observation, error) {
 	return tender.Observation{}, tender.ErrUnsupported
 }
+
+// CheckStore verifies that this host can durably receive both capture success
+// and subsequent failure before submitting a capture to Adyen.
+func (a *Adapter) CheckStore(kind tender.OperationKind, tx tender.Tx) error {
+	if kind == tender.OpCapture {
+		_, ok := tx.(interface {
+			tender.VerifiedEventTx
+			tender.VerifiedEvidenceReader
+			tender.CaptureFailureTx
+		})
+		if !ok {
+			return tender.ErrUnsupported
+		}
+	}
+	return nil
+}
 func (a *Adapter) modify(ctx context.Context, r tender.ProviderRequest, o tender.Observation) (tender.Observation, error) {
 	if !reference.MatchString(r.Payment.ProviderReference) || r.Payment.Funds.Authorized == 0 || r.Operation.Kind == tender.OpCapture && r.Payment.VerifiedMethod != r.Payment.Market.Method {
 		return o, tender.ErrUnsupported

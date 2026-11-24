@@ -1050,3 +1050,265 @@ func TestAdyenWebhookReplayCaptureFailureSQL(t *testing.T) {
 		t.Fatal(reviews, err)
 	}
 }
+
+type missingReviewStore struct{ *store.Memory }
+
+func (s missingReviewStore) Transact(ctx context.Context, fn func(tender.Tx) error) error {
+	return s.Memory.Transact(ctx, func(tx tender.Tx) error {
+		return fn(struct {
+			tender.Tx
+			tender.VerifiedEvidenceReader
+			tender.VerifiedEventTx
+		}{tx, tx.(tender.VerifiedEvidenceReader), tx.(tender.VerifiedEventTx)})
+	})
+}
+
+func TestAdyenContractRequiresFailureQueue(t *testing.T) {
+	h := newAdyenRig(t, missingReviewStore{store.NewMemory()}, "Authorised", "")
+	h.create()
+	if _, err := h.confirm(); err != nil {
+		t.Fatal(err)
+	}
+	h.process()
+	cfg := h.cfg
+	calls := 0
+	cfg.Transport = changeAdyenReply(func(req *http.Request) (*http.Response, error) {
+		calls++
+		return h.cfg.Transport.RoundTrip(req)
+	})
+	if _, err := h.engine(cfg, nil).Capture(t.Context(), h.request("cap", 100)); !errors.Is(err, tender.ErrUnsupported) || calls != 0 {
+		t.Fatalf("incomplete store dispatched %d capture calls, err %v", calls, err)
+	}
+}
+
+func (h *adyenRig) record(res tender.Result) mockserver.AdyenRecord {
+	h.t.Helper()
+	rec, found := h.sim.Lookup(mockserver.AdyenKey(testAccount, res.Operation.ProviderKey))
+	if !found {
+		h.t.Fatal("missing fixture record")
+	}
+	var fx mockserver.AdyenRecord
+	if err := json.Unmarshal(rec.Data, &fx); err != nil {
+		h.t.Fatal(err)
+	}
+	return fx
+}
+
+func TestAdyenObservationRaceHoldDuringModification(t *testing.T) {
+	for _, variant := range []string{"capture", "refund", "cancel", "cancel after ack"} {
+		t.Run(variant, func(t *testing.T) {
+			h := newAdyenRig(t, store.NewMemory(), "Authorised", "")
+			h.create()
+			auth, err := h.confirm()
+			if err != nil {
+				t.Fatal(err)
+			}
+			h.process()
+			first, err := h.e.Capture(t.Context(), h.request("first", 40))
+			if err != nil {
+				t.Fatal(err)
+			}
+			h.process()
+			fx := h.record(first)
+			failBody := notification(eventFields{fx.PSP, fx.PaymentPSP, testAccount, fx.Reference, "40", "USD", "CAPTURE_FAILED", "true"}, true)
+			hold := func() {
+				// Drain the simulator's successful modification notification. The host
+				// will receive an original-reference version after the acknowledgement.
+				_ = h.next()
+				if h.post(failBody) != 202 {
+					t.Fatal("hold rejected")
+				}
+				h.process()
+			}
+			cfg := h.cfg
+			cfg.Transport = changeAdyenReply(func(req *http.Request) (*http.Response, error) {
+				resp, err := h.cfg.Transport.RoundTrip(req)
+				if err == nil && variant != "cancel after ack" {
+					hold()
+				}
+				return resp, err
+			})
+			e := h.engine(cfg, nil)
+			amount, code, run := int64(60), "CAPTURE", e.Capture
+			switch variant {
+			case "refund":
+				amount, code, run = 40, "REFUND", e.Refund
+			case "cancel", "cancel after ack":
+				code, run = "CANCELLATION", e.Void
+			}
+			mod, err := run(t.Context(), h.request("second", amount))
+			if err != nil {
+				t.Fatal(err)
+			}
+			second := h.record(mod)
+			if mod.Operation.Status != tender.OperationPending || mod.Operation.ProviderReference != second.PSP {
+				t.Fatalf("lost modification acknowledgement after hold: %s %q", mod.Operation.Status, mod.Operation.ProviderReference)
+			}
+			if variant == "cancel after ack" {
+				hold()
+			}
+			// Deliver the original payment's merchant reference. This needs the PSP
+			// from the acknowledgement; a modification-reference event would hide a lost binding.
+			body := notification(eventFields{second.PSP, second.PaymentPSP, testAccount, h.record(auth).Reference, fmt.Sprint(amount), "USD", code, "true"}, true)
+			if h.post(body) != 202 {
+				t.Fatal("callback rejected")
+			}
+			h.process()
+			final, err := run(t.Context(), h.request("second", amount))
+			if err != nil || final.Payment.Status != tender.PaymentCaptureFailed || final.Operation.Status != tender.OperationSucceeded {
+				t.Fatalf("held result: %s operation %s err %v", final.Payment.Status, final.Operation.Status, err)
+			}
+			captured := int64(40)
+			if variant == "capture" {
+				captured = 100
+			}
+			if final.Payment.Funds.Captured != captured || (variant == "refund" && final.Payment.Funds.Refunded != 40) {
+				t.Fatal(final.Payment.Funds)
+			}
+		})
+	}
+}
+
+func TestAdyenObservationRaceRecoveryOwnership(t *testing.T) {
+	runAdyenRecoveryOwnership(t, store.NewMemory())
+}
+
+func TestAdyenObservationRaceRecoveryOwnershipSQL(t *testing.T) {
+	dsn := os.Getenv("TENDER_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("disposable local PostgreSQL required")
+	}
+	if !adyenLocalDatabase(dsn) {
+		t.Fatal("local database required")
+	}
+	open := postgresFixture(t)
+	runAdyenRecoveryOwnership(t, postgres.New(open()))
+}
+
+func runAdyenRecoveryOwnership(t *testing.T, db adyenStore) {
+	h := newAdyenRig(t, db, "Authorised", "")
+	h.create()
+	if _, err := h.confirm(); err != nil {
+		t.Fatal(err)
+	}
+	h.process()
+	start := time.Now().UTC()
+	primary := h.cfg
+	started, release := make(chan struct{}), make(chan struct{})
+	primary.Transport = changeAdyenReply(func(req *http.Request) (*http.Response, error) {
+		close(started)
+		<-release
+		return &http.Response{StatusCode: http.StatusTooManyRequests, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(""))}, nil
+	})
+	req := h.request("first", 40)
+	owner := h.engine(primary, func() time.Time { return start })
+	done := make(chan error, 1)
+	go func() { _, err := owner.Capture(t.Context(), req); done <- err }()
+	<-started
+	reserved, err := owner.Capture(t.Context(), req)
+	if err != nil || reserved.Operation.Status != tender.OperationReserved {
+		t.Fatal(reserved.Operation, err)
+	}
+	t.Run("unexpired owner", func(t *testing.T) {
+		cfg := h.cfg
+		calls := 0
+		cfg.Transport = changeAdyenReply(func(req *http.Request) (*http.Response, error) {
+			calls++
+			return nil, context.DeadlineExceeded
+		})
+		if _, err := h.engine(cfg, func() time.Time { return start }).Recover(t.Context(), reserved.Operation.ID); !errors.Is(err, tender.ErrConflict) || calls != 0 {
+			t.Errorf("dispatched over live owner: calls=%d err=%v", calls, err)
+		}
+	})
+	recovery := h.cfg
+	accepted, releaseAck := make(chan struct{}), make(chan struct{})
+	recovery.Transport = changeAdyenReply(func(req *http.Request) (*http.Response, error) {
+		resp, err := h.cfg.Transport.RoundTrip(req)
+		close(accepted)
+		<-releaseAck
+		return resp, err
+	})
+	type outcome struct {
+		res tender.Result
+		err error
+	}
+	recovered := make(chan outcome, 1)
+	go func() {
+		res, err := h.engine(recovery, func() time.Time { return start.Add(time.Minute) }).Recover(t.Context(), reserved.Operation.ID)
+		recovered <- outcome{res, err}
+	}()
+	<-accepted
+	event := h.next()
+	// The accepted replay has its own durable lease. A third process must
+	// leave this key alone even if the old dispatch reports a failure.
+	third := h.cfg
+	third.Transport = changeAdyenReply(func(*http.Request) (*http.Response, error) {
+		t.Error("overlapping recovery dispatch")
+		return nil, context.DeadlineExceeded
+	})
+	if _, err := h.engine(third, func() time.Time { return start.Add(time.Minute) }).Recover(t.Context(), reserved.Operation.ID); !errors.Is(err, tender.ErrConflict) {
+		t.Errorf("concurrent replay claim: %v", err)
+	}
+	close(release)
+	primaryErr := <-done
+	if errors.Is(primaryErr, tender.ErrRateLimit) {
+		t.Error("older 429 closed reservation during accepted replay")
+	}
+	if _, err := h.e.Capture(t.Context(), h.request("new", 40)); !errors.Is(err, tender.ErrConflict) {
+		t.Errorf("fresh capture admitted during replay: %v", err)
+	}
+	close(releaseAck)
+	got := <-recovered
+	if got.err != nil || got.res.Operation.Status != tender.OperationPending || got.res.Operation.ProviderReference == "" {
+		t.Fatalf("lost accepted replay: %s %v", got.res.Operation.Status, got.err)
+	}
+	if err := h.hook.Process(t.Context(), event); err != nil {
+		t.Fatal(err)
+	}
+	final, err := h.e.Capture(t.Context(), req)
+	if err != nil || final.Payment.Funds.Captured != 40 {
+		t.Fatal(final.Payment.Funds, err)
+	}
+}
+
+func TestAdyenObservationRaceReplayTimeoutAfterWebhook(t *testing.T) {
+	h := newAdyenRig(t, store.NewMemory(), "Authorised", "")
+	h.create()
+	if _, err := h.confirm(); err != nil {
+		t.Fatal(err)
+	}
+	h.process()
+	if err := h.sim.SetScenarios("adyen.captures", mockserver.Scenario{Fault: mockserver.LoseResponse}); err != nil {
+		t.Fatal(err)
+	}
+	lost, err := h.e.Capture(t.Context(), h.request("cap", 100))
+	if !errors.Is(err, tender.ErrUnknownOutcome) {
+		t.Fatal(err)
+	}
+	cfg := h.cfg
+	cfg.Transport = changeAdyenReply(func(req *http.Request) (*http.Response, error) {
+		h.process()
+		return nil, context.DeadlineExceeded
+	})
+	got, err := h.engine(cfg, nil).Recover(t.Context(), lost.Operation.ID)
+	if err != nil || got.Operation.Status != tender.OperationSucceeded || got.Payment.Funds.Captured != 100 {
+		t.Fatalf("stale replay timeout won: %s gross %d error %v", got.Operation.Status, got.Payment.Funds.Captured, err)
+	}
+}
+
+func TestAdyenContractRecoveryRouteIsolation(t *testing.T) {
+	h := newAdyenRig(t, store.NewMemory(), "Authorised", "")
+	created := h.create()
+	adapter, err := adyen.New(h.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := tender.NewEngine(tender.EngineConfig{Store: h.db, Scope: dbScope, Market: dbMarket, ProviderName: "adyen", MerchantAccount: "Different", Provider: adapter})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := other.Recover(t.Context(), created.Operation.ID)
+	if !errors.Is(err, tender.ErrConflict) || got != (tender.Result{}) {
+		t.Fatalf("recovery exposed other route %q: %v", got.Payment.ID, err)
+	}
+}

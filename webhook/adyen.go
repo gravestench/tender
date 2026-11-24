@@ -355,7 +355,10 @@ func (h *Adyen) observation(tx tender.EventRecords, e evidence) (tender.Observat
 // capture can enqueue collection. Other payments' or unbound evidence cannot
 // put this payment on hold.
 func (h *Adyen) captureFailure(tx tender.EventRecords, p tender.Payment, op tender.OperationRecord, event evidence) (bool, error) {
-	inbox, ok := tx.(tender.VerifiedEvidenceReader)
+	inbox, ok := tx.(interface {
+		tender.VerifiedEvidenceReader
+		tender.CaptureFailureTx
+	})
 	if !ok {
 		return false, tender.ErrUnsupported
 	}

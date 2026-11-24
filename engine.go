@@ -184,9 +184,20 @@ func (e *Engine) execute(ctx context.Context, kind OperationKind, r Request, pre
 	if !dispatch {
 		return s.result()
 	}
-	call, cancel := context.WithTimeout(ctx, e.config.Timeout)
+	timeout := e.config.Timeout
+	if !s.op.DispatchUntil.IsZero() {
+		timeout = min(timeout, s.op.DispatchUntil.Sub(e.config.Now().UTC()))
+	}
+	call, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	if err := call.Err(); err != nil {
+		return e.finishDispatch(ctx, s, Observation{}, err)
+	}
 	obs, callErr := e.config.Provider.Execute(call, ProviderRequest{Payment: s.payment, Operation: s.op.Operation, Token: r.Token})
-	cancel()
+	return e.finishDispatch(ctx, s, obs, callErr)
+}
+
+func (e *Engine) finishDispatch(ctx context.Context, s state, obs Observation, callErr error) (Result, error) {
 	// A disconnected host request must not discard a provider result.
 	finish, stop := context.WithTimeout(context.WithoutCancel(ctx), e.config.Timeout)
 	defer stop()
@@ -264,6 +275,9 @@ func (e *Engine) reserve(ctx context.Context, kind OperationKind, r Request, pre
 		if err := e.checkAmount(kind, r.Amount, p); err != nil {
 			return err
 		}
+		if err := e.checkStore(kind, tx); err != nil {
+			return err
+		}
 		op := Operation{
 			Scope: p.Scope, PaymentID: p.ID, AttemptID: p.AttemptID, ID: e.config.NewID(),
 			Key: r.Key, ProviderKey: e.config.NewID(), Fingerprint: hash, Amount: r.Amount,
@@ -290,6 +304,9 @@ func (e *Engine) reserve(ctx context.Context, kind OperationKind, r Request, pre
 			}
 		}
 		s = state{p, OperationRecord{Operation: op, PaymentVersion: p.Version}}
+		if op.ReplayFingerprint != "" {
+			s.op.DispatchUntil = e.config.Now().UTC().Add(e.config.Timeout)
+		}
 		if err := tx.InsertOperation(s.op); err != nil {
 			return err
 		}
@@ -297,6 +314,13 @@ func (e *Engine) reserve(ctx context.Context, kind OperationKind, r Request, pre
 		return e.audit(tx, s, Change{}, "reservation")
 	})
 	return s, dispatch, err
+}
+
+func (e *Engine) checkStore(kind OperationKind, tx Tx) error {
+	if requirements, ok := e.config.Provider.(StoreRequirements); ok {
+		return requirements.CheckStore(kind, tx)
+	}
+	return nil
 }
 
 func (e *Engine) retryableCreate(tx Tx, predecessor string, r Request) (state, error) {
@@ -380,7 +404,10 @@ func (e *Engine) load(tx Tx, id string) (state, error) {
 	if err != nil {
 		return state{}, err
 	}
-	return state{p, op}, e.route(p)
+	if err := e.route(p); err != nil {
+		return state{}, err
+	}
+	return state{p, op}, nil
 }
 
 func definitiveFailure(cause error) ErrorKind {
@@ -404,9 +431,20 @@ func (e *Engine) finishError(ctx context.Context, original state, cause error) (
 			return err
 		}
 		final = s
-		if s.op.Status != OperationReserved || s.payment.Version != original.payment.Version {
+		if s.op.Status != original.op.Status || !s.op.DispatchUntil.Equal(original.op.DispatchUntil) {
 			return nil
 		}
+		if s.op.Status == OperationUnknown && original.op.ReplayFingerprint != "" {
+			// A replay error describes only its own call. A prior dispatch may
+			// have succeeded. Release the lease and retain the unknown outcome.
+			s.op.DispatchUntil = time.Time{}
+			final = s
+			return tx.UpdateOperation(s.op)
+		}
+		if s.op.Status != OperationReserved || s.payment.Version != original.payment.Version && s.payment.Status != PaymentCaptureFailed {
+			return nil
+		}
+		s.op.DispatchUntil = time.Time{}
 		next := OperationUnknown
 		if kind := definitiveFailure(cause); kind != "" {
 			s.op.Failure = kind
@@ -546,7 +584,13 @@ func (e *Engine) applyTx(tx Tx, original state, o Observation, source string) (s
 	// settlement/return/dispute evidence may refer to an older operation.
 	versionChanged := s.payment.Version != original.payment.Version
 	if source == "response" && (versionChanged || s.op != original.op) {
-		return s, nil
+		// A verified acknowledgement can arrive after a hold or a same-key
+		// takeover. Retain only the operation PSP and pending status against
+		// the current snapshot. A completed callback still wins.
+		if !s.acceptsPendingAck(original, o) {
+			return s, nil
+		}
+		o.Snapshot = s.payment.Snapshot
 	}
 	earlierOperation := s.op.PaymentVersion != s.payment.Version
 	if source == "query" && versionChanged && !earlierOperation {
@@ -599,6 +643,7 @@ func (e *Engine) applyTx(tx Tx, original state, o Observation, source string) (s
 	if err := s.op.SetStatus(o.Status); err != nil {
 		return state{}, err
 	}
+	s.op.DispatchUntil = time.Time{}
 	if o.Status == OperationFailed && s.op.Failure == "" {
 		s.op.Failure = ErrOperationFailed
 		s.op.FailureStatus = o.Snapshot.ProviderStatus
@@ -646,6 +691,19 @@ func (e *Engine) applyTx(tx Tx, original state, o Observation, source string) (s
 		}
 	}
 	return s, nil
+}
+
+func (s state) acceptsPendingAck(original state, o Observation) bool {
+	if s.op.ReplayFingerprint == "" || s.op.Status != OperationReserved && s.op.Status != OperationUnknown ||
+		s.op.PaymentVersion != s.payment.Version || o.Status != OperationPending || o.OperationReference == "" ||
+		o.ProviderReference == "" || o.ProviderReference != s.payment.ProviderReference || o.Snapshot != original.payment.Snapshot {
+		return false
+	}
+	switch s.op.Kind {
+	case OpCapture, OpRefund, OpVoid:
+		return s.payment.Snapshot == original.payment.Snapshot || s.payment.Status == PaymentCaptureFailed
+	}
+	return false
 }
 
 // Older reservations may contribute independent cumulative facts. Their
@@ -750,8 +808,10 @@ func validateOutcome(s state, o Observation, source string) error {
 			return fmt.Errorf("%w: refund differs from reservation", ErrConflict)
 		}
 	case OpVoid:
+		heldVoid := source == "webhook" && p.Status == PaymentCaptureFailed && p.Snapshot == o.Snapshot &&
+			o.OperationReference != "" && o.ProviderReference == p.ProviderReference && p.ProviderReference != ""
 		if f.Captured != base.Captured || f.Refunded != base.Refunded || f.Authorized != base.Authorized ||
-			o.Status == OperationSucceeded && o.Snapshot.Status != PaymentVoided {
+			o.Status == OperationSucceeded && o.Snapshot.Status != PaymentVoided && !heldVoid {
 			return fmt.Errorf("%w: void differs from reservation", ErrConflict)
 		}
 	}
@@ -767,10 +827,13 @@ func (e *Engine) Recover(ctx context.Context, operationID string) (Result, error
 	err := e.config.Store.Transact(ctx, func(tx Tx) error {
 		var err error
 		original, err = e.load(tx, operationID)
+		if err == nil && !e.caps.Query {
+			return e.claimReplay(tx, &original)
+		}
 		return err
 	})
 	if err != nil {
-		return Result{}, err
+		return Result{original.payment, original.op.Operation}, err
 	}
 	if !e.caps.Query {
 		return e.replayUnknown(ctx, original)
@@ -807,35 +870,51 @@ func (e *Engine) Recover(ctx context.Context, operationID string) (Result, error
 	}
 }
 
-// replayUnknown makes at most one identical provider call. It never uses a
-// fresh key or a token, and excludes records created without a replay binding.
-func (e *Engine) replayUnknown(ctx context.Context, original state) (Result, error) {
-	p, op := original.payment, original.op.Operation
-	last := Result{p, op}
+// Transfer dispatch ownership under the store's serializable transaction.
+// Once a prior lease expires its outstanding HTTP call might still succeed.
+// Marking the outcome unknown fences a late definite rejection from that call.
+func (e *Engine) claimReplay(tx Tx, s *state) error {
+	p, op := s.payment, s.op.Operation
 	provider, ok := e.config.Provider.(IdempotentReplayProvider)
 	if !ok || op.ReplayFingerprint == "" || op.Status != OperationUnknown && op.Status != OperationReserved || p.Status == PaymentCaptureFailed {
-		return last, ErrUnsupported
+		return ErrUnsupported
+	}
+	if err := e.checkStore(op.Kind, tx); err != nil {
+		return err
 	}
 	req := ProviderRequest{Payment: p, Operation: op}
 	id, window := provider.ReplayIdentity(req)
 	if id != op.ReplayFingerprint {
-		return last, ErrConflict
+		return ErrConflict
 	}
-	remaining := op.ReplayUntil.Sub(e.config.Now().UTC())
+	now := e.config.Now().UTC()
+	remaining := op.ReplayUntil.Sub(now)
 	if remaining <= 0 || remaining > window {
-		return last, ErrUnsupported
+		return ErrUnsupported
 	}
+	if s.op.DispatchUntil.After(now) {
+		return ErrConflict
+	}
+	claim := s.op
+	claim.Status = OperationUnknown
+	claim.DispatchUntil = now.Add(min(e.config.Timeout, remaining))
+	if err := tx.UpdateOperation(claim); err != nil {
+		return err
+	}
+	s.op = claim
+	return nil
+}
+
+// replayUnknown makes one token-free request under the committed lease.
+func (e *Engine) replayUnknown(ctx context.Context, original state) (Result, error) {
+	req := ProviderRequest{Payment: original.payment, Operation: original.op.Operation}
+	remaining := original.op.DispatchUntil.Sub(e.config.Now().UTC())
 	call, cancel := context.WithTimeout(ctx, min(e.config.Timeout, remaining))
 	defer cancel()
-	obs, err := e.config.Provider.Execute(call, req)
-	if err != nil {
-		return last, errors.Join(ErrUnknownOutcome, err)
+	var obs Observation
+	err := call.Err()
+	if err == nil {
+		obs, err = e.config.Provider.Execute(call, req)
 	}
-	finish, stop := context.WithTimeout(context.WithoutCancel(ctx), e.config.Timeout)
-	defer stop()
-	result, err := e.apply(finish, original, obs, "response")
-	if err != nil {
-		return last, errors.Join(ErrUnknownOutcome, err)
-	}
-	return result.result()
+	return e.finishDispatch(ctx, original, obs, err)
 }
