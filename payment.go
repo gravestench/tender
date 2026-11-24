@@ -122,6 +122,7 @@ type Payment struct {
 	Scope                                                   Scope
 	ID, OrderID                                             string
 	Provider, MerchantAccount, AttemptID, ProviderReference string
+	Market                                                  Market
 	Amount                                                  Money
 	Version                                                 uint64
 	Snapshot
