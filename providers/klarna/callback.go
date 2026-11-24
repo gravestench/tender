@@ -169,15 +169,36 @@ func (a *Adapter) ProcessAuthorization(ctx context.Context, e *tender.Engine, pa
 		return tender.Result{}, tender.ErrConflict
 	}
 	res, err := e.Confirm(ctx, tender.Request{Key: "klarna-order-" + id, PaymentID: payment, Amount: p.Amount, Token: id})
-	if res.Operation.Status != tender.OperationFailed && res.Operation.Status != tender.OperationPending && res.Operation.Status != tender.OperationSucceeded {
+	// A different receipt can already have completed this same attempt.
+	// Uncertain or pending authority leaves the competing receipt available.
+	superseded := res.Operation.ID == "" && errors.Is(err, tender.ErrConflict)
+	if !superseded && res.Operation.Status != tender.OperationFailed && res.Operation.Status != tender.OperationPending && res.Operation.Status != tender.OperationSucceeded {
 		return res, err
 	}
 	mark := a.cfg.Store.Transact(ctx, func(tx tender.Tx) error {
+		if superseded {
+			current, readErr := tx.Payment(a.cfg.Scope, p.ID)
+			if readErr != nil {
+				return readErr
+			}
+			if !a.validRoute(current) || binding(current) != item.Binding {
+				return tender.ErrConflict
+			}
+			switch current.Status {
+			case tender.PaymentAuthorized, tender.PaymentPartiallyCaptured, tender.PaymentCaptured, tender.PaymentSettled, tender.PaymentVoided, tender.PaymentDeclined, tender.PaymentExpired, tender.PaymentReturned:
+			default:
+				return tender.ErrConflict
+			}
+			res = tender.Result{Payment: current}
+		}
 		w, ok := tx.(tender.VerifiedEventTx)
 		if !ok {
 			return tender.ErrUnsupported
 		}
 		return w.ProcessVerifiedEvent(a.key(id), a.cfg.Now(), func(json.RawMessage) error { return nil })
 	})
+	if superseded {
+		return res, mark
+	}
 	return res, errors.Join(err, mark)
 }

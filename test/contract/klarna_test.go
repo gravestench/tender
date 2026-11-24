@@ -47,7 +47,7 @@ func newKlarna(t *testing.T, db adyenStore, fx mockserver.KlarnaFixture) *klarna
 	fx.APIKey = "mock-key"
 	fx.CallbackURL = srv.URL + "/callback"
 	var err error
-	h.sim, err = mockserver.New(mockserver.Config{PublicBaseURL: srv.URL + "/sim", Routes: mockserver.KlarnaRoutes(fx)})
+	h.sim, err = mockserver.New(mockserver.Config{PublicBaseURL: srv.URL + "/sim", Clock: func() time.Time { return h.now }, Routes: mockserver.KlarnaRoutes(fx)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,15 +102,25 @@ func (h *klarnaRig) session() tender.Result {
 }
 func (h *klarnaRig) callback(session string) string {
 	h.t.Helper()
-	for range 2 {
-		resp, err := http.Post(h.url+"/sim/mock/authorize/"+session, "application/json", nil)
-		if err != nil {
-			h.t.Fatal(err)
-		}
-		resp.Body.Close()
-		if resp.StatusCode != 204 {
-			h.t.Fatalf("synthetic callback = %d", resp.StatusCode)
-		}
+	res, err := http.Post(h.url+"/sim/mock/authorize/"+session, "application/json", nil)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != 204 {
+		h.t.Fatalf("synthetic callback = %d", res.StatusCode)
+	}
+	// A retry of the same callback carries the already-issued token. A
+	// second buyer authorization is a distinct operation and issues a new one.
+	first := <-h.seen
+	body, _ := json.Marshal(map[string]string{"session_id": session, "authorization_token": first.token})
+	res, err = http.Post(first.target, "application/json", bytes.NewReader(body))
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != 204 {
+		h.t.Fatalf("duplicate callback = %d", res.StatusCode)
 	}
 	ids, err := h.a.Authorizations(h.t.Context(), "pay")
 	if err != nil || len(ids) != 1 {
@@ -456,3 +466,215 @@ func TestKlarnaUSTaxAndInactiveMerchant(t *testing.T) {
 type klarnaRequestFunc func(*http.Request) (*http.Response, error)
 
 func (f klarnaRequestFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func filterKlarnaJSON(t *testing.T, change func(string, map[string]any)) klarnaResponseFilter {
+	t.Helper()
+	return func(res *http.Response) {
+		if res.Request.Method != "GET" || res.StatusCode != 200 {
+			return
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(res.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		_ = res.Body.Close()
+		change(res.Request.URL.Path, payload)
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body = io.NopCloser(bytes.NewReader(raw))
+	}
+}
+func TestKlarnaModificationResourceProof(t *testing.T) {
+	for _, route := range []string{"captures", "refunds"} {
+		t.Run(route, func(t *testing.T) {
+			h := newKlarna(t, store.NewMemory(), mockserver.KlarnaFixture{})
+			ctx := t.Context()
+			if _, err := h.order(); err != nil {
+				t.Fatal(err)
+			}
+			mutate := h.e.Capture
+			if route == "refunds" {
+				if _, err := h.e.Capture(ctx, kreq("base", 70)); err != nil {
+					t.Fatal(err)
+				}
+				mutate = h.e.Refund
+			}
+			if err := h.sim.SetScenarios("klarna."+route, mockserver.Scenario{Fault: mockserver.LoseResponse}); err != nil {
+				t.Fatal(err)
+			}
+			lost, err := mutate(ctx, kreq("lost", 34))
+			if !errors.Is(err, tender.ErrUnknownOutcome) {
+				t.Fatal(err)
+			}
+			var reads int
+			h.cfg.Transport = filterKlarnaJSON(t, func(path string, obj map[string]any) {
+				if strings.Contains(path, "/"+route+"/") {
+					reads++
+					obj["reference"] = "different-operation"
+				}
+			})
+			h.restart()
+			r, err := h.e.Recover(ctx, lost.Operation.ID)
+			if !errors.Is(err, tender.ErrUnknownOutcome) || r.Payment.Funds != lost.Payment.Funds || reads != 1 {
+				t.Fatalf("contradictory %s detail advanced funds: %v, reads %d, error %v", route, r.Payment.Funds, reads, err)
+			}
+			h.cfg.Transport = nil
+			h.restart()
+			r, err = h.e.Recover(ctx, lost.Operation.ID)
+			if err != nil || r.Operation.Status != tender.OperationSucceeded {
+				t.Fatal("genuine detail was not accepted", err)
+			}
+		})
+	}
+}
+func TestKlarnaPendingOrderEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name, fraud, status, country, method string
+		remaining                            int64
+	}{
+		{"pending_unknown_status", "PENDING", "X", "US", "FIXED_AMOUNT", 100}, {"pending_negative", "PENDING", "AUTHORIZED", "US", "FIXED_AMOUNT", -1}, {"rejected_excess", "REJECTED", "CANCELLED", "US", "FIXED_AMOUNT", 101}, {"rejected_bad_status", "REJECTED", "X", "US", "FIXED_AMOUNT", 0}, {"wrong_country", "ACCEPTED", "AUTHORIZED", "CA", "FIXED_AMOUNT", 100}, {"pay_now", "ACCEPTED", "AUTHORIZED", "US", "DIRECT_DEBIT", 100},
+		{"unqualified_credit_product", "ACCEPTED", "AUTHORIZED", "US", "BASE_ACCOUNT", 100},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newKlarna(t, store.NewMemory(), mockserver.KlarnaFixture{FraudStatus: "PENDING"})
+			ctx := t.Context()
+			base, err := h.order()
+			if err != nil {
+				t.Fatal(err)
+			}
+			h.cfg.Transport = filterKlarnaJSON(t, func(_ string, obj map[string]any) {
+				obj["fraud_status"] = tc.fraud
+				obj["status"] = tc.status
+				obj["remaining_authorized_amount"] = tc.remaining
+				obj["purchase_country"] = tc.country
+				obj["initial_payment_method"] = map[string]string{"type": tc.method}
+			})
+			h.restart()
+			r, err := h.e.Recover(ctx, base.Operation.ID)
+			if !errors.Is(err, tender.ErrUnknownOutcome) || r.Payment.Status != tender.PaymentPending {
+				t.Fatalf("bad provider facts accepted: %v, %v", r.Payment.Status, err)
+			}
+		})
+	}
+}
+func TestKlarnaReleaseNoEffect(t *testing.T) {
+	h := newKlarna(t, store.NewMemory(), mockserver.KlarnaFixture{})
+	ctx := t.Context()
+	auth, err := h.order()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = h.e.Capture(ctx, kreq("part", 40)); err != nil {
+		t.Fatal(err)
+	}
+	// An operator already released the outstanding amount in the portal.
+	req, err := http.NewRequestWithContext(ctx, "POST", h.url+"/sim/ordermanagement/v1/orders/"+auth.Payment.ProviderReference+"/release-remaining-authorization", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Basic mock-key")
+	req.Header.Set("Klarna-Idempotency-Key", "outside-release")
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != 204 {
+		t.Fatal("portal release", res.StatusCode)
+	}
+	r, err := h.e.Void(ctx, kreq("release", 60))
+	var pe *tender.ProviderError
+	if !errors.As(err, &pe) || pe.Kind != tender.ErrValidation || pe.ProviderStatus != "NOT_ALLOWED" || r.Operation.Status != tender.OperationFailed {
+		t.Fatalf("release = %s %v %+v", r.Operation.Status, err, pe)
+	}
+	r, err = h.e.Refund(ctx, kreq("still-refund", 20))
+	if err != nil || r.Payment.Funds.Refunded != 20 {
+		t.Fatal("rejected release blocked independent refund", err)
+	}
+}
+func TestKlarnaReauthorization(t *testing.T) {
+	h := newKlarna(t, store.NewMemory(), mockserver.KlarnaFixture{})
+	ctx := t.Context()
+	placements := 0
+	h.cfg.Transport = klarnaRequestFunc(func(req *http.Request) (*http.Response, error) {
+		if strings.HasSuffix(req.URL.Path, "/order") {
+			placements++
+		}
+		return http.DefaultTransport.RoundTrip(req)
+	})
+	h.restart()
+	session := h.session().Operation.ProviderReference
+	approve := func() {
+		t.Helper()
+		resp, err := http.Post(h.url+"/sim/mock/authorize/"+session, "application/json", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 204 {
+			t.Fatal("buyer approval", resp.StatusCode)
+		}
+	}
+	approve()
+	old := <-h.seen
+	ids, err := h.a.Authorizations(ctx, "pay")
+	if err != nil || len(ids) != 1 {
+		t.Fatal(ids, err)
+	}
+	first := ids[0]
+	h.now = h.now.Add(61 * time.Minute)
+	if _, err = h.a.ProcessAuthorization(ctx, h.e, "pay", first); !errors.Is(err, tender.ErrValidation) {
+		t.Fatal("old authorization not expired", err)
+	}
+	approve()
+	fresh := <-h.seen
+	if fresh.token == old.token {
+		t.Fatal("renewed authorization reused expired token")
+	}
+	ids, err = h.a.Authorizations(ctx, "pay")
+	if err != nil || len(ids) != 2 {
+		t.Fatal("renewal did not persist a second receipt", ids, err)
+	}
+	var renewed string
+	for _, id := range ids {
+		if id != first {
+			renewed = id
+		}
+	}
+	r, err := h.a.ProcessAuthorization(ctx, h.e, "pay", renewed)
+	if err != nil || r.Payment.Status != tender.PaymentAuthorized {
+		t.Fatal("renewal failed", err)
+	}
+	// A distinct, delayed receipt for the same session arrives after placement.
+	raw, _ := json.Marshal(map[string]string{"session_id": session, "authorization_token": "another-delayed-token"})
+	res, err := http.Post(fresh.target, "application/json", bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != 204 {
+		t.Fatal(res.StatusCode)
+	}
+	ids, err = h.a.Authorizations(ctx, "pay")
+	if err != nil || len(ids) != 3 {
+		t.Fatal(ids, err)
+	}
+	var late string
+	for _, id := range ids {
+		if id != first && id != renewed {
+			late = id
+		}
+	}
+	got, err := h.a.ProcessAuthorization(ctx, h.e, "pay", late)
+	if err != nil || got.Payment.ProviderReference != r.Payment.ProviderReference || placements != 1 {
+		t.Fatal("superseded receipt or duplicate placement", err, placements)
+	}
+	err = h.db.Transact(ctx, func(tx tender.Tx) error {
+		return tx.(tender.VerifiedEventTx).ProcessVerifiedEvent(tender.VerifiedEventKey{Scope: dbScope, Provider: "klarna", MerchantAccount: "mid", ID: late}, h.now, func(json.RawMessage) error { return errors.New("superseded receipt remained pending") })
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}

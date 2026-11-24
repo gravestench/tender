@@ -145,11 +145,9 @@ func (a *app) installKlarna(mux *http.ServeMux, db tender.Store) (func(), error)
 			http.Error(w, "order pending", 503)
 			return
 		}
-		ids, err := adapter.Authorizations(r.Context(), o.PaymentID)
-		if err != nil || len(ids) != 1 || worker.Process(r.Context(), ids[0]) != nil {
-			http.Error(w, "order pending", 503)
-			return
-		}
+		// A session may have older expired/superseded authorization receipts.
+		// Drain the same durable inbox as the background worker.
+		a.processCheckoutEvents(r.Context(), worker)
 		render(w, r, o, s)
 	}))
 	// The worker drains durable receipts even if the browser disconnects.

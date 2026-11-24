@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 )
 
 // KlarnaFixture supplies a single synthetic US/USD Klarna Payments merchant.
@@ -41,9 +42,10 @@ type klarnaCart struct {
 	Binding  string            `json:"merchant_reference2"`
 }
 type klarnaSession struct {
-	cart                   klarnaCart
-	callback, token, order string
-	approved               bool
+	cart                       klarnaCart
+	callback, token, order     string
+	generation                 int
+	sessionExpiry, tokenExpiry time.Time
 }
 type klarnaChange struct {
 	CaptureID string `json:"capture_id,omitempty"`
@@ -124,6 +126,9 @@ func KlarnaRoutes(cfg KlarnaFixture) func(*Server) http.Handler {
 		for _, name := range []string{"captures", "refunds", "release-remaining-authorization", "cancel"} {
 			route("POST /ordermanagement/v1/orders/{order}/"+name, name, func(w http.ResponseWriter, r *http.Request) { k.modify(w, r, name) })
 		}
+		for _, name := range []string{"captures", "refunds"} {
+			route("GET /ordermanagement/v1/orders/{order}/"+name+"/{resource}", name+"-detail", func(w http.ResponseWriter, r *http.Request) { k.readResource(w, r, name) })
+		}
 		route("GET /ordermanagement/v1/orders/{order}", "read", k.read)
 		return mux
 	}
@@ -173,10 +178,8 @@ func (k *klarnaSimulator) session(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := mockKlarnaID(fmt.Sprintf("%s/%s/%d", req.Binding, query.Get("create"), len(k.sessions)))
-	token := mockKlarnaID("auth/" + id)
-	s := &klarnaSession{cart: req.klarnaCart, callback: req.URLs["authorization"], token: token}
+	s := &klarnaSession{cart: req.klarnaCart, callback: req.URLs["authorization"], sessionExpiry: k.s.clock().Add(48 * time.Hour)}
 	k.sessions[id] = s
-	k.tokens[token] = s
 	klarnaJSON(w, 200, map[string]any{"session_id": id, "client_token": "mock-client-" + id, "payment_method_categories": []map[string]string{{"identifier": k.cfg.Category, "name": "Synthetic Klarna"}}})
 }
 func (k *klarnaSimulator) approve(w http.ResponseWriter, r *http.Request) {
@@ -190,7 +193,15 @@ func (k *klarnaSimulator) approve(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(403)
 		return
 	}
-	session.approved = true
+	if session.order != "" || !k.s.clock().Before(session.sessionExpiry) {
+		klarnaError(w, 404, "SESSION_COMPLETED")
+		return
+	}
+	delete(k.tokens, session.token)
+	session.generation++
+	session.token = mockKlarnaID(fmt.Sprintf("auth/%s/%d", id, session.generation))
+	session.tokenExpiry = k.s.clock().Add(time.Hour)
+	k.tokens[session.token] = session
 	body, _ := json.Marshal(map[string]string{"session_id": id, "authorization_token": session.token})
 	req, err := http.NewRequestWithContext(r.Context(), "POST", session.callback, bytes.NewReader(body))
 	if err != nil {
@@ -214,7 +225,7 @@ func (k *klarnaSimulator) approve(w http.ResponseWriter, r *http.Request) {
 }
 func (k *klarnaSimulator) order(w http.ResponseWriter, r *http.Request) {
 	s := k.tokens[r.PathValue("token")]
-	if s == nil || !s.approved {
+	if s == nil || (s.order == "" && !k.s.clock().Before(s.tokenExpiry)) {
 		klarnaError(w, 404, "NOT_FOUND")
 		return
 	}
@@ -297,7 +308,11 @@ func (k *klarnaSimulator) modify(w http.ResponseWriter, r *http.Request, route s
 		ord.refunds = append(ord.refunds, klarnaChange{RefundID: changeID, Ref: item.Ref, Refunded: item.Refunded})
 	case "cancel", "release-remaining-authorization":
 		if ord.remaining == 0 || (route == "cancel") != (ord.captured == 0) {
-			klarnaError(w, 403, "CANCEL_NOT_ALLOWED")
+			code := "CANCEL_NOT_ALLOWED"
+			if route == "release-remaining-authorization" {
+				code = "NOT_ALLOWED"
+			}
+			klarnaError(w, 403, code)
 			return
 		}
 		rec.Amount = ord.remaining
@@ -331,6 +346,27 @@ func (k *klarnaSimulator) read(w http.ResponseWriter, r *http.Request) {
 	}
 	if k.cfg.FraudOnRead != "" {
 		o.fraud = k.cfg.FraudOnRead
+		if o.fraud == "REJECTED" {
+			o.status = "CANCELLED"
+			o.remaining = 0
+		}
 	}
-	klarnaJSON(w, 200, map[string]any{"order_id": id, "merchant_reference1": o.cart.Merchant, "merchant_reference2": o.cart.Binding, "purchase_currency": o.cart.Currency, "order_amount": o.cart.Amount, "original_order_amount": o.cart.Amount, "captured_amount": o.captured, "refunded_amount": o.refunded, "remaining_authorized_amount": o.remaining, "fraud_status": o.fraud, "status": o.status, "captures": o.captures, "refunds": o.refunds})
+	klarnaJSON(w, 200, map[string]any{"order_id": id, "merchant_reference1": o.cart.Merchant, "merchant_reference2": o.cart.Binding, "purchase_country": o.cart.Country, "initial_payment_method": map[string]string{"type": "FIXED_AMOUNT"}, "purchase_currency": o.cart.Currency, "order_amount": o.cart.Amount, "original_order_amount": o.cart.Amount, "captured_amount": o.captured, "refunded_amount": o.refunded, "remaining_authorized_amount": o.remaining, "fraud_status": o.fraud, "status": o.status, "captures": o.captures, "refunds": o.refunds})
+}
+
+func (k *klarnaSimulator) readResource(w http.ResponseWriter, r *http.Request, route string) {
+	o := k.orders[r.PathValue("order")]
+	if o != nil {
+		items := o.captures
+		if route == "refunds" {
+			items = o.refunds
+		}
+		for _, item := range items {
+			if item.CaptureID == r.PathValue("resource") || item.RefundID == r.PathValue("resource") {
+				klarnaJSON(w, 200, item)
+				return
+			}
+		}
+	}
+	klarnaError(w, 404, "NOT_FOUND")
 }

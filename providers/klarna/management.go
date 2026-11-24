@@ -2,6 +2,7 @@ package klarna
 
 import (
 	"context"
+	"errors"
 	"net/http"
 
 	"github.com/gravestench/tender"
@@ -81,28 +82,45 @@ func modificationOutcome(r tender.ProviderRequest, o tender.Observation) tender.
 	return o
 }
 
+// IsUSFinancing checks the authenticated Order Management market and initial
+// payment method against this adapter's pinned pay-over-time product.
+func IsUSFinancing(country, currency, method string) bool {
+	return country == "US" && currency == "USD" && financingMethod(method)
+}
+
+type modificationResource struct {
+	CaptureID string `json:"capture_id"`
+	RefundID  string `json:"refund_id"`
+	Reference string `json:"reference"`
+	Captured  int64  `json:"captured_amount"`
+	Refunded  int64  `json:"refunded_amount"`
+}
+
+func (m modificationResource) identity(kind tender.OperationKind) (string, int64) {
+	if kind == tender.OpRefund {
+		return m.RefundID, m.Refunded
+	}
+	return m.CaptureID, m.Captured
+}
+
 type orderDetails struct {
 	OrderID     string `json:"order_id"`
 	MerchantRef string `json:"merchant_reference1"`
 	Binding     string `json:"merchant_reference2"`
-	Currency    string `json:"purchase_currency"`
-	Original    *int64 `json:"original_order_amount"`
-	Amount      *int64 `json:"order_amount"`
-	Captured    *int64 `json:"captured_amount"`
-	Refunded    *int64 `json:"refunded_amount"`
-	Remaining   *int64 `json:"remaining_authorized_amount"`
-	Fraud       string `json:"fraud_status"`
-	Status      string `json:"status"`
-	Captures    []struct {
-		ID        string `json:"capture_id"`
-		Reference string `json:"reference"`
-		Amount    int64  `json:"captured_amount"`
-	} `json:"captures"`
-	Refunds []struct {
-		ID        string `json:"refund_id"`
-		Reference string `json:"reference"`
-		Amount    int64  `json:"refunded_amount"`
-	} `json:"refunds"`
+	Country     string `json:"purchase_country"`
+	Initial     struct {
+		Type string `json:"type"`
+	} `json:"initial_payment_method"`
+	Currency  string                 `json:"purchase_currency"`
+	Original  *int64                 `json:"original_order_amount"`
+	Amount    *int64                 `json:"order_amount"`
+	Captured  *int64                 `json:"captured_amount"`
+	Refunded  *int64                 `json:"refunded_amount"`
+	Remaining *int64                 `json:"remaining_authorized_amount"`
+	Fraud     string                 `json:"fraud_status"`
+	Status    string                 `json:"status"`
+	Captures  []modificationResource `json:"captures"`
+	Refunds   []modificationResource `json:"refunds"`
 }
 
 // Query reads a bound order. A capture or refund requires its exact merchant
@@ -124,14 +142,23 @@ func (a *Adapter) Query(ctx context.Context, r tender.ProviderRequest) (tender.O
 	if _, err := a.call(ctx, "GET", "/ordermanagement/v1/orders/"+p.ProviderReference, "", nil, 200, &data); err != nil {
 		return o, err
 	}
-	if data.OrderID != p.ProviderReference || data.MerchantRef != p.OrderID || data.Binding != binding(p) || data.Currency != p.Amount.Currency || data.Original == nil || *data.Original != p.Amount.Minor || data.Amount == nil || data.Captured == nil || data.Refunded == nil || data.Remaining == nil {
+	if data.OrderID != p.ProviderReference || data.MerchantRef != p.OrderID || data.Binding != binding(p) || !IsUSFinancing(data.Country, data.Currency, data.Initial.Type) || data.Original == nil || *data.Original != p.Amount.Minor || data.Amount == nil || data.Captured == nil || data.Refunded == nil || data.Remaining == nil {
 		return o, tender.ErrUnknownOutcome
 	}
 	if op.Kind == tender.OpConfirm {
 		if op.ProviderReference != p.ProviderReference || p.VerifiedMethod != tender.MethodKlarna || *data.Captured != 0 || *data.Refunded != 0 || *data.Amount != p.Amount.Minor {
 			return o, tender.ErrUnknownOutcome
 		}
-		if data.Fraud == "ACCEPTED" && (data.Status != "AUTHORIZED" || *data.Remaining != p.Amount.Minor) {
+		switch data.Fraud {
+		case "PENDING", "ACCEPTED":
+			if data.Status != "AUTHORIZED" || *data.Remaining != p.Amount.Minor {
+				return o, tender.ErrUnknownOutcome
+			}
+		case "REJECTED":
+			if data.Status != "CANCELLED" || *data.Remaining != 0 {
+				return o, tender.ErrUnknownOutcome
+			}
+		default:
 			return o, tender.ErrUnknownOutcome
 		}
 		o.OperationReference = p.ProviderReference
@@ -156,27 +183,39 @@ func (a *Adapter) Query(ctx context.Context, r tender.ProviderRequest) (tender.O
 	if !amountMatches || data.Status != expectedStatus || *data.Remaining != remaining {
 		return o, tender.ErrUnknownOutcome
 	}
-	var ids []string
-	ref := modificationReference(r)
+	items, route := data.Captures, "captures"
 	switch op.Kind {
-	case tender.OpCapture:
-		for _, c := range data.Captures {
-			if c.Reference == ref && c.Amount == op.Amount.Minor {
-				ids = append(ids, c.ID)
-			}
-		}
 	case tender.OpRefund:
-		for _, f := range data.Refunds {
-			if f.Reference == ref && f.Amount == op.Amount.Minor {
-				ids = append(ids, f.ID)
-			}
-		}
+		items, route = data.Refunds, "refunds"
+	case tender.OpCapture:
 	default:
 		return o, tender.ErrUnsupported
 	}
-	if len(ids) != 1 || !safeID.MatchString(ids[0]) {
+	ref := modificationReference(r)
+	var id string
+	for _, item := range items {
+		if item.Reference != ref {
+			continue
+		}
+		candidate, amount := item.identity(op.Kind)
+		if id != "" || !safeID.MatchString(candidate) || amount != op.Amount.Minor {
+			return o, tender.ErrUnknownOutcome
+		}
+		id = candidate
+	}
+	if id == "" {
 		return o, tender.ErrUnknownOutcome
 	}
-	expect.OperationReference = ids[0]
+	// The order's embedded list locates the resource. The resource's own
+	// authenticated detail must independently agree with this reservation.
+	var detail modificationResource
+	if _, err := a.call(ctx, "GET", "/ordermanagement/v1/orders/"+p.ProviderReference+"/"+route+"/"+id, "", nil, 200, &detail); err != nil {
+		return o, errors.Join(tender.ErrUnknownOutcome, err)
+	}
+	actual, amount := detail.identity(op.Kind)
+	if actual != id || detail.Reference != ref || amount != op.Amount.Minor {
+		return o, tender.ErrUnknownOutcome
+	}
+	expect.OperationReference = id
 	return expect, nil
 }

@@ -32,15 +32,15 @@ func TestKlarnaSandboxOrderRecord(t *testing.T) {
 	}
 	defer f.Close()
 	var host struct {
-		OrderID, MerchantReference1, MerchantReference2, CaptureID, RefundID string
-		OrderAmount, CapturedAmount, RefundedAmount                          int64
+		OrderID, MerchantReference1, MerchantReference2, CaptureID, RefundID, FinancingMethod string
+		OrderAmount, CapturedAmount, RefundedAmount                                           int64
 	}
 	raw, err := io.ReadAll(io.LimitReader(f, 8193))
 	if err != nil || len(raw) > 8192 || json.Unmarshal(raw, &host) != nil {
 		t.Fatal("BLOCKED: invalid host evidence")
 	}
 	uuid := regexp.MustCompile(`(?i)^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`)
-	if !uuid.MatchString(host.OrderID) || !uuid.MatchString(host.CaptureID) || !uuid.MatchString(host.RefundID) || host.MerchantReference1 == "" || host.MerchantReference2 == "" || host.OrderAmount <= 0 || host.CapturedAmount > host.OrderAmount || host.RefundedAmount <= 0 || host.RefundedAmount >= host.CapturedAmount {
+	if !uuid.MatchString(host.OrderID) || !uuid.MatchString(host.CaptureID) || !uuid.MatchString(host.RefundID) || !klarna.IsUSFinancing("US", "USD", host.FinancingMethod) || host.MerchantReference1 == "" || host.MerchantReference2 == "" || host.OrderAmount <= 0 || host.CapturedAmount > host.OrderAmount || host.RefundedAmount <= 0 || host.RefundedAmount >= host.CapturedAmount {
 		t.Fatal("BLOCKED: host evidence must identify a captured US/USD order and its partial refund")
 	}
 	req, err := http.NewRequestWithContext(t.Context(), "GET", klarna.PlaygroundURL+"/ordermanagement/v1/orders/"+host.OrderID, nil)
@@ -60,9 +60,13 @@ func TestKlarnaSandboxOrderRecord(t *testing.T) {
 		t.Fatal(fmt.Sprintf("BLOCKED: NA playground order returned HTTP %d", res.StatusCode))
 	}
 	var provider struct {
-		ID       string `json:"order_id"`
-		Ref1     string `json:"merchant_reference1"`
-		Ref2     string `json:"merchant_reference2"`
+		ID      string `json:"order_id"`
+		Ref1    string `json:"merchant_reference1"`
+		Ref2    string `json:"merchant_reference2"`
+		Country string `json:"purchase_country"`
+		Initial struct {
+			Type string `json:"type"`
+		} `json:"initial_payment_method"`
 		Currency string `json:"purchase_currency"`
 		Original int64  `json:"original_order_amount"`
 		Captured int64  `json:"captured_amount"`
@@ -79,7 +83,7 @@ func TestKlarnaSandboxOrderRecord(t *testing.T) {
 	if err != nil || len(raw) > 1<<20 || json.Unmarshal(raw, &provider) != nil {
 		t.Fatal("invalid playground order details")
 	}
-	if provider.ID != host.OrderID || provider.Ref1 != host.MerchantReference1 || provider.Ref2 != host.MerchantReference2 || provider.Currency != "USD" || provider.Fraud != "ACCEPTED" || provider.Original != host.OrderAmount || provider.Captured != host.CapturedAmount || provider.Refunded != host.RefundedAmount {
+	if provider.ID != host.OrderID || provider.Ref1 != host.MerchantReference1 || provider.Ref2 != host.MerchantReference2 || !klarna.IsUSFinancing(provider.Country, provider.Currency, provider.Initial.Type) || !strings.EqualFold(host.FinancingMethod, provider.Initial.Type) || provider.Fraud != "ACCEPTED" || provider.Original != host.OrderAmount || provider.Captured != host.CapturedAmount || provider.Refunded != host.RefundedAmount {
 		t.Fatal("host and playground order identities, route, or amounts differ")
 	}
 	capture, refund := false, false

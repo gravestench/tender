@@ -310,15 +310,17 @@ func (a *Adapter) order(ctx context.Context, r tender.ProviderRequest, o tender.
 	if !safeID.MatchString(reply.OrderID) || reply.Redirect != "" {
 		return o, tender.ErrUnknownOutcome
 	}
-	switch strings.ToLower(reply.Method) {
-	case "fixed_amount", "base_account":
-	default:
+	if !financingMethod(reply.Method) {
 		return o, tender.ErrUnknownOutcome
 	}
 	o.ProviderReference = reply.OrderID
 	o.OperationReference = reply.OrderID
 	return orderDecision(o, reply.Fraud, p.Amount.Minor)
 }
+func financingMethod(method string) bool {
+	return strings.EqualFold(method, "FIXED_AMOUNT")
+}
+
 func orderDecision(o tender.Observation, fraud string, amount int64) (tender.Observation, error) {
 	o.Snapshot = tender.Snapshot{ProviderStatus: fraud, VerifiedMethod: tender.MethodKlarna}
 	switch fraud {
@@ -380,6 +382,9 @@ func (a *Adapter) call(ctx context.Context, method, path, key string, body any, 
 			e.RetryAfter = time.Duration(n) * time.Second
 			return nil, e
 		case 400, 403, 404, 422:
+			if res.StatusCode == 403 && failure.Code == "NOT_ALLOWED" && method == "POST" && strings.HasSuffix(path, "/release-remaining-authorization") {
+				return nil, tender.NewProviderError(tender.ErrValidation, "NOT_ALLOWED")
+			}
 			if res.StatusCode == 403 && failure.Code == "MERCHANT_INACTIVE" {
 				return nil, tender.NewProviderError(tender.ErrUnsupported, "MERCHANT_INACTIVE")
 			}
