@@ -566,7 +566,12 @@ func fullyCollected(p Payment) bool {
 		return false
 	}
 	if p.Market.Method == MethodACH {
-		return p.Status == PaymentSettled && f.Settled == p.Amount.Minor
+		// A settlement with prior authorization retains its principal status.
+		switch p.Status {
+		case PaymentSettled, PaymentAuthorized, PaymentPartiallyCaptured, PaymentCaptured:
+			return f.Settled == p.Amount.Minor
+		}
+		return false
 	}
 	return p.Status == PaymentCaptured && f.Captured == p.Amount.Minor
 }

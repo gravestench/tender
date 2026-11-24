@@ -825,17 +825,61 @@ func TestPendingCollectionRejectsContradictoryFailure(t *testing.T) {
 
 func TestACHRequiresSettlementForFulfillment(t *testing.T) {
 	db := store.NewMemory()
+	var req tender.ProviderRequest
+	funds := tender.Funds{Authorized: 100, Captured: 100}
 	p := achProcessor{&processor{execute: func(_ context.Context, r tender.ProviderRequest) (tender.Observation, error) {
-		return observed(r, tender.PaymentCaptured, tender.Funds{Authorized: 100, Captured: 100}), nil
+		req = r
+		return observed(r, tender.PaymentCaptured, funds), nil
 	}}}
-	e, err := tender.NewEngine(tender.EngineConfig{Store: db, Provider: p, Scope: shop, ProviderName: "bank", MerchantAccount: "account", Market: p.Capabilities().Markets[0].Market})
+	e, err := tender.NewEngine(tender.EngineConfig{
+		Store: db, Provider: p, Scope: shop, ProviderName: "bank", MerchantAccount: "account",
+		Market: p.Capabilities().Markets[0].Market,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _ = e.Create(t.Context(), purchase())
+
+	created, err := e.Create(t.Context(), purchase())
+	if err != nil || created.Payment.Funds != funds {
+		t.Fatalf("initial ACH principal: %+v %v", created, err)
+	}
 	out, err := db.Outbox(t.Context(), shop)
 	if err != nil || len(out) != 0 {
 		t.Fatalf("bank collection published before settlement: %v %v", out, err)
+	}
+
+	funds.Settled = 100
+	settlement := observed(req, tender.PaymentSettled, funds)
+	settled, err := e.ApplyVerified(t.Context(), settlement)
+	if err != nil || settled.Payment.Funds != funds {
+		t.Fatalf("verified full settlement: %+v %v", settled, err)
+	}
+	out, err = db.Outbox(t.Context(), shop)
+	if err != nil || len(out) != 1 || out[0].Version != settled.Payment.Version {
+		t.Fatalf("full ACH settlement failed to publish one collection: %+v %v", out, err)
+	}
+	notice := out[0]
+
+	replay, err := e.ApplyVerified(t.Context(), settlement)
+	if err != nil || replay != settled {
+		t.Fatalf("settlement replay changed payment: %+v %v", replay, err)
+	}
+	out, err = db.Outbox(t.Context(), shop)
+	if err != nil || len(out) != 1 || out[0] != notice {
+		t.Fatalf("settlement replay changed outbox: %+v %v", out, err)
+	}
+
+	funds.Returned = 100
+	returned, err := e.ApplyVerified(t.Context(), observed(req, tender.PaymentReturned, funds))
+	if err != nil || returned.Payment.Status != tender.PaymentReturned || returned.Payment.Funds != funds {
+		t.Fatalf("return lost original settlement or failed to reverse collection: %+v %v", returned, err)
+	}
+	out, err = db.Outbox(t.Context(), shop)
+	if err != nil || len(out) != 1 || out[0] != notice {
+		t.Fatalf("return changed historical collection notice: %+v %v", out, err)
+	}
+	if _, err := e.ApplyVerified(t.Context(), settlement); err == nil {
+		t.Fatal("late settlement reversed the recorded return")
 	}
 }
 
