@@ -16,6 +16,10 @@ type OperationRecord struct {
 	Failure        ErrorKind
 	FailureStatus  string
 	RetryAfter     time.Duration
+	// RetryNotBefore survives restarts. SuccessorID is set at most once when
+	// a definitive no-effect rejection permits a new reservation on the claim.
+	RetryNotBefore time.Time
+	SuccessorID    string
 }
 
 // AuditEntry records a reservation or outcome. A zero Change means only the

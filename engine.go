@@ -85,23 +85,35 @@ type Result struct {
 }
 
 func (e *Engine) Create(ctx context.Context, r Request) (Result, error) {
-	return e.execute(ctx, OpCreate, r)
+	return e.execute(ctx, OpCreate, r, "")
+}
+
+// RetryCreate reserves a new create operation on the original payment and order
+// after the adapter definitively rejected an earlier request without effect.
+// Supply the rejected operation ID, a new key and the same trusted order and
+// amount. A rejected operation has at most one successor. A retry before the
+// provider's deadline returns ErrRateLimit with the remaining interval.
+func (e *Engine) RetryCreate(ctx context.Context, rejectedOperationID string, r Request) (Result, error) {
+	if strings.TrimSpace(rejectedOperationID) == "" {
+		return Result{}, fmt.Errorf("%w: missing rejected operation ID", ErrValidation)
+	}
+	return e.execute(ctx, OpCreate, r, rejectedOperationID)
 }
 
 func (e *Engine) Confirm(ctx context.Context, r Request) (Result, error) {
-	return e.execute(ctx, OpConfirm, r)
+	return e.execute(ctx, OpConfirm, r, "")
 }
 
 func (e *Engine) Capture(ctx context.Context, r Request) (Result, error) {
-	return e.execute(ctx, OpCapture, r)
+	return e.execute(ctx, OpCapture, r, "")
 }
 
 func (e *Engine) Void(ctx context.Context, r Request) (Result, error) {
-	return e.execute(ctx, OpVoid, r)
+	return e.execute(ctx, OpVoid, r, "")
 }
 
 func (e *Engine) Refund(ctx context.Context, r Request) (Result, error) {
-	return e.execute(ctx, OpRefund, r)
+	return e.execute(ctx, OpRefund, r, "")
 }
 
 func (e *Engine) route(p Payment) error {
@@ -128,7 +140,7 @@ func (e *Engine) Get(ctx context.Context, id string) (Payment, error) {
 	return p, nil
 }
 
-func (e *Engine) fingerprint(kind OperationKind, r Request) string {
+func (e *Engine) fingerprint(kind OperationKind, r Request, predecessor string) string {
 	h := sha256.New()
 	for _, s := range []string{
 		"tender-request-v1", e.config.Scope.MerchantID, string(e.config.Scope.Environment),
@@ -140,6 +152,10 @@ func (e *Engine) fingerprint(kind OperationKind, r Request) string {
 		h.Write([]byte(s))
 	}
 	h.Write(binary.BigEndian.AppendUint64(nil, uint64(r.Amount.Minor)))
+	if predecessor != "" {
+		h.Write(binary.BigEndian.AppendUint64(nil, uint64(len(predecessor))))
+		h.Write([]byte(predecessor))
+	}
 	return hex.EncodeToString(h.Sum(nil))
 }
 
@@ -159,8 +175,8 @@ func (s state) result() (Result, error) {
 	return r, nil
 }
 
-func (e *Engine) execute(ctx context.Context, kind OperationKind, r Request) (Result, error) {
-	s, dispatch, err := e.reserve(ctx, kind, r)
+func (e *Engine) execute(ctx context.Context, kind OperationKind, r Request, predecessor string) (Result, error) {
+	s, dispatch, err := e.reserve(ctx, kind, r, predecessor)
 	if err != nil {
 		return Result{}, err
 	}
@@ -189,11 +205,11 @@ func (e *Engine) execute(ctx context.Context, kind OperationKind, r Request) (Re
 	return final.result()
 }
 
-func (e *Engine) reserve(ctx context.Context, kind OperationKind, r Request) (state, bool, error) {
+func (e *Engine) reserve(ctx context.Context, kind OperationKind, r Request, predecessor string) (state, bool, error) {
 	if strings.TrimSpace(r.Key) == "" || strings.TrimSpace(r.PaymentID) == "" {
 		return state{}, false, fmt.Errorf("%w: missing payment or operation key", ErrValidation)
 	}
-	hash := e.fingerprint(kind, r)
+	hash := e.fingerprint(kind, r, predecessor)
 	var s state
 	var dispatch bool
 	err := e.config.Store.Transact(ctx, func(tx Tx) error {
@@ -213,7 +229,14 @@ func (e *Engine) reserve(ctx context.Context, kind OperationKind, r Request) (st
 			return err
 		}
 		var p Payment
-		if kind == OpCreate {
+		var rejected OperationRecord
+		if predecessor != "" {
+			previous, err := e.retryableCreate(tx, predecessor, r)
+			if err != nil {
+				return err
+			}
+			p, rejected = previous.payment, previous.op
+		} else if kind == OpCreate {
 			p, err = NewPayment(e.config.Scope, r.PaymentID, r.OrderID, r.Amount)
 			if err != nil {
 				return err
@@ -248,7 +271,12 @@ func (e *Engine) reserve(ctx context.Context, kind OperationKind, r Request) (st
 		if p.AttemptID == "" || op.ID == "" || op.ProviderKey == "" {
 			return fmt.Errorf("%w: missing generated identity", ErrValidation)
 		}
-		if kind == OpCreate {
+		if predecessor != "" {
+			rejected.SuccessorID = op.ID
+			if err := tx.UpdateOperation(rejected); err != nil {
+				return err
+			}
+		} else if kind == OpCreate {
 			if err := tx.InsertPayment(p); err != nil {
 				return err
 			}
@@ -261,6 +289,29 @@ func (e *Engine) reserve(ctx context.Context, kind OperationKind, r Request) (st
 		return e.audit(tx, s, Change{}, "reservation")
 	})
 	return s, dispatch, err
+}
+
+func (e *Engine) retryableCreate(tx Tx, predecessor string, r Request) (state, error) {
+	s, err := e.load(tx, predecessor)
+	if err != nil {
+		return state{}, err
+	}
+	p, op := s.payment, s.op
+	if p.ID != r.PaymentID || p.OrderID != r.OrderID || p.Amount != r.Amount ||
+		p.Status != PaymentCreated || p.Version != op.BaseVersion || p.ProviderReference != "" ||
+		op.Kind != OpCreate || op.Status != OperationFailed || op.SuccessorID != "" {
+		return state{}, fmt.Errorf("%w: create is not eligible for another attempt", ErrConflict)
+	}
+	switch op.Failure {
+	case ErrRateLimit, ErrAuthentication, ErrValidation, ErrUnsupported:
+		// These adapter errors are definitive rejections before any remote effect.
+	default:
+		return state{}, fmt.Errorf("%w: create did not receive a definite no-effect rejection", ErrConflict)
+	}
+	if delay := op.RetryNotBefore.Sub(e.config.Now()); delay > 0 {
+		return state{}, &ProviderError{Kind: ErrRateLimit, ProviderStatus: op.FailureStatus, RetryAfter: delay}
+	}
+	return s, nil
 }
 
 func (e *Engine) checkAmount(kind OperationKind, amount Money, p Payment) error {
@@ -321,6 +372,19 @@ func (e *Engine) load(tx Tx, id string) (state, error) {
 	return state{p, op}, e.route(p)
 }
 
+func definitiveFailure(cause error) ErrorKind {
+	if errors.Is(cause, ErrUnknownOutcome) || errors.Is(cause, ErrTransport) ||
+		errors.Is(cause, context.DeadlineExceeded) || errors.Is(cause, context.Canceled) {
+		return ""
+	}
+	for _, kind := range []ErrorKind{ErrDeclined, ErrValidation, ErrAuthentication, ErrUnsupported, ErrRateLimit} {
+		if errors.Is(cause, kind) {
+			return kind
+		}
+	}
+	return ""
+}
+
 func (e *Engine) finishError(ctx context.Context, original state, cause error) (Result, error) {
 	var final state
 	err := e.config.Store.Transact(ctx, func(tx Tx) error {
@@ -333,17 +397,17 @@ func (e *Engine) finishError(ctx context.Context, original state, cause error) (
 			return nil
 		}
 		next := OperationUnknown
-		for _, kind := range []ErrorKind{ErrDeclined, ErrValidation, ErrAuthentication, ErrUnsupported, ErrRateLimit} {
-			if !errors.Is(cause, ErrUnknownOutcome) && errors.Is(cause, kind) {
-				s.op.Failure = kind
-				var providerError *ProviderError
-				if errors.As(cause, &providerError) {
-					s.op.FailureStatus = sanitizeStatus(providerError.ProviderStatus)
-					s.op.RetryAfter = max(0, providerError.RetryAfter)
+		if kind := definitiveFailure(cause); kind != "" {
+			s.op.Failure = kind
+			var providerError *ProviderError
+			if errors.As(cause, &providerError) {
+				s.op.FailureStatus = sanitizeStatus(providerError.ProviderStatus)
+				s.op.RetryAfter = max(0, providerError.RetryAfter)
+				if s.op.RetryAfter > 0 {
+					s.op.RetryNotBefore = e.config.Now().UTC().Add(s.op.RetryAfter)
 				}
-				next = OperationFailed
-				break
 			}
+			next = OperationFailed
 		}
 		if err := s.op.SetStatus(next); err != nil {
 			return err
@@ -397,11 +461,17 @@ func (e *Engine) apply(ctx context.Context, original state, o Observation, sourc
 			return err
 		}
 		final = s
-		// A callback or later query won the race while the HTTP call was out.
-		if source != "webhook" && s.payment.Version != original.payment.Version || source == "response" && s.op != original.op {
+		// A mutation reply is fenced by its original reservation. Cumulative
+		// settlement/return/dispute evidence may refer to an older operation.
+		versionChanged := s.payment.Version != original.payment.Version
+		if source == "response" && (versionChanged || s.op != original.op) {
 			return nil
 		}
-		if s.op.PaymentVersion != s.payment.Version {
+		earlierOperation := s.op.PaymentVersion != s.payment.Version
+		if source == "query" && versionChanged && !earlierOperation {
+			return nil
+		}
+		if earlierOperation && !s.canReconcile(o, source) {
 			return fmt.Errorf("%w: stale observation for an earlier payment version", ErrConflict)
 		}
 		if active, err := tx.ActiveOperation(s.payment.Scope, s.payment.ID); err == nil && active.ID != s.op.ID {
@@ -441,7 +511,9 @@ func (e *Engine) apply(ctx context.Context, original state, o Observation, sourc
 		if err != nil {
 			return err
 		}
-		s.op.PaymentVersion = s.payment.Version
+		if !earlierOperation {
+			s.op.PaymentVersion = s.payment.Version
+		}
 		if err := tx.UpdatePayment(s.payment); err != nil {
 			return err
 		}
@@ -451,8 +523,7 @@ func (e *Engine) apply(ctx context.Context, original state, o Observation, sourc
 		if err := e.audit(tx, s, change, source); err != nil {
 			return err
 		}
-		f := s.payment.Funds
-		if o.Status == OperationSucceeded && max(f.Captured, f.Settled) == s.payment.Amount.Minor && f.Returned == 0 && f.Refunded == 0 && f.Disputed == 0 {
+		if o.Status == OperationSucceeded && fullyCollected(s.payment) {
 			entry := OutboxEntry{
 				Scope: s.payment.Scope, ID: s.payment.ID, PaymentID: s.payment.ID, OrderID: s.payment.OrderID,
 				OperationID: s.op.ID, Version: s.payment.Version, At: change.At,
@@ -465,6 +536,39 @@ func (e *Engine) apply(ctx context.Context, original state, o Observation, sourc
 		return nil
 	})
 	return final, err
+}
+
+// Older reservations may contribute independent cumulative facts. Their
+// observations must agree with the current principal and the bound processor
+// payment. They cannot authorize, capture, refund or release money again.
+func (s state) canReconcile(o Observation, source string) bool {
+	if source == "response" || s.op.Status != OperationSucceeded || o.Status != OperationSucceeded ||
+		o.ProviderReference == "" || o.ProviderReference != s.payment.ProviderReference {
+		return false
+	}
+	before, after := s.payment.Funds, o.Snapshot.Funds
+	if after.Authorized != before.Authorized || after.Captured != before.Captured || after.Refunded != before.Refunded {
+		return false
+	}
+	switch o.Snapshot.Status {
+	case PaymentSettled, PaymentReturned:
+		return true
+	default:
+		return o.Snapshot.Status == s.payment.Status &&
+			(after.Settled > before.Settled || after.Returned > before.Returned || after.Disputed > before.Disputed ||
+				o.Snapshot == s.payment.Snapshot)
+	}
+}
+
+func fullyCollected(p Payment) bool {
+	f := p.Funds
+	if f.Refunded != 0 || f.Returned != 0 || f.Disputed != 0 {
+		return false
+	}
+	if p.Market.Method == MethodACH {
+		return p.Status == PaymentSettled && f.Settled == p.Amount.Minor
+	}
+	return p.Status == PaymentCaptured && f.Captured == p.Amount.Minor
 }
 
 // ErrOperationFailed is a definitive unsuccessful operation without a more
@@ -492,6 +596,9 @@ func validateOutcome(s state, o Observation, source string) error {
 	}
 	p, op := s.payment, s.op
 	f, base := o.Snapshot.Funds, p.Funds
+	if p.Market.Method != MethodACH && f.Settled > f.Captured {
+		return fmt.Errorf("%w: settlement exceeds captured principal", ErrConflict)
+	}
 	terminal := op.Status == OperationFailed || op.Status == OperationSucceeded
 	// Creating a session may succeed before the provider collects the money.
 	// Capture, refund and void reservations each authorize exactly one change.
@@ -500,7 +607,7 @@ func validateOutcome(s state, o Observation, source string) error {
 	if terminal && (op.Status != o.Status || !session && principalChanged) {
 		return fmt.Errorf("%w: conflicting terminal observation", ErrConflict)
 	}
-	if o.Status == OperationFailed && (principalChanged || f.Settled != base.Settled) {
+	if o.Status == OperationFailed && (session && f != (Funds{}) || principalChanged || f.Settled != base.Settled) {
 		return fmt.Errorf("%w: failed operation reports new funds", ErrConflict)
 	}
 	if session && !terminal && o.Status == OperationSucceeded && (o.Snapshot.Status == PaymentDeclined || o.Snapshot.Status == PaymentFailed) {

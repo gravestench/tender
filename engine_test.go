@@ -594,3 +594,264 @@ func TestOperationAmountBinding(t *testing.T) {
 		t.Fatalf("accepted more principal than reserved: %+v %v", r, err)
 	}
 }
+
+func TestEarlierOperationSettlementAndReturn(t *testing.T) {
+	for _, query := range []bool{false, true} {
+		name := "verified"
+		if query {
+			name = "query"
+		}
+		t.Run(name, func(t *testing.T) {
+			db := store.NewMemory()
+			var create tender.ProviderRequest
+			funds := tender.Funds{Authorized: 100, Captured: 100, Settled: 100}
+			status := tender.PaymentSettled
+			p := &processor{execute: func(ctx context.Context, r tender.ProviderRequest) (tender.Observation, error) {
+				if r.Operation.Kind == tender.OpCreate {
+					create = r
+					return authorized(ctx, r)
+				}
+				return observed(r, tender.PaymentCaptured, tender.Funds{Authorized: 100, Captured: 100}), nil
+			}, query: func(_ context.Context, r tender.ProviderRequest) (tender.Observation, error) {
+				if r.Operation.ID != create.Operation.ID {
+					t.Fatal("queried different operation")
+				}
+				return observed(r, status, funds), nil
+			}}
+			e := openEngine(t, db, p, shop)
+			if _, err := e.Create(t.Context(), purchase()); err != nil {
+				t.Fatal(err)
+			}
+			captured, err := e.Capture(t.Context(), tender.Request{PaymentID: "payment", Key: "capture", Amount: usd100})
+			if err != nil {
+				t.Fatal(err)
+			}
+			observe := func() (tender.Result, error) {
+				if query {
+					return e.Recover(t.Context(), create.Operation.ID)
+				}
+				return e.ApplyVerified(t.Context(), observed(create, status, funds))
+			}
+			settled, err := observe()
+			if err != nil || settled.Payment.Version != captured.Payment.Version+1 || settled.Payment.Funds != funds {
+				t.Fatalf("old reservation could not record settlement: %v, %+v", err, settled.Payment)
+			}
+			duplicate, err := observe()
+			if err != nil || duplicate != settled {
+				t.Fatalf("duplicate settlement changed history: %v", err)
+			}
+			funds.Refunded = 40
+			if _, err := observe(); err == nil {
+				t.Fatal("old operation changed refund principal")
+			}
+			funds.Refunded = 0
+			funds.Returned = 100
+			status = tender.PaymentReturned
+			returned, err := observe()
+			if err != nil || returned.Payment.Status != tender.PaymentReturned || returned.Payment.Funds != funds {
+				t.Fatalf("old reservation could not record return: %v, %+v", err, returned.Payment)
+			}
+			out, err := db.Outbox(t.Context(), shop)
+			if err != nil || len(out) != 1 {
+				t.Fatalf("changed fulfillment count: %v %v", out, err)
+			}
+		})
+	}
+}
+
+func TestRetryDefinitiveCreate(t *testing.T) {
+	db := store.NewMemory()
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	started, release := make(chan tender.ProviderRequest, 1), make(chan struct{})
+	defer close(release)
+	p := &processor{execute: func(ctx context.Context, r tender.ProviderRequest) (tender.Observation, error) {
+		if r.Operation.Key == "create" {
+			return tender.Observation{}, &tender.ProviderError{Kind: tender.ErrRateLimit, RetryAfter: time.Minute}
+		}
+		started <- r
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return authorized(ctx, r)
+	}}
+	cfg := tender.EngineConfig{Store: db, Provider: p, Scope: shop, ProviderName: "acquirer", MerchantAccount: "merchant-account", Market: usVisa, Now: func() time.Time { return now }}
+	e, err := tender.NewEngine(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := e.Create(t.Context(), purchase())
+	if !errors.Is(err, tender.ErrRateLimit) {
+		t.Fatal(err)
+	}
+	restarted, err := tender.NewEngine(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := purchase()
+	second.Key = "retry"
+	now = now.Add(40 * time.Second)
+	_, err = restarted.RetryCreate(t.Context(), first.Operation.ID, second)
+	var rate *tender.ProviderError
+	if !errors.As(err, &rate) || rate.Kind != tender.ErrRateLimit || rate.RetryAfter != 20*time.Second || p.calls.Load() != 1 {
+		t.Fatalf("ignored remaining Retry-After: %v, calls %d", err, p.calls.Load())
+	}
+	now = now.Add(20 * time.Second)
+	wrong := second
+	wrong.PaymentID = "other"
+	if _, err := restarted.RetryCreate(t.Context(), first.Operation.ID, wrong); !errors.Is(err, tender.ErrConflict) {
+		t.Fatalf("retry changed payment: %v", err)
+	}
+	wrong = second
+	wrong.Amount.Minor = 99
+	if _, err := restarted.RetryCreate(t.Context(), first.Operation.ID, wrong); !errors.Is(err, tender.ErrConflict) {
+		t.Fatalf("retry changed trusted total: %v", err)
+	}
+	done := make(chan response, 1)
+	go func() {
+		r, err := restarted.RetryCreate(t.Context(), first.Operation.ID, second)
+		done <- response{r, err}
+	}()
+	req := getRequest(t, started)
+	competitor := second
+	competitor.Key = "independent"
+	if _, err := restarted.RetryCreate(t.Context(), first.Operation.ID, competitor); !errors.Is(err, tender.ErrConflict) {
+		t.Fatalf("duplicate successor: %v", err)
+	}
+	release <- struct{}{}
+	success := <-done
+	replay, err := restarted.RetryCreate(t.Context(), first.Operation.ID, second)
+	if err != nil || success.err != nil || success.result != replay || replay.Payment.Status != tender.PaymentAuthorized || req.Operation.ID == first.Operation.ID || replay.Payment.ID != first.Payment.ID || p.calls.Load() != 2 {
+		t.Fatalf("retry did not preserve the claim/idempotency: %+v, %+v, %v", success, replay, err)
+	}
+	if _, err := restarted.RetryCreate(t.Context(), first.Operation.ID, competitor); !errors.Is(err, tender.ErrConflict) {
+		t.Fatalf("reused rejected predecessor: %v", err)
+	}
+	unknownProc := &processor{execute: func(context.Context, tender.ProviderRequest) (tender.Observation, error) {
+		return tender.Observation{}, tender.ErrUnknownOutcome
+	}}
+	unknownEngine := openEngine(t, db, unknownProc, shop)
+	diff := purchase()
+	diff.OrderID = "other-order"
+	diff.PaymentID = "other-payment"
+	diff.Key = "unknown"
+	unknown, err := unknownEngine.Create(t.Context(), diff)
+	if !errors.Is(err, tender.ErrUnknownOutcome) {
+		t.Fatal(err)
+	}
+	diff.Key = "new-key"
+	if _, err := restarted.RetryCreate(t.Context(), unknown.Operation.ID, diff); !errors.Is(err, tender.ErrConflict) {
+		t.Fatalf("retried ambiguous dispatch: %v", err)
+	}
+}
+
+type achProcessor struct{ *processor }
+
+func (p achProcessor) Capabilities() tender.Capabilities {
+	caps := p.processor.Capabilities()
+	caps.Markets = []tender.MarketCapability{{Market: tender.Market{Country: "US", Currency: "USD", Method: tender.MethodACH}}}
+	return caps
+}
+
+func TestFulfillmentCollectionEvidence(t *testing.T) {
+	t.Run("voided card cannot settle uncaptured principal", func(t *testing.T) {
+		db := store.NewMemory()
+		p := &processor{execute: func(ctx context.Context, r tender.ProviderRequest) (tender.Observation, error) {
+			if r.Operation.Kind == tender.OpCreate {
+				return authorized(ctx, r)
+			}
+			return observed(r, tender.PaymentVoided, tender.Funds{Authorized: 100, Settled: 100}), nil
+		}}
+		e := openEngine(t, db, p, shop)
+		if _, err := e.Create(t.Context(), purchase()); err != nil {
+			t.Fatal(err)
+		}
+		result, err := e.Void(t.Context(), tender.Request{PaymentID: "payment", Key: "void", Amount: usd100})
+		if !errors.Is(err, tender.ErrUnknownOutcome) || result.Payment.Funds.Settled != 0 {
+			t.Fatalf("accepted card settlement beyond capture: %v, %+v", err, result.Payment)
+		}
+		out, err := db.Outbox(t.Context(), shop)
+		if err != nil || len(out) != 0 {
+			t.Fatalf("fulfilled voided card: %v, %v", out, err)
+		}
+	})
+	t.Run("ACH settlement collects without card principal", func(t *testing.T) {
+		db := store.NewMemory()
+		p := achProcessor{&processor{execute: func(_ context.Context, r tender.ProviderRequest) (tender.Observation, error) {
+			return observed(r, tender.PaymentSettled, tender.Funds{Settled: 100}), nil
+		}}}
+		e, err := tender.NewEngine(tender.EngineConfig{Store: db, Provider: p, Scope: shop, ProviderName: "bank", MerchantAccount: "account", Market: p.Capabilities().Markets[0].Market})
+		if err != nil {
+			t.Fatal(err)
+		}
+		r, err := e.Create(t.Context(), purchase())
+		if err != nil || r.Payment.Status != tender.PaymentSettled {
+			t.Fatal(err)
+		}
+		out, err := db.Outbox(t.Context(), shop)
+		if err != nil || len(out) != 1 {
+			t.Fatalf("missing ACH collection: %+v %v", out, err)
+		}
+	})
+}
+
+func TestPendingCollectionRejectsContradictoryFailure(t *testing.T) {
+	db := store.NewMemory()
+	var req tender.ProviderRequest
+	p := &processor{execute: func(_ context.Context, r tender.ProviderRequest) (tender.Observation, error) {
+		req = r
+		o := observed(r, tender.PaymentCaptured, tender.Funds{Authorized: 100, Captured: 100})
+		o.Status = tender.OperationPending
+		return o, nil
+	}}
+	e := openEngine(t, db, p, shop)
+	first, err := e.Create(t.Context(), purchase())
+	if err != nil {
+		t.Fatal(err)
+	}
+	failed := observed(req, tender.PaymentCaptured, tender.Funds{Authorized: 100, Captured: 100})
+	failed.Status = tender.OperationFailed
+	if _, err := e.ApplyVerified(t.Context(), failed); !errors.Is(err, tender.ErrConflict) {
+		t.Fatalf("accepted contradictory failure with provisional captured funds: %v", err)
+	}
+	r, err := e.Create(t.Context(), purchase())
+	if err != nil || r != first {
+		t.Fatalf("failed observation changed pending reservation: %+v %v", r, err)
+	}
+	if _, err := e.Refund(t.Context(), tender.Request{PaymentID: "payment", Key: "refund", Amount: usd100}); !errors.Is(err, tender.ErrConflict) || p.calls.Load() != 1 {
+		t.Fatalf("pending funds became refundable: %v, calls %d", err, p.calls.Load())
+	}
+}
+
+func TestACHRequiresSettlementForFulfillment(t *testing.T) {
+	db := store.NewMemory()
+	p := achProcessor{&processor{execute: func(_ context.Context, r tender.ProviderRequest) (tender.Observation, error) {
+		return observed(r, tender.PaymentCaptured, tender.Funds{Authorized: 100, Captured: 100}), nil
+	}}}
+	e, err := tender.NewEngine(tender.EngineConfig{Store: db, Provider: p, Scope: shop, ProviderName: "bank", MerchantAccount: "account", Market: p.Capabilities().Markets[0].Market})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = e.Create(t.Context(), purchase())
+	out, err := db.Outbox(t.Context(), shop)
+	if err != nil || len(out) != 0 {
+		t.Fatalf("bank collection published before settlement: %v %v", out, err)
+	}
+}
+
+func TestRetryCreateRejectsAmbiguousTransport(t *testing.T) {
+	db := store.NewMemory()
+	p := &processor{execute: func(context.Context, tender.ProviderRequest) (tender.Observation, error) {
+		return tender.Observation{}, errors.Join(tender.ErrRateLimit, tender.ErrTransport)
+	}}
+	e := openEngine(t, db, p, shop)
+	r, err := e.Create(t.Context(), purchase())
+	if !errors.Is(err, tender.ErrUnknownOutcome) || r.Operation.Status != tender.OperationUnknown {
+		t.Fatalf("transport ambiguity recorded as a definite rejection: %v", err)
+	}
+	next := purchase()
+	next.Key = "retry"
+	if _, err := e.RetryCreate(t.Context(), r.Operation.ID, next); !errors.Is(err, tender.ErrConflict) || p.calls.Load() != 1 {
+		t.Fatalf("retried ambiguous create: %v %d", err, p.calls.Load())
+	}
+}

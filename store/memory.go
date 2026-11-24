@@ -170,7 +170,8 @@ func (t *memoryTx) UpdateOperation(o tender.OperationRecord) error {
 	if err != nil {
 		return err
 	}
-	if old.ProviderReference != "" && o.ProviderReference != old.ProviderReference {
+	if old.SuccessorID != "" && o.SuccessorID != old.SuccessorID ||
+		old.ProviderReference != "" && o.ProviderReference != old.ProviderReference {
 		return tender.ErrConflict
 	}
 	// Only the result and its binding may change after reservation.
