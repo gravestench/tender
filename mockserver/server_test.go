@@ -342,3 +342,96 @@ func TestContractComparesPaymentAndOperation(t *testing.T) {
 		t.Fatalf("comparison did not run or its result was lost: %v", err)
 	}
 }
+
+func TestCloseAbortsDelayedCommittedResponse(t *testing.T) {
+	committed := make(chan struct{})
+	s := fixture(t, mockserver.Config{Routes: func(s *mockserver.Server) http.Handler {
+		return s.Route("charge", func(w http.ResponseWriter, r *http.Request, _ mockserver.Scenario) {
+			s.Commit("payment", []byte("captured"))
+			close(committed)
+			w.WriteHeader(http.StatusCreated)
+		})
+	}})
+	if err := s.SetScenarios("charge", mockserver.Scenario{Delay: time.Hour, Fault: mockserver.LoseResponse}); err != nil {
+		t.Fatal(err)
+	}
+	host := httptest.NewServer(s.Handler())
+	defer host.Close()
+	client := host.Client()
+	client.Timeout = 5 * time.Second
+	result := make(chan error, 1)
+	go func() {
+		resp, err := client.Post(host.URL, "application/json", nil)
+		if err == nil {
+			resp.Body.Close()
+			result <- fmt.Errorf("received HTTP %d after close", resp.StatusCode)
+			return
+		}
+		if !errors.Is(err, io.EOF) {
+			result <- fmt.Errorf("expected an aborted HTTP stream, got %w", err)
+			return
+		}
+		result <- nil
+	}()
+	select {
+	case <-committed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fixture never committed")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	if rec, ok := s.Lookup("payment"); !ok || string(rec.Data) != "captured" {
+		t.Fatalf("lost committed state: %+v", rec)
+	}
+}
+
+func TestRouteFactoryCanClose(t *testing.T) {
+	result := make(chan error, 1)
+	go func() {
+		s, err := mockserver.New(mockserver.Config{PublicBaseURL: "http://localhost", Routes: func(s *mockserver.Server) http.Handler {
+			_ = s.Close()
+			return http.NotFoundHandler()
+		}})
+		if s != nil {
+			_ = s.Close()
+		}
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("constructed a closed simulator")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("factory deadlocked in Close")
+	}
+}
+
+func TestFailedRouteFactorySettlesCallbacks(t *testing.T) {
+	host := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-r.Context().Done() }))
+	defer host.Close()
+	var receipt <-chan error
+	_, err := mockserver.New(mockserver.Config{PublicBaseURL: host.URL, AllowedCallbackTargets: []string{host.URL}, SigningKey: []byte("fixture"), Routes: func(s *mockserver.Server) http.Handler {
+		var err error
+		receipt, err = s.Enqueue([]mockserver.Callback{{Target: host.URL}}, mockserver.Scenario{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return nil
+	}})
+	if err == nil {
+		t.Fatal("accepted nil handler")
+	}
+	select {
+	case err := <-receipt:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("setup cleanup returned %v", err)
+		}
+	default:
+		t.Fatal("callback still pending after failed setup")
+	}
+}

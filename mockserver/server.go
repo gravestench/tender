@@ -99,14 +99,27 @@ func New(cfg Config) (*Server, error) {
 		records:   make(map[string]Record),
 		scenarios: make(map[string][]Scenario),
 	}
+	go s.deliver()
 	if cfg.Routes != nil {
-		s.handler = cfg.Routes(s)
-		if s.handler == nil {
-			cancel()
+		var handler http.Handler
+		// An unsuccessful factory (including a panic) can already have
+		// enqueued callbacks. Resolve their receipts before leaving New.
+		defer func() {
+			if handler == nil {
+				s.Close()
+			}
+		}()
+		handler = cfg.Routes(s)
+		if handler == nil {
 			return nil, errors.New("mockserver: nil fixture handler")
 		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.closed {
+			return nil, errors.New("mockserver: fixture closed during setup")
+		}
+		s.handler = handler
 	}
-	go s.deliver()
 	return s, nil
 }
 
@@ -148,13 +161,14 @@ func (s *Server) Handler() http.Handler {
 			return
 		}
 		s.active++
+		handler := s.handler
 		s.mu.Unlock()
 		defer func() {
 			s.mu.Lock()
 			s.active--
 			s.mu.Unlock()
 		}()
-		s.handler.ServeHTTP(w, r)
+		handler.ServeHTTP(w, r)
 	})
 }
 

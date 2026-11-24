@@ -83,7 +83,7 @@ func (s *Server) Route(name string, fixture func(http.ResponseWriter, *http.Requ
 			case <-r.Context().Done():
 				return
 			case <-s.ctx.Done():
-				return
+				panic(http.ErrAbortHandler)
 			}
 		}
 		switch step.Fault {
