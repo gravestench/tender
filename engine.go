@@ -443,6 +443,27 @@ func (e *Engine) ApplyVerified(ctx context.Context, o Observation) (Result, erro
 // receipt, payment, audit and outbox writes commit in the same transaction.
 // A delivery replay after commit succeeds without running the normalizer.
 func (e *Engine) ProcessVerifiedEvent(ctx context.Context, id string, normalize func(json.RawMessage) (VerifiedEvent, error)) error {
+	if normalize == nil {
+		return ErrValidation
+	}
+	return e.ProcessVerifiedEventWithRecords(ctx, id, func(_ EventRecords, raw json.RawMessage) (VerifiedEvent, error) {
+		return normalize(raw)
+	})
+}
+
+// EventRecords exposes the read operations needed to correlate signed provider
+// references and turn a modification amount into a cumulative funds snapshot.
+type EventRecords interface {
+	Payment(Scope, string) (Payment, error)
+	Operation(Scope, string) (OperationRecord, error)
+	OperationByReference(Scope, string, string) (OperationRecord, error)
+	ActiveOperation(Scope, string) (OperationRecord, error)
+}
+
+// ProcessVerifiedEventWithRecords runs normalize with the same transactional
+// snapshot as receipt processing and result application. Use only local reads
+// and computation in normalize.
+func (e *Engine) ProcessVerifiedEventWithRecords(ctx context.Context, id string, normalize func(EventRecords, json.RawMessage) (VerifiedEvent, error)) error {
 	if strings.TrimSpace(id) == "" || normalize == nil {
 		return ErrValidation
 	}
@@ -453,7 +474,7 @@ func (e *Engine) ProcessVerifiedEvent(ctx context.Context, id string, normalize 
 			return ErrUnsupported
 		}
 		return inbox.ProcessVerifiedEvent(key, e.config.Now().UTC(), func(evidence json.RawMessage) error {
-			event, err := normalize(evidence)
+			event, err := normalize(tx, evidence)
 			if err != nil {
 				return err
 			}
