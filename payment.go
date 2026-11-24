@@ -197,7 +197,9 @@ func (p *Payment) Correct(next Snapshot, at time.Time, basis Correction) (Change
 	if strings.TrimSpace(basis.Actor) == "" || strings.TrimSpace(basis.Reason) == "" {
 		return Change{}, fmt.Errorf("%w: correction requires actor and reason", ErrValidation)
 	}
-	return p.record(next.principalSnapshot(p.Status), at, basis)
+	// The correction supplies the authoritative principal, including when the
+	// previous terminal state was recorded in error.
+	return p.record(next.principalSnapshot(next.Status), at, basis)
 }
 
 func (p *Payment) record(next Snapshot, at time.Time, basis Correction) (Change, error) {

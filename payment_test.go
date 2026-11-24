@@ -80,6 +80,19 @@ func TestPaymentTransitions(t *testing.T) {
 			t.Fatalf("correction %+v, %v", c, err)
 		}
 	})
+	t.Run("audited settlement supersedes erroneous void", func(t *testing.T) {
+		p := newPayment(t)
+		voided := Snapshot{Status: PaymentVoided, Funds: Funds{Authorized: 100}}
+		apply(t, &p, voided)
+		observed := Snapshot{Status: PaymentSettled, Funds: Funds{Authorized: 100, Captured: 100, Settled: 100}}
+		reject(t, &p, observed)
+		basis := Correction{Actor: "ops", Reason: "Authoritative settlement report confirms full capture"}
+		change, err := p.Correct(observed, now, basis)
+		want := Snapshot{Status: PaymentCaptured, Funds: Funds{Authorized: 100, Captured: 100, Settled: 100}}
+		if err != nil || p.Snapshot != want || change.After != want || change.Before != voided || change.Correction != basis {
+			t.Fatalf("audited settlement: %+v, %v", change, err)
+		}
+	})
 	t.Run("settled partial capture can void remainder", func(t *testing.T) {
 		p := newPayment(t)
 		apply(t, &p, Snapshot{Status: PaymentAuthorized, Funds: Funds{Authorized: 100}})
