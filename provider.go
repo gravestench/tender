@@ -153,6 +153,8 @@ type ProviderRequest struct {
 // operation amount. Snapshot holds cumulative facts in the payment currency.
 // The engine binds references and checks authority before applying a snapshot.
 type Observation struct {
+	// CaptureFailure records authenticated scheme rejection of this capture.
+	CaptureFailure                        bool
 	Scope                                 Scope
 	MerchantAccount                       string
 	PaymentID, AttemptID, OperationID     string
@@ -169,4 +171,13 @@ type Provider interface {
 	Capabilities() Capabilities
 	Execute(context.Context, ProviderRequest) (Observation, error)
 	Query(context.Context, ProviderRequest) (Observation, error)
+}
+
+// IdempotentReplayProvider describes token-free mutations that can be retried
+// at their original endpoint with the exact same authenticated request identity.
+// ReplayIdentity is pure local computation. It returns a fingerprint of the
+// destination, account, operation key and serialized payload, and a window
+// shorter than the provider's guaranteed idempotency retention.
+type IdempotentReplayProvider interface {
+	ReplayIdentity(ProviderRequest) (fingerprint string, window time.Duration)
 }

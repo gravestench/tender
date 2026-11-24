@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -225,7 +226,7 @@ func TestAdyenContract(t *testing.T) {
 	for _, tc := range []struct {
 		first, details string
 		want           tender.PaymentStatus
-	}{{"IdentifyShopper", "Authorised", tender.PaymentAuthorized}, {"ChallengeShopper", "RedirectShopper", tender.PaymentPending}, {"RedirectShopper", "", tender.PaymentPending}, {"UnknownAction", "", tender.PaymentPending}, {"Refused", "", tender.PaymentDeclined}} {
+	}{{"IdentifyShopper", "", tender.PaymentPending}, {"ChallengeShopper", "Authorised", tender.PaymentAuthorized}, {"ChallengeShopper", "RedirectShopper", tender.PaymentPending}, {"RedirectShopper", "", tender.PaymentPending}, {"UnknownAction", "", tender.PaymentPending}, {"Refused", "", tender.PaymentDeclined}} {
 		t.Run(tc.first+tc.details, func(t *testing.T) {
 			h := newAdyenRig(t, store.NewMemory(), tc.first, tc.details)
 			h.create()
@@ -511,7 +512,7 @@ func TestAdyenContractPinnedWebInputAndActivation(t *testing.T) {
 
 }
 func TestAdyenContractRejectsRawOrUnboundInput(t *testing.T) {
-	h := newAdyenRig(t, store.NewMemory(), "IdentifyShopper", "Authorised")
+	h := newAdyenRig(t, store.NewMemory(), "ChallengeShopper", "Authorised")
 	h.create()
 	for i, token := range []string{strings.Replace(cardInput, "eyJhbGci.demo.demo.demo.demo", "123", 1), strings.Replace(cardInput, `"type":"scheme"`, `"number":"123","type":"scheme"`, 1), strings.Replace(cardInput, `"brand":"visa"`, `"brand":"mc"`, 1)} {
 		r := h.request(fmt.Sprintf("invalid-%d", i), 100)
@@ -582,7 +583,7 @@ func TestAdyenWebhookReplayOriginalReference(t *testing.T) {
 }
 
 func TestAdyenWebhookReplayPendingDetails(t *testing.T) {
-	h := newAdyenRig(t, store.NewMemory(), "IdentifyShopper", "Pending")
+	h := newAdyenRig(t, store.NewMemory(), "ChallengeShopper", "Pending")
 	h.create()
 	first, err := h.confirm()
 	if err != nil {
@@ -601,11 +602,14 @@ func TestAdyenWebhookReplayPendingDetails(t *testing.T) {
 	if h.post(notification(eventFields{pending.Payment.ProviderReference, "", testAccount, action.Reference, "100", "USD", "AUTHORISATION", "true"}, true)) != 202 {
 		t.Fatal("signed final authorization rejected")
 	}
-	h.process()
+	if err := h.hook.Process(t.Context(), h.next()); !errors.Is(err, tender.ErrConflict) {
+		t.Fatal("webhook alone authorized unverified brand", err)
+	}
 	replay, err := h.e.Confirm(t.Context(), details)
-	if err != nil || replay.Operation.Status != tender.OperationSucceeded || replay.Payment.Funds.Authorized != 100 {
+	if err != nil || replay.Operation.Status != tender.OperationPending || replay.Payment.Funds.Authorized != 0 {
 		t.Fatal(replay, err)
 	}
+
 }
 func TestAdyenContractWireReplay(t *testing.T) {
 	h := newAdyenRig(t, store.NewMemory(), "Authorised", "")
@@ -624,7 +628,425 @@ func TestAdyenContractWireReplay(t *testing.T) {
 		t.Fatal(got, err)
 	}
 	r.Token = strings.Replace(cardInput, "Synthetic Shopper", "Changed Shopper", 1)
-	if _, err = adapter.Execute(t.Context(), r); !errors.Is(err, tender.ErrUnknownOutcome) {
-		t.Fatal("changed replay accepted", err)
+	if replay, err := adapter.Execute(t.Context(), r); err != nil || replay.ProviderReference != got.ProviderReference {
+		t.Fatal("idempotent replay did not return original provider decision", err)
+	}
+}
+
+type changeAdyenReply func(*http.Request) (*http.Response, error)
+
+func (f changeAdyenReply) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+func (h *adyenRig) engine(c adyen.Config, now func() time.Time) *tender.Engine {
+	h.t.Helper()
+	a, err := adyen.New(c)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	e, err := tender.NewEngine(tender.EngineConfig{Store: h.db, Scope: dbScope, Market: dbMarket, ProviderName: "adyen", MerchantAccount: testAccount, Provider: a, Now: now})
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return e
+}
+func TestAdyenContractAuthoritativeBinding(t *testing.T) {
+	for _, bad := range []string{"echo", "missing ref", "missing amount", "missing brand", "different brand", "non-scheme", "missing browser brand", "incomplete challenge"} {
+		t.Run(bad, func(t *testing.T) {
+			result := "Authorised"
+			if bad == "incomplete challenge" {
+				result = "ChallengeShopper"
+			}
+			h := newAdyenRig(t, store.NewMemory(), result, "")
+			h.create()
+			cfg := h.cfg
+			cfg.Transport = changeAdyenReply(func(req *http.Request) (*http.Response, error) {
+				resp, err := h.cfg.Transport.RoundTrip(req)
+				if err != nil {
+					return nil, err
+				}
+				// These fields are specified by the v72 authorized-response schema.
+				var body map[string]any
+				err = json.NewDecoder(resp.Body).Decode(&body)
+				resp.Body.Close()
+				if err != nil {
+					return nil, err
+				}
+				body["paymentMethod"] = map[string]any{"type": "scheme", "brand": "visa"}
+				switch bad {
+				case "echo":
+					resp.Header.Set("Idempotency-Key", "other")
+				case "missing ref":
+					delete(body, "merchantReference")
+				case "missing amount":
+					delete(body, "amount")
+				case "missing brand":
+					delete(body, "paymentMethod")
+				case "different brand":
+					body["paymentMethod"] = map[string]any{"type": "scheme", "brand": "mc"}
+				case "non-scheme":
+					body["paymentMethod"] = map[string]any{"type": "paypal", "brand": "visa"}
+				case "incomplete challenge":
+					delete(body["action"].(map[string]any), "authorisationToken")
+				}
+				raw, _ := json.Marshal(body)
+				resp.Body = io.NopCloser(bytes.NewReader(raw))
+				return resp, nil
+			})
+			h.e = h.engine(cfg, nil)
+			r := h.request("pay", 100)
+			r.Token = cardInput
+			if bad == "missing browser brand" {
+				r.Token = strings.Replace(r.Token, `"brand":"visa",`, "", 1)
+			}
+			got, err := h.e.Confirm(t.Context(), r)
+			if got.Payment.Funds.Authorized != 0 || got.Payment.Action.Mode == tender.ActionComponent && got.Payment.Action.Data != "" && strings.Contains(got.Payment.Action.Data, "threeDS2") {
+				t.Fatalf("accepted %s, status %s error %v", bad, got.Payment.Status, err)
+			}
+			if bad == "missing browser brand" {
+				if !errors.Is(err, tender.ErrValidation) {
+					t.Fatal(err)
+				}
+				return
+			}
+			if bad == "incomplete challenge" {
+				return
+			}
+			// The unsigned network in the otherwise valid signed webhook cannot repair
+			// missing or contradictory authenticated HTTP evidence.
+			if err := h.hook.Process(t.Context(), h.next()); !errors.Is(err, tender.ErrConflict) {
+				t.Fatalf("admitted webhook without brand evidence: %v", err)
+			}
+		})
+	}
+}
+func TestAdyenWebhookReplayCaptureFailure(t *testing.T) {
+	for _, timing := range []string{"first processed", "stored first", "late"} {
+		t.Run(timing, func(t *testing.T) {
+			db := store.NewMemory()
+			h := newAdyenRig(t, db, "Authorised", "")
+			h.create()
+			auth, err := h.confirm()
+			if err != nil {
+				t.Fatal(err)
+			}
+			h.process()
+			req := h.request("cap", 100)
+			cap, err := h.e.Capture(t.Context(), req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			capEvent := h.next()
+			rec, _ := h.sim.Lookup(mockserver.AdyenKey(testAccount, cap.Operation.ProviderKey))
+			var fx mockserver.AdyenRecord
+			json.Unmarshal(rec.Data, &fx)
+			if timing == "late" {
+				if err := h.hook.Process(t.Context(), capEvent); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fail := notification(eventFields{fx.PSP, auth.Payment.ProviderReference, testAccount, fx.Reference, "100", "USD", "CAPTURE_FAILED", "true"}, true)
+			if h.post(fail) != 202 {
+				t.Fatal("signed failure rejected")
+			}
+			failedEvent := h.next()
+			if timing == "stored first" {
+				_ = h.hook.Process(t.Context(), capEvent)
+				out, _ := db.Outbox(t.Context(), dbScope)
+				if len(out) != 0 {
+					t.Fatal("stored failure did not fence capture")
+				}
+			}
+			if err := h.hook.Process(t.Context(), failedEvent); err != nil {
+				t.Fatal(err)
+			}
+			if err := h.hook.Process(t.Context(), capEvent); err != nil {
+				t.Fatal(err)
+			}
+			p, err := h.e.Get(t.Context(), "pay")
+			if err != nil || p.Status != "capture_failed" {
+				t.Fatal(p, err)
+			}
+			out, err := db.Outbox(t.Context(), dbScope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if timing == "late" {
+				if len(out) != 1 || p.Funds.Captured != 100 {
+					t.Fatal("lost prior capture audit")
+				}
+			} else if len(out) != 0 {
+				t.Fatal("failed capture fulfilled")
+			}
+		})
+	}
+}
+func TestAdyenWebhookReplayDistinctCaptureFailures(t *testing.T) {
+	db := store.NewMemory()
+	h := newAdyenRig(t, db, "Authorised", "")
+	h.create()
+	if _, err := h.confirm(); err != nil {
+		t.Fatal(err)
+	}
+	h.process()
+	capture := func(key string, minor int64) (tender.Result, string) {
+		res, err := h.e.Capture(t.Context(), h.request(key, minor))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res, h.next()
+	}
+	storeFailure := func(cap tender.Result) string {
+		rec, _ := h.sim.Lookup(mockserver.AdyenKey(testAccount, cap.Operation.ProviderKey))
+		var fx mockserver.AdyenRecord
+		if err := json.Unmarshal(rec.Data, &fx); err != nil {
+			t.Fatal(err)
+		}
+		raw := notification(eventFields{fx.PSP, fx.PaymentPSP, testAccount, fx.Reference, fmt.Sprint(cap.Operation.Amount.Minor), "USD", "CAPTURE_FAILED", "true"}, true)
+		if h.post(raw) != 202 {
+			t.Fatal("failure rejected")
+		}
+		return h.next()
+	}
+	first, firstOK := capture("partial", 40)
+	if err := h.hook.Process(t.Context(), firstOK); err != nil {
+		t.Fatal(err)
+	}
+	second, secondOK := capture("remainder", 60)
+	firstFailed := storeFailure(first)
+	if err := h.hook.Process(t.Context(), secondOK); !errors.Is(err, tender.ErrConflict) {
+		t.Fatalf("unprocessed failure failed to fence other capture: %v", err)
+	}
+	for _, id := range []string{firstFailed, secondOK} {
+		if err := h.hook.Process(t.Context(), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.hook.Process(t.Context(), storeFailure(second)); err != nil {
+		t.Fatal(err)
+	}
+	notices, err := db.CaptureFailures(t.Context(), dbScope)
+	if err != nil || len(notices) != 2 || notices[0].OperationID != first.Operation.ID || notices[1].OperationID != second.Operation.ID {
+		t.Fatalf("distinct adverse notices: %+v %v", notices, err)
+	}
+	out, err := db.Outbox(t.Context(), dbScope)
+	if err != nil || len(out) != 0 {
+		t.Fatalf("fulfilled held captures: %+v %v", out, err)
+	}
+}
+
+func TestAdyenContractRecoverLostModification(t *testing.T) {
+	h := newAdyenRig(t, store.NewMemory(), "Authorised", "")
+	h.create()
+	auth, err := h.confirm()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.process()
+	if err := h.sim.SetScenarios("adyen.captures", mockserver.Scenario{Fault: mockserver.LoseResponse}); err != nil {
+		t.Fatal(err)
+	}
+	r := h.request("lost", 100)
+	lost, err := h.e.Capture(t.Context(), r)
+	if !errors.Is(err, tender.ErrUnknownOutcome) {
+		t.Fatal(err)
+	}
+	_ = h.next()
+	rec, _ := h.sim.Lookup(mockserver.AdyenKey(testAccount, lost.Operation.ProviderKey))
+	var cap mockserver.AdyenRecord
+	json.Unmarshal(rec.Data, &cap)
+	rec, _ = h.sim.Lookup(mockserver.AdyenKey(testAccount, auth.Operation.ProviderKey))
+	var pay mockserver.AdyenRecord
+	json.Unmarshal(rec.Data, &pay)
+	body := notification(eventFields{cap.PSP, cap.PaymentPSP, testAccount, pay.Reference, "100", "USD", "CAPTURE", "true"}, true)
+	if h.post(body) != 202 {
+		t.Fatal("event rejected")
+	}
+	id := h.next()
+	if err := h.hook.Process(t.Context(), id); err == nil {
+		t.Fatal("guessed modification identity")
+	}
+	restarted := h.engine(h.cfg, nil)
+	result, err := restarted.Recover(t.Context(), lost.Operation.ID)
+	if err != nil || result.Operation.Status != tender.OperationPending || result.Operation.ProviderReference != cap.PSP {
+		t.Fatalf("same-key recovery = %s %v", result.Operation.Status, err)
+	}
+	if err := h.hook.Process(t.Context(), id); err != nil {
+		t.Fatal(err)
+	}
+	result, err = restarted.Capture(t.Context(), r)
+	if err != nil || result.Payment.Funds.Captured != 100 {
+		t.Fatal(result, err)
+	}
+}
+
+func TestAdyenContractCompanyScopedReplay(t *testing.T) {
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	sim, err := mockserver.New(mockserver.Config{PublicBaseURL: srv.URL, Routes: func(s *mockserver.Server) http.Handler {
+		m := http.NewServeMux()
+		for account, network := range map[string]string{"First": "visa", "Second": "mc"} {
+			routes := mockserver.AdyenRoutes(mockserver.AdyenFixture{CompanyAccount: "Company", MerchantAccount: account, APIKey: account + "-key", Brands: []string{network}})(s)
+			m.Handle("/"+account+"/", http.StripPrefix("/"+account, routes))
+		}
+		return m
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sim.Close()
+	mux.Handle("/", sim.Handler())
+	for _, account := range []string{"First", "Second"} {
+		raw := fmt.Sprintf(`{"merchantAccount":%q,"amount":{"value":100,"currency":"USD"},"channel":"Web","countryCode":"US","allowedPaymentMethods":["scheme"]}`, account)
+		req, _ := http.NewRequest("POST", srv.URL+"/"+account+"/v72/paymentMethods", strings.NewReader(raw))
+		req.Header.Set("X-API-Key", account+"-key")
+		req.Header.Set("Idempotency-Key", "same-company-key")
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil || resp.StatusCode != 200 || resp.Header.Get("Idempotency-Key") != "same-company-key" || !bytes.Contains(body, []byte(`"visa"`)) {
+			t.Errorf("company-scoped replay for %s: %d key=%q body=%s", account, resp.StatusCode, resp.Header.Get("Idempotency-Key"), body)
+		}
+	}
+	if _, found := sim.Lookup(mockserver.AdyenKey("Second", "same-company-key")); found {
+		t.Fatal("one company key committed a second merchant effect")
+	}
+}
+
+func TestAdyenContractLegacyAuthorizationCannotCapture(t *testing.T) {
+	h := newAdyenRig(t, store.NewMemory(), "Authorised", "")
+	created := h.create()
+	auth, err := h.confirm()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.process()
+	// Simulate a payment restored from before the adapter stored card-network
+	// evidence. A PSP and authorized principal alone cannot establish its rail.
+	raw, _ := json.Marshal(auth.Payment)
+	var fields map[string]json.RawMessage
+	json.Unmarshal(raw, &fields)
+	delete(fields, "VerifiedMethod")
+	raw, _ = json.Marshal(fields)
+	var legacy tender.Payment
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := adyen.New(h.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op := created.Operation
+	op.ID = "legacy-cap"
+	op.ProviderKey = "legacy-key"
+	op.Kind = tender.OpCapture
+	if result, err := adapter.Execute(t.Context(), tender.ProviderRequest{Payment: legacy, Operation: op}); err == nil {
+		t.Fatalf("legacy unverified capture dispatched: %v", result.Status)
+	}
+}
+func TestAdyenContractRecoveryBounds(t *testing.T) {
+	h := newAdyenRig(t, store.NewMemory(), "Authorised", "")
+	h.create()
+	if _, err := h.confirm(); err != nil {
+		t.Fatal(err)
+	}
+	h.process()
+	if err := h.sim.SetScenarios("adyen.captures", mockserver.Scenario{Fault: mockserver.LoseResponse}); err != nil {
+		t.Fatal(err)
+	}
+	lost, err := h.e.Capture(t.Context(), h.request("lost", 100))
+	if !errors.Is(err, tender.ErrUnknownOutcome) {
+		t.Fatal(err)
+	}
+	_ = h.next()
+	cfg := h.cfg
+	cfg.BaseURL = h.http.URL + "/other/v72"
+	cfg.Transport = changeAdyenReply(func(*http.Request) (*http.Response, error) {
+		t.Fatal("recovery sent to new origin or outside window")
+		return nil, errors.New("unreachable")
+	})
+	if _, err := h.engine(cfg, nil).Recover(t.Context(), lost.Operation.ID); !errors.Is(err, tender.ErrConflict) {
+		t.Fatalf("changed route %v", err)
+	}
+	cfg.BaseURL = h.cfg.BaseURL
+	if _, err := h.engine(cfg, func() time.Time { return time.Now().Add(8 * 24 * time.Hour) }).Recover(t.Context(), lost.Operation.ID); !errors.Is(err, tender.ErrUnsupported) {
+		t.Fatalf("expired replay %v", err)
+	}
+	if _, err := h.engine(cfg, func() time.Time { return time.Now().Add(-48 * time.Hour) }).Recover(t.Context(), lost.Operation.ID); !errors.Is(err, tender.ErrUnsupported) {
+		t.Fatalf("clock moved back before reservation %v", err)
+	}
+}
+func TestAdyenWebhookReplayCaptureFailureSQL(t *testing.T) {
+	dsn := os.Getenv("TENDER_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("disposable local PostgreSQL required")
+	}
+	if !adyenLocalDatabase(dsn) {
+		t.Fatal("local database required")
+	}
+	open := postgresFixture(t)
+	db := open()
+	h := newAdyenRig(t, postgres.New(db), "Authorised", "")
+	h.create()
+	if _, err := h.confirm(); err != nil {
+		t.Fatal(err)
+	}
+	h.process()
+	req := h.request("cap", 100)
+	cap, err := h.e.Capture(t.Context(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.process()
+	if _, err := db.ExecContext(t.Context(), "UPDATE tender_outbox SET consumed_at=CURRENT_TIMESTAMP"); err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := h.sim.Lookup(mockserver.AdyenKey(testAccount, cap.Operation.ProviderKey))
+	var fx mockserver.AdyenRecord
+	json.Unmarshal(rec.Data, &fx)
+	failure := notification(eventFields{fx.PSP, fx.PaymentPSP, testAccount, fx.Reference, "100", "USD", "CAPTURE_FAILED", "true"}, true)
+	if h.post(failure) != 202 {
+		t.Fatal("failure rejected")
+	}
+	id := h.next()
+	// The failure, host review notice and processed_at must share a commit.
+	if _, err := db.ExecContext(t.Context(), "ALTER TABLE tender_capture_failures ADD CONSTRAINT fail_review CHECK(false)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.hook.Process(t.Context(), id); err == nil {
+		t.Fatal("missing rollback")
+	}
+	current, err := h.e.Get(t.Context(), "pay")
+	if err != nil || current.Status != tender.PaymentCaptured {
+		t.Fatalf("partial failure commit: %s %v", current.Status, err)
+	}
+	if _, err := db.ExecContext(t.Context(), "ALTER TABLE tender_capture_failures DROP CONSTRAINT fail_review"); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.hook.Process(t.Context(), id); err != nil {
+		t.Fatal(err)
+	}
+	if h.post(failure) != 202 {
+		t.Fatal("duplicate rejected")
+	}
+	h.process()
+	db.Close()
+	again := open()
+	reviews, err := postgres.New(again).CaptureFailures(t.Context(), dbScope)
+	if err != nil || len(reviews) != 1 || reviews[0].OperationID != cap.Operation.ID || reviews[0].OperationReference != fx.PSP || reviews[0].Amount != req.Amount {
+		t.Fatal(reviews, err)
+	}
+	var consumed, processed int
+	if err := again.QueryRowContext(t.Context(), "SELECT (SELECT COUNT(*) FROM tender_outbox WHERE consumed_at IS NOT NULL),(SELECT COUNT(*) FROM tender_provider_events WHERE event_id=$1 AND processed_at IS NOT NULL)", id).Scan(&consumed, &processed); err != nil || consumed != 1 || processed != 1 {
+		t.Fatal(consumed, processed, err)
+	}
+	if _, err := again.ExecContext(t.Context(), "UPDATE tender_capture_failures SET reviewed_at=CURRENT_TIMESTAMP WHERE operation_id=$1", cap.Operation.ID); err != nil {
+		t.Fatal(err)
+	}
+	reviews, err = postgres.New(again).CaptureFailures(t.Context(), dbScope)
+	if err != nil || len(reviews) != 0 {
+		t.Fatal(reviews, err)
 	}
 }

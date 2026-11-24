@@ -98,3 +98,24 @@ type VerifiedEventTx interface {
 	InsertVerifiedEvent(VerifiedEventKey, json.RawMessage) error
 	ProcessVerifiedEvent(VerifiedEventKey, time.Time, func(json.RawMessage) error) error
 }
+
+// CaptureFailureNotice is a host review item for a processor's rejection of
+// a previously submitted capture. Its scope and operation ID deduplicate
+// delivery independently of the full-collection outbox.
+type CaptureFailureNotice struct {
+	Scope                                                      Scope
+	Provider, MerchantAccount, PaymentID, OrderID, OperationID string
+	ProviderReference, OperationReference                      string
+	Amount                                                     Money
+	At                                                         time.Time
+}
+
+type CaptureFailureTx interface {
+	EnqueueCaptureFailure(CaptureFailureNotice) error
+}
+
+// VerifiedEvidenceReader returns allowlisted evidence containing the supplied
+// top-level string fields, including already processed events on this route.
+type VerifiedEvidenceReader interface {
+	MatchingVerifiedEvidence(Scope, string, string, map[string]string) ([]json.RawMessage, error)
+}

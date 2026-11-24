@@ -12,7 +12,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
+
 	"time"
 )
 
@@ -21,6 +21,7 @@ import (
 // ChallengeShopper, RedirectShopper or UnknownAction. WebhookURL must be an
 // allowed callback target; SigningKey is the decoded test HMAC key.
 type AdyenFixture struct {
+	CompanyAccount                                                    string
 	MerchantAccount, APIKey, PaymentResult, DetailsResult, WebhookURL string
 	Brands                                                            []string
 }
@@ -28,8 +29,9 @@ type AdyenFixture struct {
 // AdyenRecord holds the committed wire references and amount, without card
 // data or credentials. Digest detects changed requests under the same key.
 type AdyenRecord struct {
-	Route, Reference, PaymentPSP, PSP, Currency, Result, Digest string
-	Value                                                       int64
+	Route, Reference, PaymentPSP, PSP, Currency, Result, Digest, Brand, MerchantAccount string
+	Brands                                                                              []string
+	Value                                                                               int64
 }
 
 func AdyenKey(account, key string) string {
@@ -55,10 +57,12 @@ type adyenFixtureRequest struct {
 type adyenFixtureServer struct {
 	*Server
 	config AdyenFixture
-	mu     sync.Mutex
 }
 
 func AdyenRoutes(c AdyenFixture) func(*Server) http.Handler {
+	if c.CompanyAccount == "" {
+		c.CompanyAccount = c.MerchantAccount
+	}
 	c.Brands = slices.Clone(c.Brands)
 	return func(s *Server) http.Handler {
 		if c.MerchantAccount == "" || c.APIKey == "" || c.WebhookURL != "" && (!s.targets[c.WebhookURL] || len(s.key) != 32) {
@@ -89,28 +93,13 @@ func (f *adyenFixtureServer) serve(w http.ResponseWriter, r *http.Request, route
 		fixtureInvalid(w)
 		return
 	}
-	key = AdyenKey(f.config.MerchantAccount, key)
-	digest := sha256.Sum256(append([]byte(r.URL.Path+"\x00"), raw...))
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	rec, ok := f.Lookup(key)
-	var fx AdyenRecord
-	if ok {
-		if json.Unmarshal(rec.Data, &fx) != nil || fx.Digest != hex.EncodeToString(digest[:]) {
-			w.WriteHeader(409)
-			return
-		}
-	} else {
-		psp := sha256.Sum256([]byte(fmt.Sprintf("%d/%s", f.seed, key)))
-		fx = AdyenRecord{Route: route, Reference: req.Reference, PSP: strings.ToUpper(hex.EncodeToString(psp[:8])), Currency: req.Amount.Currency, Value: req.Amount.Value, Digest: hex.EncodeToString(digest[:])}
-		if !f.prepare(&fx, req, r.PathValue("psp")) {
-			fixtureInvalid(w)
-			return
-		}
-		data, _ := json.Marshal(fx)
-		f.Commit(key, data)
+	fx, first, ok := f.commit(route, r.PathValue("psp"), key, req, raw, r.URL.Path)
+	if !ok {
+		fixtureInvalid(w)
+		return
 	}
-	if f.config.WebhookURL != "" {
+	w.Header().Set("Idempotency-Key", key)
+	if first && f.config.WebhookURL != "" {
 		if notification := f.notification(fx); notification != nil {
 			_, err = f.Enqueue([]Callback{{Target: f.config.WebhookURL, Body: notification}}, step)
 			if err != nil {
@@ -119,18 +108,43 @@ func (f *adyenFixtureServer) serve(w http.ResponseWriter, r *http.Request, route
 			}
 		}
 	}
-	if route == "captures" || route == "refunds" || route == "cancels" {
+	if fx.Route == "captures" || fx.Route == "refunds" || fx.Route == "cancels" {
 		w.WriteHeader(201)
 	}
 	_ = json.NewEncoder(w).Encode(f.reply(fx))
+}
+
+// Commit the company-scoped idempotent response and the merchant ledger under
+// one lock, including when multiple fixtures share this simulator.
+func (f *adyenFixtureServer) commit(route, original, key string, req adyenFixtureRequest, raw []byte, path string) (AdyenRecord, bool, bool) {
+	f.Server.mu.Lock()
+	defer f.Server.mu.Unlock()
+	companyKey := fmt.Sprintf("adyen/company/%d/%s/%s", len(f.config.CompanyAccount), f.config.CompanyAccount, key)
+	if rec, found := f.Server.records[companyKey]; found {
+		var fx AdyenRecord
+		err := json.Unmarshal(rec.Data, &fx)
+		return fx, false, err == nil
+	}
+	merchantKey := AdyenKey(f.config.MerchantAccount, key)
+	digest := sha256.Sum256(append([]byte(path+"\x00"), raw...))
+	psp := sha256.Sum256([]byte(fmt.Sprintf("%d/%s", f.seed, merchantKey)))
+	fx := AdyenRecord{Route: route, Reference: req.Reference, PSP: strings.ToUpper(hex.EncodeToString(psp[:8])),
+		Currency: req.Amount.Currency, Value: req.Amount.Value, Digest: hex.EncodeToString(digest[:]),
+		MerchantAccount: f.config.MerchantAccount, Brands: f.config.Brands,
+	}
+	if !f.prepare(&fx, req, original) {
+		return fx, false, false
+	}
+	data, _ := json.Marshal(fx)
+	f.commitLocked(companyKey, data)
+	f.commitLocked(merchantKey, data)
+	return fx, true, true
 }
 func fixtureInvalid(w http.ResponseWriter) {
 	w.WriteHeader(422)
 	_, _ = io.WriteString(w, `{"status":422,"errorCode":"101","errorType":"validation"}`)
 }
 func (f *adyenFixtureServer) records() []AdyenRecord {
-	f.Server.mu.Lock()
-	defer f.Server.mu.Unlock()
 	var list []AdyenRecord
 	for k, r := range f.Server.records {
 		if strings.HasPrefix(k, AdyenKey(f.config.MerchantAccount, "")) {
@@ -155,6 +169,7 @@ func (f *adyenFixtureServer) prepare(fx *AdyenRecord, req adyenFixtureRequest, o
 			req.AdditionalData.ManualCapture != "true" || req.AuthenticationData.ThreeDSRequestData.NativeThreeDS != "preferred" {
 			return false
 		}
+		fx.Brand = pm.Brand
 		fx.PaymentPSP = fx.PSP
 		fx.Result = f.config.PaymentResult
 	case "details":
@@ -163,6 +178,7 @@ func (f *adyenFixtureServer) prepare(fx *AdyenRecord, req adyenFixtureRequest, o
 		}
 		for _, p := range f.records() {
 			if p.Route == "payments" && (p.Result == "IdentifyShopper" || p.Result == "ChallengeShopper") && req.Details.ThreeDSResult == "mock-native-"+p.PSP && (req.PaymentData == "" || req.PaymentData == "mock-data-"+p.PSP) {
+				fx.Brand = p.Brand
 				fx.Reference = p.Reference
 				fx.PaymentPSP = p.PSP
 				fx.Currency = p.Currency
@@ -228,7 +244,7 @@ func (f *adyenFixtureServer) reply(p AdyenRecord) any {
 	amt := adyenFixtureAmount{p.Currency, p.Value}
 	switch p.Route {
 	case "paymentMethods":
-		return map[string]any{"paymentMethods": []any{map[string]any{"name": "Cards", "type": "scheme", "brands": f.config.Brands}}}
+		return map[string]any{"paymentMethods": []any{map[string]any{"name": "Cards", "type": "scheme", "brands": p.Brands}}}
 	case "payments", "details":
 		v := map[string]any{"resultCode": p.Result, "merchantReference": p.Reference}
 		switch p.Result {
@@ -243,12 +259,15 @@ func (f *adyenFixtureServer) reply(p AdyenRecord) any {
 		case "UnknownAction":
 			v["action"] = map[string]any{"type": "fixture-unknown"}
 		default:
+			if p.Result == "Authorised" {
+				v["paymentMethod"] = map[string]string{"type": "scheme", "brand": p.Brand}
+			}
 			v["pspReference"] = p.PaymentPSP
 			v["amount"] = amt
 		}
 		return v
 	default:
-		v := map[string]any{"status": "received", "reference": p.Reference, "merchantAccount": f.config.MerchantAccount, "pspReference": p.PSP, "paymentPspReference": p.PaymentPSP}
+		v := map[string]any{"status": "received", "reference": p.Reference, "merchantAccount": p.MerchantAccount, "pspReference": p.PSP, "paymentPspReference": p.PaymentPSP}
 		if p.Route != "cancels" {
 			v["amount"] = amt
 		}

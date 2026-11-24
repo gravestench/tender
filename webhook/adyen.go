@@ -211,7 +211,7 @@ func (h *Adyen) Process(ctx context.Context, id string) error {
 }
 func (h *Adyen) observation(tx tender.EventRecords, e evidence) (tender.Observation, error) {
 	var o tender.Observation
-	kind := map[string]tender.OperationKind{"AUTHORISATION": tender.OpConfirm, "CAPTURE": tender.OpCapture, "CANCELLATION": tender.OpVoid, "REFUND": tender.OpRefund}[e.Code]
+	kind := map[string]tender.OperationKind{"AUTHORISATION": tender.OpConfirm, "CAPTURE": tender.OpCapture, "CAPTURE_FAILED": tender.OpCapture, "CANCELLATION": tender.OpVoid, "REFUND": tender.OpRefund}[e.Code]
 	if kind == "" {
 		return o, tender.ErrUnsupported
 	}
@@ -281,10 +281,12 @@ func (h *Adyen) observation(tx tender.EventRecords, e evidence) (tender.Observat
 		o.ProviderReference = e.PSP
 		o.OperationReference = ""
 		if e.Success == "true" {
-			if p.Funds.Authorized == m.Minor {
+			if p.Funds.Authorized == m.Minor && p.VerifiedMethod == p.Market.Method {
 				return o, nil
 			}
-			o.Snapshot = tender.Snapshot{Status: tender.PaymentAuthorized, Funds: tender.Funds{Authorized: m.Minor}, ProviderStatus: "Authorised"}
+			// The Standard HMAC omits paymentMethod. Only an authenticated
+			// Checkout response establishes the actual card network.
+			return o, tender.ErrConflict
 		} else {
 			if p.Status == tender.PaymentDeclined && op.Status == tender.OperationFailed {
 				o.Status = tender.OperationFailed
@@ -296,6 +298,27 @@ func (h *Adyen) observation(tx tender.EventRecords, e evidence) (tender.Observat
 			o.Snapshot = tender.Snapshot{Status: tender.PaymentDeclined, ProviderStatus: "Refused"}
 		}
 		return o, nil
+	}
+	if kind == tender.OpCapture {
+		failed := e.Code == "CAPTURE_FAILED"
+		if !failed && e.Success == "true" {
+			failed, err = h.captureFailure(tx, p, op, e)
+			if err != nil {
+				return o, err
+			}
+		}
+		if !failed && e.Success == "true" && p.VerifiedMethod != p.Market.Method {
+			return o, tender.ErrConflict
+		}
+		if failed {
+			o.CaptureFailure = true
+			o.Snapshot.Status = tender.PaymentCaptureFailed
+			o.Snapshot.ProviderStatus = "CAPTURE_FAILED"
+			if op.Status != tender.OperationSucceeded {
+				o.Status = tender.OperationFailed
+			}
+			return o, nil
+		}
 	}
 	if e.Success == "false" {
 		o.Status = tender.OperationFailed
@@ -318,6 +341,70 @@ func (h *Adyen) observation(tx tender.EventRecords, e evidence) (tender.Observat
 	case tender.OpVoid:
 		o.Snapshot.Status = tender.PaymentVoided
 	}
-	o.Snapshot.ProviderStatus = e.Code
+	if p.Status == tender.PaymentCaptureFailed {
+		o.Snapshot.Status = p.Status
+		o.Snapshot.ProviderStatus = "CAPTURE_FAILED"
+	} else {
+		o.Snapshot.ProviderStatus = e.Code
+	}
 	return o, nil
+}
+
+// A success worker can run before the worker for a failure that is already
+// durably received. Inspect the same transaction's verified inbox before a
+// capture can enqueue collection. Other payments' or unbound evidence cannot
+// put this payment on hold.
+func (h *Adyen) captureFailure(tx tender.EventRecords, p tender.Payment, op tender.OperationRecord, event evidence) (bool, error) {
+	inbox, ok := tx.(tender.VerifiedEvidenceReader)
+	if !ok {
+		return false, tender.ErrUnsupported
+	}
+	rows, err := inbox.MatchingVerifiedEvidence(p.Scope, "adyen", p.MerchantAccount, map[string]string{"eventCode": "CAPTURE_FAILED", "originalReference": event.Original})
+	if err != nil {
+		return false, err
+	}
+	for _, raw := range rows {
+		var failure evidence
+		if json.Unmarshal(raw, &failure) != nil {
+			return false, tender.ErrValidation
+		}
+		if _, ok := failure.canonical(); !ok || failure.Account != p.MerchantAccount || failure.Original != p.ProviderReference || failure.Amount.Currency != p.Amount.Currency {
+			continue
+		}
+		boundPayment, bound, err := adyen.ResolveReference(tx, p.Scope, failure.Ref)
+		if errors.Is(err, tender.ErrNotFound) || errors.Is(err, tender.ErrConflict) {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		if boundPayment.ID != p.ID || boundPayment.AttemptID != p.AttemptID {
+			continue
+		}
+		if bound.Kind == tender.OpConfirm {
+			// The positive delivery itself can bind an otherwise-unresolved
+			// modification PSP when the failure named the original payment.
+			if failure.PSP == event.PSP {
+				bound = op
+			} else {
+				bound, err = tx.OperationByReference(p.Scope, p.ID, failure.PSP)
+				if errors.Is(err, tender.ErrNotFound) {
+					continue
+				}
+				if err != nil {
+					return false, err
+				}
+			}
+		}
+		if bound.Kind != tender.OpCapture || bound.Amount.Minor != *failure.Amount.Value || bound.ProviderReference != "" && bound.ProviderReference != failure.PSP {
+			continue
+		}
+		if bound.ID == op.ID && failure.PSP == event.PSP {
+			return true, nil
+		}
+		if p.Status != tender.PaymentCaptureFailed && bound.ID != op.ID {
+			return false, tender.ErrConflict
+		}
+	}
+	return false, nil
 }

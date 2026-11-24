@@ -178,6 +178,10 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) Commit(key string, data []byte) Record {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.commitLocked(key, data)
+}
+
+func (s *Server) commitLocked(key string, data []byte) Record {
 	if rec, ok := s.records[key]; ok {
 		return rec.clone()
 	}

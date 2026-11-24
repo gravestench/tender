@@ -4,6 +4,8 @@ package adyen
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -125,6 +127,9 @@ func (a *Adapter) post(ctx context.Context, path, key string, data, out any) err
 		return tender.ErrUnknownOutcome
 	}
 	defer resp.Body.Close()
+	if echoed := resp.Header.Values("Idempotency-Key"); len(echoed) > 0 && (len(echoed) != 1 || echoed[0] != key) {
+		return tender.ErrUnknownOutcome
+	}
 	switch resp.StatusCode {
 	case http.StatusUnauthorized, http.StatusForbidden:
 		return tender.ErrAuthentication
@@ -183,20 +188,15 @@ func (a *Adapter) Query(context.Context, tender.ProviderRequest) (tender.Observa
 	return tender.Observation{}, tender.ErrUnsupported
 }
 func (a *Adapter) modify(ctx context.Context, r tender.ProviderRequest, o tender.Observation) (tender.Observation, error) {
-	if !reference.MatchString(r.Payment.ProviderReference) || r.Payment.Funds.Authorized == 0 {
+	if !reference.MatchString(r.Payment.ProviderReference) || r.Payment.Funds.Authorized == 0 || r.Operation.Kind == tender.OpCapture && r.Payment.VerifiedMethod != r.Payment.Market.Method {
 		return o, tender.ErrUnsupported
 	}
-	paths := map[tender.OperationKind]string{tender.OpVoid: "cancels", tender.OpCapture: "captures", tender.OpRefund: "refunds"}
+	path, data := a.modification(r)
 	ref := merchantReference(r.Payment, r.Operation)
-	data := map[string]any{"merchantAccount": a.cfg.MerchantAccount, "reference": ref}
-	if r.Operation.Kind != tender.OpVoid {
-		data["amount"] = money(r.Operation.Amount)
-	}
 	var reply struct {
 		MerchantAccount, Reference, PaymentPspReference, PspReference, Status string
 		Amount                                                                *amount
 	}
-	path := "/payments/" + r.Payment.ProviderReference + "/" + paths[r.Operation.Kind]
 	if err := a.post(ctx, path, r.Operation.ProviderKey, data, &reply); err != nil {
 		return o, err
 	}
@@ -207,4 +207,32 @@ func (a *Adapter) modify(ctx context.Context, r tender.ProviderRequest, o tender
 	o.OperationReference = reply.PspReference
 	o.Status = tender.OperationPending
 	return o, nil
+}
+
+func (a *Adapter) modification(r tender.ProviderRequest) (string, map[string]any) {
+	paths := map[tender.OperationKind]string{tender.OpVoid: "cancels", tender.OpCapture: "captures", tender.OpRefund: "refunds"}
+	ref := merchantReference(r.Payment, r.Operation)
+	data := map[string]any{"merchantAccount": a.cfg.MerchantAccount, "reference": ref}
+	if r.Operation.Kind != tender.OpVoid {
+		data["amount"] = money(r.Operation.Amount)
+	}
+
+	return "/payments/" + r.Payment.ProviderReference + "/" + paths[r.Operation.Kind], data
+}
+
+// ReplayIdentity opts only authenticated manual modifications into bounded
+// same-key replay. The URI, version and exact wire body are part of the binding.
+func (a *Adapter) ReplayIdentity(r tender.ProviderRequest) (string, time.Duration) {
+	switch r.Operation.Kind {
+	case tender.OpCapture, tender.OpVoid, tender.OpRefund:
+	default:
+		return "", 0
+	}
+	if r.Payment.ProviderReference == "" {
+		return "", 0
+	}
+	path, data := a.modification(r)
+	body, _ := json.Marshal(data)
+	sum := sha256.Sum256([]byte(strings.Join([]string{"POST", a.cfg.BaseURL + path, a.cfg.MerchantAccount, r.Operation.ProviderKey, string(body)}, "\x00")))
+	return hex.EncodeToString(sum[:]), 24 * time.Hour
 }

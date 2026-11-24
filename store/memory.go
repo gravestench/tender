@@ -23,11 +23,12 @@ type inboxEvent struct {
 }
 
 type memoryTx struct {
-	events     map[tender.VerifiedEventKey]inboxEvent
-	payments   map[key]tender.Payment
-	operations map[key]tender.OperationRecord
-	history    []tender.AuditEntry
-	outbox     []tender.OutboxEntry
+	events          map[tender.VerifiedEventKey]inboxEvent
+	payments        map[key]tender.Payment
+	operations      map[key]tender.OperationRecord
+	history         []tender.AuditEntry
+	outbox          []tender.OutboxEntry
+	captureFailures []tender.CaptureFailureNotice
 }
 
 // Memory serializes transactions and publishes a new snapshot only on commit.
@@ -60,7 +61,7 @@ func (m *Memory) Transact(ctx context.Context, fn func(tender.Tx) error) error {
 	tx := memoryTx{
 		events:   maps.Clone(m.state.events),
 		payments: maps.Clone(m.state.payments), operations: maps.Clone(m.state.operations),
-		history: slices.Clone(m.state.history), outbox: slices.Clone(m.state.outbox),
+		history: slices.Clone(m.state.history), outbox: slices.Clone(m.state.outbox), captureFailures: slices.Clone(m.state.captureFailures),
 	}
 	if err := fn(&tx); err != nil {
 		return err
@@ -266,4 +267,53 @@ func (t *memoryTx) ProcessVerifiedEvent(key tender.VerifiedEventKey, _ time.Time
 	event.processed = true
 	t.events[key] = event
 	return nil
+}
+
+func (t *memoryTx) EnqueueCaptureFailure(n tender.CaptureFailureNotice) error {
+	for _, old := range t.captureFailures {
+		if old.Scope == n.Scope && old.OperationID == n.OperationID {
+			return nil
+		}
+	}
+	t.captureFailures = append(t.captureFailures, n)
+	return nil
+}
+
+func (m *Memory) CaptureFailures(ctx context.Context, scope tender.Scope) ([]tender.CaptureFailureNotice, error) {
+	if err := m.acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer func() { <-m.lock }()
+	var notices []tender.CaptureFailureNotice
+	for _, n := range m.state.captureFailures {
+		if n.Scope == scope {
+			notices = append(notices, n)
+		}
+	}
+	return notices, nil
+}
+
+func (t *memoryTx) MatchingVerifiedEvidence(scope tender.Scope, provider, account string, fields map[string]string) ([]json.RawMessage, error) {
+	var result []json.RawMessage
+	for k, row := range t.events {
+		if k.Scope != scope || k.Provider != provider || k.MerchantAccount != account {
+			continue
+		}
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(row.evidence, &obj); err != nil {
+			return nil, err
+		}
+		matches := true
+		for field, want := range fields {
+			var s string
+			if json.Unmarshal(obj[field], &s) != nil || s != want {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			result = append(result, slices.Clone(row.evidence))
+		}
+	}
+	return result, nil
 }

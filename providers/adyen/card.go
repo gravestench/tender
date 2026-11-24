@@ -31,6 +31,12 @@ type NativeAction struct {
 	AuthorisationToken string `json:"authorisationToken,omitempty"`
 }
 
+// Allowed checks the native action fields required by Adyen Web 6.45.2.
+// Fingerprinting can invoke a redirect from inside the SDK.
+func (n NativeAction) Allowed() bool {
+	return n.Type == "threeDS2" && n.Subtype == "challenge" && n.PaymentMethodType == "scheme" && strings.TrimSpace(n.Token) != "" && strings.TrimSpace(n.AuthorisationToken) != ""
+}
+
 func (a *Adapter) action(o tender.Observation, data CardAction) (tender.Observation, error) {
 	raw, err := json.Marshal(data)
 	if err != nil {
@@ -110,7 +116,7 @@ func strict(raw string, out any) bool {
 }
 func (i cardInput) valid(b string) bool {
 	p, bi := i.PaymentMethod, i.BrowserInfo
-	if p.Type != "scheme" || p.Brand != "" && p.Brand != b || b == "visa" && (p.HolderName == "" || i.ShopperEmail == "" || i.ShopperIP == "") {
+	if p.Type != "scheme" || p.Brand != b || b == "visa" && (p.HolderName == "" || i.ShopperEmail == "" || i.ShopperIP == "") {
 		return false
 	}
 	if i.ShopperIP != "" {
@@ -129,6 +135,7 @@ func (i cardInput) valid(b string) bool {
 type paymentReply struct {
 	ResultCode, MerchantReference, PspReference string
 	Amount                                      *amount
+	PaymentMethod                               struct{ Type, Brand string }
 	Action                                      json.RawMessage
 }
 
@@ -164,7 +171,7 @@ func (a *Adapter) confirm(ctx context.Context, r tender.ProviderRequest, o tende
 				ThreeDSResult string `json:"threeDSResult"`
 			} `json:"details"`
 		}
-		if saved.Action == nil || saved.Reference == "" || !strict(r.Token, &input) || input.Details.ThreeDSResult == "" || len(input.Details.ThreeDSResult) > 50000 {
+		if saved.Action == nil || !saved.Action.Allowed() || saved.Reference == "" || !strict(r.Token, &input) || input.Details.ThreeDSResult == "" || len(input.Details.ThreeDSResult) > 50000 {
 			return o, tender.ErrValidation
 		}
 		path, ref = "/payments/details", saved.Reference
@@ -201,10 +208,9 @@ func (a *Adapter) confirm(ctx context.Context, r tender.ProviderRequest, o tende
 	}
 	if len(reply.Action) > 0 && string(reply.Action) != "null" {
 		var n NativeAction
-		native := json.Unmarshal(reply.Action, &n) == nil && n.Type == "threeDS2" && n.PaymentMethodType == "scheme" && n.Token != ""
-		fingerprint := n.Subtype == "fingerprint" && reply.ResultCode == "IdentifyShopper"
+		native := json.Unmarshal(reply.Action, &n) == nil && n.Allowed()
 		challenge := n.Subtype == "challenge" && reply.ResultCode == "ChallengeShopper"
-		if native && (fingerprint || challenge) {
+		if native && challenge {
 			o.OperationReference = ""
 			return a.action(o, CardAction{Type: "threeDS2", Reference: ref, Action: &n})
 		}
@@ -215,10 +221,10 @@ func (a *Adapter) confirm(ctx context.Context, r tender.ProviderRequest, o tende
 	switch reply.ResultCode {
 	case "Authorised":
 		o.OperationReference = ""
-		if o.ProviderReference == "" {
+		if !reference.MatchString(reply.PspReference) || reply.MerchantReference != ref || reply.Amount == nil || reply.PaymentMethod.Type != "scheme" || reply.PaymentMethod.Brand != brand(r.Payment.Market.Method) {
 			return o, tender.ErrUnknownOutcome
 		}
-		o.Snapshot = tender.Snapshot{Status: tender.PaymentAuthorized, Funds: tender.Funds{Authorized: o.Amount.Minor}, ProviderStatus: "Authorised"}
+		o.Snapshot = tender.Snapshot{Status: tender.PaymentAuthorized, VerifiedMethod: r.Payment.Market.Method, Funds: tender.Funds{Authorized: o.Amount.Minor}, ProviderStatus: "Authorised"}
 	case "Refused", "Cancelled":
 		o.OperationReference = ""
 		o.Status = tender.OperationFailed

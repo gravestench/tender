@@ -269,6 +269,13 @@ func (e *Engine) reserve(ctx context.Context, kind OperationKind, r Request, pre
 			Key: r.Key, ProviderKey: e.config.NewID(), Fingerprint: hash, Amount: r.Amount,
 			Kind: kind, BaseVersion: p.Version, Status: OperationReserved,
 		}
+		if provider, ok := e.config.Provider.(IdempotentReplayProvider); ok {
+			id, window := provider.ReplayIdentity(ProviderRequest{Payment: p, Operation: op})
+			if id != "" && window > 0 {
+				op.ReplayFingerprint = id
+				op.ReplayUntil = e.config.Now().UTC().Add(window)
+			}
+		}
 		if p.AttemptID == "" || op.ID == "" || op.ProviderKey == "" {
 			return fmt.Errorf("%w: missing generated identity", ErrValidation)
 		}
@@ -316,6 +323,9 @@ func (e *Engine) retryableCreate(tx Tx, predecessor string, r Request) (state, e
 }
 
 func (e *Engine) checkAmount(kind OperationKind, amount Money, p Payment) error {
+	if p.Status == PaymentCaptureFailed {
+		return ErrConflict
+	}
 	if err := amount.ValidatePurchase(); err != nil {
 		return err
 	}
@@ -519,6 +529,19 @@ func (e *Engine) applyTx(tx Tx, original state, o Observation, source string) (s
 	if err := bind(s, o); err != nil {
 		return state{}, err
 	}
+
+	if o.CaptureFailure {
+		status := OperationFailed
+		if s.op.Status == OperationSucceeded {
+			status = OperationSucceeded
+		}
+		if source != "webhook" || s.op.Kind != OpCapture || o.ProviderReference == "" || o.OperationReference == "" ||
+			o.Snapshot.Status != PaymentCaptureFailed || o.Snapshot.Funds != s.payment.Funds || o.Status != status {
+			return state{}, ErrConflict
+		}
+	} else if o.Snapshot.Status == PaymentCaptureFailed && s.payment.Status != PaymentCaptureFailed {
+		return state{}, ErrConflict
+	}
 	// A mutation reply is fenced by its original reservation. Cumulative
 	// settlement/return/dispute evidence may refer to an older operation.
 	versionChanged := s.payment.Version != original.payment.Version
@@ -529,19 +552,43 @@ func (e *Engine) applyTx(tx Tx, original state, o Observation, source string) (s
 	if source == "query" && versionChanged && !earlierOperation {
 		return s, nil
 	}
-	if earlierOperation && !s.canReconcile(o, source) {
+	if earlierOperation && !o.CaptureFailure && !s.canReconcile(o, source) {
 		return state{}, fmt.Errorf("%w: stale observation for an earlier payment version", ErrConflict)
 	}
-	if active, err := tx.ActiveOperation(s.payment.Scope, s.payment.ID); err == nil && active.ID != s.op.ID {
+	active, activeErr := tx.ActiveOperation(s.payment.Scope, s.payment.ID)
+	if activeErr == nil && active.ID != s.op.ID && !o.CaptureFailure {
 		return state{}, fmt.Errorf("%w: another operation is in progress", ErrConflict)
-	} else if err != nil && !errors.Is(err, ErrNotFound) {
-		return state{}, err
+	} else if activeErr != nil && !errors.Is(activeErr, ErrNotFound) {
+		return state{}, activeErr
+	}
+	if o.Snapshot.VerifiedMethod == "" {
+		o.Snapshot.VerifiedMethod = s.payment.VerifiedMethod
+	}
+	if o.Snapshot.VerifiedMethod != "" && o.Snapshot.VerifiedMethod != s.payment.Market.Method {
+		return state{}, ErrConflict
 	}
 	o.Snapshot = o.Snapshot.principalSnapshot(s.payment.Status)
 	o.Snapshot.ProviderStatus = sanitizeStatus(o.Snapshot.ProviderStatus)
 	o.Snapshot.Action.ExpiresAt = o.Snapshot.Action.ExpiresAt.UTC()
 	if err := validateOutcome(s, o, source); err != nil {
 		return state{}, err
+	}
+	at := e.config.Now().UTC()
+	if o.CaptureFailure {
+		// A second capture can fail after another operation already put this
+		// payment on hold. Each failed operation still needs its own host notice.
+		review, ok := tx.(CaptureFailureTx)
+		if !ok {
+			return state{}, ErrUnsupported
+		}
+		notice := CaptureFailureNotice{
+			Scope: s.payment.Scope, Provider: s.payment.Provider, MerchantAccount: s.payment.MerchantAccount,
+			PaymentID: s.payment.ID, OrderID: s.payment.OrderID, OperationID: s.op.ID,
+			ProviderReference: o.ProviderReference, OperationReference: o.OperationReference, Amount: o.Amount, At: at,
+		}
+		if err := review.EnqueueCaptureFailure(notice); err != nil {
+			return state{}, err
+		}
 	}
 	if s.op.Status == o.Status && s.payment.Snapshot == o.Snapshot &&
 		(o.ProviderReference == "" || s.payment.ProviderReference == o.ProviderReference) &&
@@ -565,7 +612,7 @@ func (e *Engine) applyTx(tx Tx, original state, o Observation, source string) (s
 	if o.OperationReference != "" {
 		s.op.ProviderReference = o.OperationReference
 	}
-	change, err := s.payment.Apply(o.Snapshot, e.config.Now().UTC())
+	change, err := s.payment.Apply(o.Snapshot, at)
 	if err != nil {
 		return state{}, err
 	}
@@ -580,6 +627,14 @@ func (e *Engine) applyTx(tx Tx, original state, o Observation, source string) (s
 	}
 	if err := e.audit(tx, s, change, source); err != nil {
 		return state{}, err
+	}
+	if o.CaptureFailure && activeErr == nil && active.ID != s.op.ID && active.PaymentVersion == change.Version-1 {
+		// The hold changes no principal. Keep an unrelated in-flight reservation
+		// available to receive its own verified outcome against the held payment.
+		active.PaymentVersion = change.Version
+		if err := tx.UpdateOperation(active); err != nil {
+			return state{}, err
+		}
 	}
 	if o.Status == OperationSucceeded && fullyCollected(s.payment) {
 		entry := OutboxEntry{
@@ -705,7 +760,8 @@ func validateOutcome(s state, o Observation, source string) error {
 
 // Recover asks the adapter for an authoritative result using the persisted
 // reservation and original provider key. Recovery never executes a new host
-// mutation. Only the read-only query retries on rate limiting/transport errors.
+// mutation. A provider may bind an identical-request replay at reservation time.
+// Only a read-only query retries on rate limiting/transport errors.
 func (e *Engine) Recover(ctx context.Context, operationID string) (Result, error) {
 	var original state
 	err := e.config.Store.Transact(ctx, func(tx Tx) error {
@@ -717,7 +773,7 @@ func (e *Engine) Recover(ctx context.Context, operationID string) (Result, error
 		return Result{}, err
 	}
 	if !e.caps.Query {
-		return Result{original.payment, original.op.Operation}, ErrUnsupported
+		return e.replayUnknown(ctx, original)
 	}
 	call, cancel := context.WithTimeout(ctx, e.config.Timeout)
 	defer cancel()
@@ -749,4 +805,37 @@ func (e *Engine) Recover(ctx context.Context, operationID string) (Result, error
 		case <-time.After(delay):
 		}
 	}
+}
+
+// replayUnknown makes at most one identical provider call. It never uses a
+// fresh key or a token, and excludes records created without a replay binding.
+func (e *Engine) replayUnknown(ctx context.Context, original state) (Result, error) {
+	p, op := original.payment, original.op.Operation
+	last := Result{p, op}
+	provider, ok := e.config.Provider.(IdempotentReplayProvider)
+	if !ok || op.ReplayFingerprint == "" || op.Status != OperationUnknown && op.Status != OperationReserved || p.Status == PaymentCaptureFailed {
+		return last, ErrUnsupported
+	}
+	req := ProviderRequest{Payment: p, Operation: op}
+	id, window := provider.ReplayIdentity(req)
+	if id != op.ReplayFingerprint {
+		return last, ErrConflict
+	}
+	remaining := op.ReplayUntil.Sub(e.config.Now().UTC())
+	if remaining <= 0 || remaining > window {
+		return last, ErrUnsupported
+	}
+	call, cancel := context.WithTimeout(ctx, min(e.config.Timeout, remaining))
+	defer cancel()
+	obs, err := e.config.Provider.Execute(call, req)
+	if err != nil {
+		return last, errors.Join(ErrUnknownOutcome, err)
+	}
+	finish, stop := context.WithTimeout(context.WithoutCancel(ctx), e.config.Timeout)
+	defer stop()
+	result, err := e.apply(finish, original, obs, "response")
+	if err != nil {
+		return last, errors.Join(ErrUnknownOutcome, err)
+	}
+	return result.result()
 }

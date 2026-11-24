@@ -193,3 +193,33 @@ func (t *transaction) ProcessVerifiedEvent(key tender.VerifiedEventKey, at time.
         WHERE merchant_id=$1 AND environment=$2 AND provider=$3 AND merchant_account=$4 AND event_id=$5`, key.Scope.MerchantID, key.Scope.Environment, key.Provider, key.MerchantAccount, key.ID, at)
 	return dbError(err)
 }
+
+func (t *transaction) EnqueueCaptureFailure(n tender.CaptureFailureNotice) error {
+	return t.write(`INSERT INTO tender_capture_failures(record) VALUES ($1) ON CONFLICT (merchant_id,environment,operation_id) DO NOTHING`, n)
+}
+
+// CaptureFailures lists pending host review items for a merchant and environment.
+func (s *Store) CaptureFailures(ctx context.Context, scope tender.Scope) ([]tender.CaptureFailureNotice, error) {
+	return list[tender.CaptureFailureNotice](ctx, s.db, `SELECT record FROM tender_capture_failures WHERE merchant_id=$1 AND environment=$2 AND reviewed_at IS NULL ORDER BY seq`, scope.MerchantID, scope.Environment)
+}
+
+func (t *transaction) MatchingVerifiedEvidence(scope tender.Scope, provider, account string, fields map[string]string) ([]json.RawMessage, error) {
+	filter, err := json.Marshal(fields)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := t.tx.QueryContext(t.ctx, `SELECT evidence FROM tender_provider_events WHERE merchant_id=$1 AND environment=$2 AND provider=$3 AND merchant_account=$4 AND evidence @> $5::jsonb`, scope.MerchantID, scope.Environment, provider, account, string(filter))
+	if err != nil {
+		return nil, dbError(err)
+	}
+	defer rows.Close()
+	var values []json.RawMessage
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return nil, dbError(err)
+		}
+		values = append(values, raw)
+	}
+	return values, dbError(rows.Err())
+}

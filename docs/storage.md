@@ -6,12 +6,13 @@ Tender stores the host order claim, payment, attempt and operation reservation b
 
 Use PostgreSQL 17 with a UTF-8 database. Choose a schema where only trusted roles can create objects. Set that schema as the search path for the migration session and **every** connection in the application pool. The example uses an existing schema named `tender`.
 
-Apply outstanding `migrations/*.up.sql` files in lexicographic order before starting workers. Each script contains `BEGIN` and `COMMIT`. Record each successfully applied version in the host migration ledger. A fresh installation needs `001_initial` and `002_reference_integrity`. An installation with `001_initial` already applied needs only `002`. The scripts are also available through `postgres.Migrations` in Go.
+Apply outstanding `migrations/*.up.sql` files in lexicographic order before starting workers. Each script contains `BEGIN` and `COMMIT`. Record each successfully applied version in the host migration ledger. A fresh installation needs `001_initial`, `002_reference_integrity` and `003_capture_failures`. Existing installations apply each version after their last recorded migration. The scripts are also available through `postgres.Migrations` in Go.
 
 ```sh
 PGOPTIONS='-c search_path=tender' psql "$TENDER_MIGRATION_DSN" -X -v ON_ERROR_STOP=1 \
   -f store/postgres/migrations/001_initial.up.sql \
-  -f store/postgres/migrations/002_reference_integrity.up.sql
+  -f store/postgres/migrations/002_reference_integrity.up.sql \
+  -f store/postgres/migrations/003_capture_failures.up.sql
 ```
 
 Grant the runtime role schema usage, table privileges for its operations, and sequence usage for inserts. Reserve DDL for the migration role. The host owns the SQL driver, pool, credentials, network settings and shutdown. With pgx v5, a PostgreSQL URL can include `search_path=tender` and `sslmode=verify-full` for a remote database. Configure a trusted CA for the server certificate. The `store/postgres` package uses the Go standard library and accepts a pool opened with any PostgreSQL `database/sql` driver that supports serializable transactions and SQLSTATE errors via `SQLState() string`.
@@ -62,6 +63,17 @@ UPDATE tender_outbox SET consumed_at = CURRENT_TIMESTAMP
 WHERE merchant_id = $1 AND environment = $2 AND seq = $3;
 ```
 
+- **Capture failure review.** A verified capture failure puts the payment on hold and atomically adds one durable review item per scoped operation, including failures reported after fulfillment. `CaptureFailures(ctx, scope)` lists pending PostgreSQL records. A host worker can claim one as shown below. Record compensation or follow-up keyed by merchant, environment and operation ID and acknowledge the review in the same transaction. The earlier gross capture and its original outbox entry remain available for audit.
+
+```sql
+SELECT seq, operation_id, record FROM tender_capture_failures
+WHERE merchant_id = $1 AND environment = $2 AND reviewed_at IS NULL
+ORDER BY seq LIMIT 1 FOR UPDATE SKIP LOCKED;
+
+UPDATE tender_capture_failures SET reviewed_at = CURRENT_TIMESTAMP
+WHERE merchant_id = $1 AND environment = $2 AND seq = $3;
+```
+
 - **Settlement and reconciliation.** Insert normalized signed minor units, currency, payout and processor references into `tender_settlements`. The primary key is merchant, environment, provider, merchant account, report and line ID. Within a transaction, insert with `ON CONFLICT DO NOTHING` and compare an existing line with the normalized facts on replay. Preserve unmatched lines for later resolution. Insert a row in `tender_reconciliation_runs` for each reconciliation run. In a transaction, append matched lines, discrepancies and resolution evidence to `tender_reconciliation_history` and set `finished_at` on the run when complete. Preserve the original evidence and add a new history row for corrections. The provider adapter supplies the report mapping, and the host schedules ingestion.
 
 For example, use these parameterized statements inside the importer transaction. The lookup locks the immutable report line while the worker decides whether a duplicate agrees. A discrepancy can retain both versions as sanitized history evidence.
@@ -109,10 +121,11 @@ WHERE (merchant_id, environment, provider, merchant_account, run_id) = ($1,$2,$3
 
 ## Rollback
 
-Before deployment, back up existing Tender data and verify restore access. A code rollback can keep a compatible schema. Before removing the initial schema, stop all Tender writers and workers, identify pending operations and outbox work, and preserve the full database for recovery. On a disposable database or after the host has explicitly approved deleting the records, run the down migrations in reverse order using the same role and search path. Downgrading `002` restores full-width reference indexes and fails atomically if a stored reference exceeds the old B-tree limit. Preserve the references and the current schema in that case.
+Before deployment, back up existing Tender data and verify restore access. A code rollback can keep a compatible schema. Before removing the initial schema, stop all Tender writers and workers, identify pending operations and outbox work, and preserve the full database for recovery. On a disposable database or after the host has explicitly approved deleting the records, run the down migrations in reverse order using the same role and search path. Downgrading `003` removes the capture failure review queue and its evidence lookup index. Preserve its review history first. Downgrading `002` restores full-width reference indexes and fails atomically if a stored reference exceeds the old B-tree limit. Preserve the references and the current schema in that case.
 
 ```sh
 PGOPTIONS='-c search_path=tender' psql "$TENDER_MIGRATION_DSN" -X -v ON_ERROR_STOP=1 \
+  -f store/postgres/migrations/003_capture_failures.down.sql \
   -f store/postgres/migrations/002_reference_integrity.down.sql \
   -f store/postgres/migrations/001_initial.down.sql
 ```

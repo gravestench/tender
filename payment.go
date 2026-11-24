@@ -10,6 +10,7 @@ import (
 type PaymentStatus string
 
 const (
+	PaymentCaptureFailed     PaymentStatus = "capture_failed"
 	PaymentCreated           PaymentStatus = "created"
 	PaymentPending           PaymentStatus = "pending"
 	PaymentRequiresAction    PaymentStatus = "requires_action"
@@ -49,6 +50,9 @@ func (f Funds) includes(previous Funds) bool {
 // Snapshot is an absolute provider observation. An absent action has its zero
 // value. Funds are cumulative even when a particular operation is partial.
 type Snapshot struct {
+	// VerifiedMethod is the payment method established by authenticated provider
+	// evidence. Zero is unknown, including records from older adapters.
+	VerifiedMethod PaymentMethod
 	Status         PaymentStatus
 	Funds          Funds
 	Action         CustomerAction
@@ -70,6 +74,8 @@ func (s Snapshot) validate(limit int64, at time.Time) error {
 	switch s.Status {
 	case PaymentCreated, PaymentPending, PaymentRequiresAction, PaymentDeclined, PaymentFailed:
 		valid = s.Funds == (Funds{})
+	case PaymentCaptureFailed:
+		valid = s.Funds.Authorized > 0
 	case PaymentAuthorized:
 		valid = s.Funds.Authorized > 0 && s.Funds.Captured == 0
 	case PaymentPartiallyCaptured:
@@ -93,7 +99,12 @@ func (s Snapshot) canAdvance(next Snapshot) bool {
 	if !next.Funds.includes(s.Funds) {
 		return false
 	}
+	if next.Status == PaymentCaptureFailed && s.Funds.Authorized > 0 {
+		return true
+	}
 	switch s.Status {
+	case PaymentCaptureFailed:
+		return false
 	case PaymentVoided, PaymentExpired, PaymentReturned:
 		return next.Status == s.Status && next.Funds.Authorized == s.Funds.Authorized && next.Funds.Captured == s.Funds.Captured
 	}
@@ -239,6 +250,8 @@ type Operation struct {
 	Status                                           OperationStatus
 	Amount                                           Money
 	BaseVersion                                      uint64
+	ReplayFingerprint                                string
+	ReplayUntil                                      time.Time
 }
 
 // SetStatus records an operation outcome independently of payment state. Only
