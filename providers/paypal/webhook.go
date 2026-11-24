@@ -203,8 +203,12 @@ func (h *Webhook) Process(ctx context.Context, id string) error {
 		if err != nil {
 			return empty, err
 		}
-		// Wait for the in-flight POST/GET comparison before a callback can apply funds.
-		if op.Status == tender.OperationReserved && (op.DispatchUntil.IsZero() || h.api.cfg.Now().Before(op.DispatchUntil)) {
+		if op.ProviderEvidenceDigest != ([32]byte{}) && op.ProviderEvidenceDigest != buyerDigest(p, o.buyerID()) {
+			return empty, tender.ErrConflict
+		}
+		// A current owner gets to finish its POST/GET comparison. An abandoned
+		// or legacy owner needs independently signed and fetched evidence.
+		if op.Status == tender.OperationReserved && (op.AwaitingEvidence || h.api.cfg.Now().Before(op.DispatchUntil)) {
 			return empty, tender.ErrConflict
 		}
 		if op.Kind != tender.OpConfirm || op.AttemptID != p.AttemptID || op.PaymentID != p.ID || op.Amount != p.Amount {

@@ -53,8 +53,8 @@ func TestPayPalSandboxTransaction(t *testing.T) {
 	}
 	p := proof.Payment
 	op := proof.Confirm
-	if p.Scope.Validate() != nil || p.Scope.Environment != tender.EnvironmentSandbox || p.Provider != "paypal" || p.MerchantAccount != os.Getenv("TENDER_PAYPAL_MERCHANT_ACCOUNT") || p.Market != (tender.Market{Country: "US", Currency: "USD", Method: tender.MethodPayPal}) || p.ProviderReference == "" || op.Kind != tender.OpConfirm || op.Amount != p.Amount || p.Funds != (tender.Funds{}) || op.ProviderReference != "" || op.BaseVersion != p.Version || op.Status != tender.OperationUnknown {
-		t.Fatal("BLOCKED: expected the original uncollected, merchant-bound sandbox payment and uncertain confirmation")
+	if p.Scope.Validate() != nil || p.Scope.Environment != tender.EnvironmentSandbox || p.Provider != "paypal" || p.MerchantAccount != os.Getenv("TENDER_PAYPAL_MERCHANT_ACCOUNT") || p.Market != (tender.Market{Country: "US", Currency: "USD", Method: tender.MethodPayPal}) || p.ProviderReference == "" || op.Kind != tender.OpConfirm || op.Amount != p.Amount || p.Funds != (tender.Funds{}) || op.ProviderReference != "" || op.BaseVersion != p.Version || op.Status != tender.OperationUnknown || op.ProviderEvidenceDigest == ([32]byte{}) {
+		t.Fatal("BLOCKED: expected the original uncollected, merchant-bound sandbox payment and uncertain confirmation with its pre-dispatch buyer digest")
 	}
 	cfg := paypal.Config{Scope: p.Scope, MerchantAccount: p.MerchantAccount, BaseURL: walletSandboxBase, ClientID: os.Getenv("TENDER_PAYPAL_CLIENT_ID"), Secret: os.Getenv("TENDER_PAYPAL_SECRET"), WebhookID: os.Getenv("TENDER_PAYPAL_WEBHOOK_ID")}
 	a, err := paypal.New(cfg)

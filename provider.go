@@ -103,6 +103,9 @@ type Capabilities struct {
 	// QueryAfterDispatch defers recovery reads until the original mutation has
 	// completed its response checks or its durable dispatch deadline expires.
 	QueryAfterDispatch bool
+	// BindBeforeDispatch identifies mutations that call BindEvidence before any
+	// financial POST. A crashed reservation awaiting that checkpoint has no effect.
+	BindBeforeDispatch []OperationKind
 	ActionModes        []ActionMode
 	Markets            []MarketCapability
 }
@@ -147,9 +150,31 @@ func (c Capabilities) SupportsIn(kind OperationKind, market Market, partial bool
 // ProviderRequest carries the durable reservation and the current payment.
 // Token is transient opaque input for Execute. It may be absent during Query.
 type ProviderRequest struct {
-	Payment   Payment
-	Operation Operation
-	Token     string
+	checkpoint *dispatchCheckpoint
+	Payment    Payment
+	Operation  Operation
+	Token      string
+}
+
+// BindEvidence persists an authenticated evidence digest on the reservation
+// before an adapter dispatches a mutation. A different digest or a failed
+// checkpoint forbids dispatch. Direct callers must supply an already bound
+// operation; only the engine can create the durable checkpoint.
+func (r *ProviderRequest) BindEvidence(digest [32]byte) error {
+	if digest == ([32]byte{}) {
+		return ErrValidation
+	}
+	if r.Operation.ProviderEvidenceDigest == digest {
+		return nil
+	}
+	if r.Operation.ProviderEvidenceDigest != ([32]byte{}) || r.checkpoint == nil {
+		return ErrNotDispatched
+	}
+	if err := r.checkpoint.bind(digest); err != nil {
+		return ErrNotDispatched
+	}
+	r.Operation.ProviderEvidenceDigest = digest
+	return nil
 }
 
 // Observation is an adapter's normalized result. Amount is the observed

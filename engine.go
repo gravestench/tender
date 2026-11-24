@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"slices"
 	"strings"
 	"time"
 )
@@ -191,10 +192,40 @@ func (e *Engine) execute(ctx context.Context, kind OperationKind, r Request, pre
 	call, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	if err := call.Err(); err != nil {
-		return e.finishDispatch(ctx, s, Observation{}, err)
+		return e.finishDispatch(ctx, s, Observation{}, ErrNotDispatched)
 	}
-	obs, callErr := e.config.Provider.Execute(call, ProviderRequest{Payment: s.payment, Operation: s.op.Operation, Token: r.Token})
+	req := ProviderRequest{Payment: s.payment, Operation: s.op.Operation, Token: r.Token, checkpoint: &dispatchCheckpoint{ctx: call, engine: e, owner: &s}}
+	obs, callErr := e.config.Provider.Execute(call, req)
 	return e.finishDispatch(ctx, s, obs, callErr)
+}
+
+// A checkpoint is valid only during this owner's Execute call. The transaction
+// commits before the adapter is permitted to issue its financial POST.
+type dispatchCheckpoint struct {
+	ctx    context.Context
+	engine *Engine
+	owner  *state
+}
+
+func (c *dispatchCheckpoint) bind(digest [32]byte) error {
+	original := *c.owner
+	next := original.op
+	next.ProviderEvidenceDigest = digest
+	next.AwaitingEvidence = false
+	err := c.engine.config.Store.Transact(c.ctx, func(tx Tx) error {
+		current, err := c.engine.load(tx, original.op.ID)
+		if err != nil {
+			return err
+		}
+		if current.op != original.op || current.op.Status != OperationReserved || current.payment.Version != original.payment.Version || !current.op.DispatchUntil.IsZero() && !c.engine.config.Now().Before(current.op.DispatchUntil) {
+			return ErrConflict
+		}
+		return tx.UpdateOperation(next)
+	})
+	if err == nil {
+		c.owner.op = next
+	}
+	return err
 }
 
 func (e *Engine) finishDispatch(ctx context.Context, s state, obs Observation, callErr error) (Result, error) {
@@ -303,8 +334,8 @@ func (e *Engine) reserve(ctx context.Context, kind OperationKind, r Request, pre
 				return err
 			}
 		}
-		s = state{p, OperationRecord{Operation: op, PaymentVersion: p.Version}}
-		if op.ReplayFingerprint != "" || e.caps.QueryAfterDispatch {
+		s = state{p, OperationRecord{Operation: op, PaymentVersion: p.Version, AwaitingEvidence: slices.Contains(e.caps.BindBeforeDispatch, kind)}}
+		if op.ReplayFingerprint != "" || e.caps.QueryAfterDispatch || s.op.AwaitingEvidence {
 			s.op.DispatchUntil = e.config.Now().UTC().Add(e.config.Timeout)
 		}
 		if err := tx.InsertOperation(s.op); err != nil {
@@ -445,6 +476,10 @@ func (e *Engine) finishError(ctx context.Context, original state, cause error) (
 			return nil
 		}
 		s.op.DispatchUntil = time.Time{}
+		if s.op.AwaitingEvidence && definitiveFailure(cause) == "" {
+			cause = ErrNotDispatched
+		}
+		s.op.AwaitingEvidence = false
 		next := OperationUnknown
 		if kind := definitiveFailure(cause); kind != "" {
 			s.op.Failure = kind
@@ -830,6 +865,23 @@ func (e *Engine) Recover(ctx context.Context, operationID string) (Result, error
 		if err == nil && e.caps.QueryAfterDispatch && original.op.Status == OperationReserved && e.config.Now().UTC().Before(original.op.DispatchUntil) {
 			return ErrConflict
 		}
+		if err == nil && original.op.Status == OperationReserved && original.op.AwaitingEvidence && !original.op.DispatchUntil.IsZero() {
+			if e.config.Now().Before(original.op.DispatchUntil) {
+				return ErrConflict
+			}
+			// The checkpoint and this takeover are mutually exclusive inside the
+			// transaction. An owner that resumes late cannot send the mutation.
+			original.op.AwaitingEvidence = false
+			original.op.DispatchUntil = time.Time{}
+			original.op.Failure = ErrNotDispatched
+			if err := original.op.SetStatus(OperationFailed); err != nil {
+				return err
+			}
+			if err := tx.UpdateOperation(original.op); err != nil {
+				return err
+			}
+			return e.audit(tx, original, Change{}, "undispatched_recovery")
+		}
 		if err == nil && !e.caps.Query {
 			return e.claimReplay(tx, &original)
 		}
@@ -837,6 +889,9 @@ func (e *Engine) Recover(ctx context.Context, operationID string) (Result, error
 	})
 	if err != nil {
 		return Result{original.payment, original.op.Operation}, err
+	}
+	if original.op.Status == OperationFailed && original.op.Failure == ErrNotDispatched {
+		return original.result()
 	}
 	if !e.caps.Query {
 		return e.replayUnknown(ctx, original)

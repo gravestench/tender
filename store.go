@@ -14,6 +14,9 @@ const ErrNotFound ErrorKind = "not_found"
 type OperationRecord struct {
 	Operation
 	PaymentVersion uint64
+	// AwaitingEvidence is set only for newly reserved operations with a mandatory
+	// checkpoint. Records created before checkpoint support decode as false.
+	AwaitingEvidence bool `json:",omitempty"`
 	// DispatchUntil leases a replayable HTTP call or fences recovery reads
 	// while a provider checks its mutation response.
 	// A recovery takeover marks the operation unknown before leaving storage.

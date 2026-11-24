@@ -246,6 +246,9 @@ const (
 // Operation holds the host and provider keys across retries and restarts.
 // BaseVersion is the payment version seen when the operation was reserved.
 type Operation struct {
+	// ProviderEvidenceDigest is a write-once binding to authenticated provider
+	// evidence established before this reserved mutation is sent.
+	ProviderEvidenceDigest                           [32]byte `json:",omitzero"`
 	Scope                                            Scope
 	ID, PaymentID, AttemptID                         string
 	Key, Fingerprint, ProviderKey, ProviderReference string

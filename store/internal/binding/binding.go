@@ -14,9 +14,15 @@ func PaymentUpdate(old, next tender.Payment) error {
 }
 
 func OperationUpdate(old, next tender.OperationRecord) error {
-	if old.SuccessorID != "" && next.SuccessorID != old.SuccessorID ||
+	if !old.AwaitingEvidence && next.AwaitingEvidence ||
+		old.AwaitingEvidence && !next.AwaitingEvidence && next.Status == tender.OperationReserved && next.ProviderEvidenceDigest == ([32]byte{}) ||
+		old.SuccessorID != "" && next.SuccessorID != old.SuccessorID ||
 		old.ProviderReference != "" && next.ProviderReference != old.ProviderReference {
 		return tender.ErrConflict
+	}
+	// Only the original reserved operation may add its pre-dispatch evidence.
+	if old.AwaitingEvidence && !next.AwaitingEvidence && old.ProviderEvidenceDigest == ([32]byte{}) && old.Status == tender.OperationReserved && next.Status == tender.OperationReserved {
+		old.ProviderEvidenceDigest = next.ProviderEvidenceDigest
 	}
 	// Only the result and its binding may change after reservation.
 	old.Status, old.ProviderReference = next.Status, next.ProviderReference

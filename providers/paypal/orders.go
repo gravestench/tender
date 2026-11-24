@@ -152,6 +152,9 @@ func (a *Adapter) Execute(ctx context.Context, r tender.ProviderRequest) (tender
 		if o.Status != "APPROVED" || o.buyerID() == "" {
 			return empty, tender.ErrValidation
 		}
+		if err := r.BindEvidence(buyerDigest(p, o.buyerID())); err != nil {
+			return empty, err
+		}
 		var receipt order
 		if err := a.call(ctx, "POST", "/v2/checkout/orders/"+o.ID+"/capture", r.Operation.ProviderKey, []byte("{}"), &receipt); err != nil {
 			return empty, err
@@ -214,7 +217,8 @@ func (receipt order) correlates(approved, current order, p tender.Payment) bool 
 func captured(r tender.ProviderRequest, o order) (tender.Observation, error) {
 	obs := observation(r)
 	c, ok := o.singleCapture(r.Payment)
-	if !ok || r.Operation.ProviderReference != "" && r.Operation.ProviderReference != c.ID || r.Payment.ProviderEvidenceDigest != ([32]byte{}) && r.Payment.ProviderEvidenceDigest != buyerDigest(r.Payment, o.buyerID()) {
+	digest := buyerDigest(r.Payment, o.buyerID())
+	if !ok || r.Operation.ProviderReference != "" && r.Operation.ProviderReference != c.ID || r.Operation.ProviderEvidenceDigest != ([32]byte{}) && r.Operation.ProviderEvidenceDigest != digest || r.Payment.ProviderEvidenceDigest != ([32]byte{}) && r.Payment.ProviderEvidenceDigest != digest {
 		return tender.Observation{}, tender.ErrUnknownOutcome
 	}
 	obs.OperationReference = c.ID
@@ -243,7 +247,10 @@ func (a *Adapter) Query(ctx context.Context, r tender.ProviderRequest) (tender.O
 	if err := a.validate(r); err != nil {
 		return empty, err
 	}
-	if r.Operation.Kind == tender.OpConfirm && r.Payment.ProviderStatus == evidenceConflict {
+	// A reserved operation can still have a live finisher comparing the POST
+	// with the GET, even after its deadline. Only a signed event corroborates
+	// an abandoned reservation. A completed finisher records unknown/pending.
+	if r.Operation.Kind == tender.OpConfirm && (r.Operation.Status == tender.OperationReserved || r.Payment.ProviderStatus == evidenceConflict || r.Operation.ProviderEvidenceDigest == ([32]byte{}) && r.Payment.ProviderEvidenceDigest == ([32]byte{}) && r.Operation.ProviderReference == "") {
 		return empty, tender.ErrUnknownOutcome
 	}
 	if r.Operation.Kind != tender.OpConfirm && (r.Operation.Kind != tender.OpRefund || !idPattern.MatchString(r.Operation.ProviderReference)) {

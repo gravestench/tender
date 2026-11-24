@@ -77,7 +77,7 @@ func New(c Config) (*Adapter, error) {
 var market = tender.Market{Country: "US", Currency: "USD", Method: tender.MethodPayPal}
 
 func (a *Adapter) Capabilities() tender.Capabilities {
-	c := tender.Capabilities{Refund: true, Query: true, QueryAfterDispatch: true, Markets: []tender.MarketCapability{{Market: market, PartialRefund: true}}}
+	c := tender.Capabilities{Refund: true, Query: true, QueryAfterDispatch: true, BindBeforeDispatch: []tender.OperationKind{tender.OpConfirm}, Markets: []tender.MarketCapability{{Market: market, PartialRefund: true}}}
 	if a.cfg.Scope.Environment == tender.EnvironmentMock {
 		c.Create = true
 		c.Confirm = true
@@ -194,7 +194,7 @@ func beforeDispatch(err error) error {
 }
 
 func (a *Adapter) rejection(destination string, res *http.Response) error {
-	if res.StatusCode != 400 && res.StatusCode != 422 {
+	if res.StatusCode != 400 && res.StatusCode != 403 && res.StatusCode != 422 {
 		return tender.ErrUnknownOutcome
 	}
 	raw, err := io.ReadAll(io.LimitReader(res.Body, 16385))
@@ -202,17 +202,28 @@ func (a *Adapter) rejection(destination string, res *http.Response) error {
 		Name    string
 		Details []struct{ Issue string }
 	}
-	if err != nil || len(raw) > 16384 || json.Unmarshal(raw, &body) != nil || len(body.Details) == 0 {
+	if err != nil || len(raw) > 16384 || json.Unmarshal(raw, &body) != nil {
 		return tender.ErrUnknownOutcome
 	}
 	path := strings.TrimPrefix(destination, a.cfg.BaseURL)
 	order := path == "/v2/checkout/orders"
 	capture := strings.HasPrefix(path, "/v2/checkout/orders/") && strings.HasSuffix(path, "/capture")
 	refund := strings.HasPrefix(path, "/v2/payments/captures/") && strings.HasSuffix(path, "/refund")
+	forbidden := res.StatusCode == 403 && body.Name == "NOT_AUTHORIZED" && (order || capture || refund)
+	if len(body.Details) == 0 {
+		if forbidden {
+			return tender.NewProviderError(tender.ErrAuthentication, "NOT_AUTHORIZED")
+		}
+		return tender.ErrUnknownOutcome
+	}
 	var kind tender.ErrorKind
 	for _, detail := range body.Details {
 		var next tender.ErrorKind
 		switch {
+		case forbidden && detail.Issue == "PERMISSION_DENIED":
+			next = tender.ErrAuthentication
+		case forbidden && order && detail.Issue == "PERMISSION_DENIED_FOR_DONATION_ITEMS":
+			next = tender.ErrAuthentication
 		case res.StatusCode == 400 && body.Name == "INVALID_REQUEST" && (order || capture):
 			switch detail.Issue {
 			case "INVALID_PARAMETER_SYNTAX", "INVALID_PARAMETER_VALUE", "INVALID_STRING_LENGTH", "MISSING_REQUIRED_PARAMETER":
@@ -225,7 +236,7 @@ func (a *Adapter) rejection(destination string, res *http.Response) error {
 			case "ORDER_NOT_APPROVED":
 				next = tender.ErrValidation
 			}
-		case res.StatusCode == 422 && body.Name == "UNPROCESSABLE_ENTITY" && refund && detail.Issue == "REFUND_AMOUNT_EXCEEDED":
+		case res.StatusCode == 422 && body.Name == "UNPROCESSABLE_ENTITY" && refund && (detail.Issue == "REFUND_AMOUNT_EXCEEDED" || detail.Issue == "TRANSACTION_DISPUTED"):
 			next = tender.ErrValidation
 		}
 		if next == "" || kind != "" && kind != next {
