@@ -5,7 +5,9 @@ package e2e_test
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"io/fs"
+	"net/netip"
 	"net/url"
 	"os"
 	"strings"
@@ -15,6 +17,65 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// Exercise the pre-dial configuration step without opening a network connection.
+func TestConsumerDatabaseRejectsRemoteBeforeDial(t *testing.T) {
+	for _, tc := range []struct{ name, dsn string }{
+		{"remote primary", "host=203.0.113.8 dbname=test sslmode=disable"},
+		{"remote fallback", "host=127.0.0.1,db.example.invalid dbname=test sslmode=disable"},
+		{"environment fallback", "dbname=test sslmode=disable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PGHOST", "localhost,203.0.113.9")
+			cfg, err := localTestDatabaseConfig(tc.dsn)
+			if cfg != nil || err == nil {
+				t.Fatal("remote target produced a dialable configuration")
+			}
+		})
+	}
+}
+
+func TestConsumerDatabasePinsLocalTargets(t *testing.T) {
+	cfg, err := localTestDatabaseConfig("host=localhost,/tmp,localhost,::1 dbname=test sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Host != "127.0.0.1" || len(cfg.Fallbacks) != 3 {
+		t.Fatalf("primary %q, %d fallbacks", cfg.Host, len(cfg.Fallbacks))
+	}
+	for i, want := range []string{"/tmp", "127.0.0.1", "::1"} {
+		if got := cfg.Fallbacks[i].Host; got != want {
+			t.Errorf("fallback %d: got %q want %q", i, got, want)
+		}
+	}
+}
+
+func localTestDatabaseConfig(dsn string) (*pgx.ConnConfig, error) {
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, errors.New("invalid test database configuration")
+	}
+	// pgx expands PGHOST, service settings, and TLS fallback choices here.
+	// Validate that effective list before exposing a config to any dialer.
+	hosts := []*string{&cfg.Host}
+	for _, fallback := range cfg.Fallbacks {
+		hosts = append(hosts, &fallback.Host)
+	}
+	for _, host := range hosts {
+		if strings.HasPrefix(*host, "/") && !strings.HasPrefix(*host, "//") {
+			continue
+		}
+		if *host == "localhost" {
+			*host = "127.0.0.1"
+		}
+		ip, err := netip.ParseAddr(*host)
+		if err != nil || !ip.Unmap().IsLoopback() {
+			return nil, errors.New("consumer E2E requires a local PostgreSQL primary and local fallback hosts")
+		}
+		*host = ip.Unmap().String()
+	}
+	return cfg, nil
+}
+
 // A committed collection survives failed host delivery. A fresh process must
 // project it once and an exact checkout retry must preserve that one record.
 func TestConsumerDurableFulfillment(t *testing.T) {
@@ -22,8 +83,12 @@ func TestConsumerDurableFulfillment(t *testing.T) {
 	if dsn == "" {
 		t.Fatal("set TENDER_TEST_DATABASE_URL to a disposable PostgreSQL database")
 	}
+	cfg, err := localTestDatabaseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx := t.Context()
-	conn, err := pgx.Connect(ctx, dsn)
+	conn, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -34,7 +99,7 @@ func TestConsumerDurableFulfillment(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		conn, err := pgx.Connect(context.Background(), dsn)
+		conn, err := pgx.ConnectConfig(context.Background(), cfg)
 		if err != nil {
 			t.Error(err)
 			return
@@ -89,7 +154,7 @@ func TestConsumerDurableFulfillment(t *testing.T) {
 		}
 		id = s.PaymentID
 	})
-	conn, err = pgx.Connect(ctx, dsn)
+	conn, err = pgx.ConnectConfig(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,7 +178,7 @@ func TestConsumerDurableFulfillment(t *testing.T) {
 			}
 		}
 	})
-	conn, err = pgx.Connect(ctx, dsn)
+	conn, err = pgx.ConnectConfig(ctx, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
