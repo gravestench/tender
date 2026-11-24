@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mock checkout</title>
+<main>
+  <h1>Mock checkout</h1>
+  <p>Choose a synthetic outcome for this order. No money moves.</p>
+  <dl>
+    <dt>Order</dt><dd>{{.OrderID}}</dd>
+    <dt>Total</dt><dd>{{.Price}} {{.Currency}}</dd>
+    <dt>Payment status</dt><dd>{{.Status}}</dd>
+    <dt>Fulfillment recorded</dt><dd>{{if .Fulfilled}}Yes{{else}}No{{end}}</dd>
+  </dl>
+  {{if .Action}}
+  <form method="post" action="/orders/{{.OrderID}}/confirm">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <button type="submit">Complete synthetic action</button>
+  </form>
+  {{else if eq .Status "unpaid"}}
+  <form method="post" action="/orders/{{.OrderID}}">
+    <input type="hidden" name="csrf" value="{{.CSRF}}">
+    <label for="scenario">Scenario</label>
+    <select id="scenario" name="scenario">
+      <option value="pending">Pending collection</option>
+      <option value="action">In-page confirmation</option>
+      <option value="collected">Collected</option>
+    </select>
+    <button type="submit">Run simulation</button>
+  </form>
+  {{end}}
+</main>
+</html>
