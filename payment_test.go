@@ -52,6 +52,58 @@ func TestPaymentTransitions(t *testing.T) {
 		s.Funds.Refunded = 101
 		reject(t, &p, s)
 	})
+	t.Run("expire pending and prohibit later collection", func(t *testing.T) {
+		p := newPayment(t)
+		apply(t, &p, Snapshot{Status: PaymentPending})
+		apply(t, &p, Snapshot{Status: PaymentExpired})
+		reject(t, &p, Snapshot{Status: PaymentCaptured, Funds: Funds{Authorized: 100, Captured: 100}})
+	})
+	t.Run("partial and complete captures", func(t *testing.T) {
+		p := newPayment(t)
+		apply(t, &p, Snapshot{Status: PaymentAuthorized, Funds: Funds{Authorized: 100}})
+		reject(t, &p, Snapshot{Status: PaymentCaptured, Funds: Funds{Authorized: 100, Captured: 40}})
+		apply(t, &p, Snapshot{Status: PaymentPartiallyCaptured, Funds: Funds{Authorized: 100, Captured: 40}})
+		reject(t, &p, Snapshot{Status: PaymentPartiallyCaptured, Funds: Funds{Authorized: 100, Captured: 100}})
+		apply(t, &p, Snapshot{Status: PaymentCaptured, Funds: Funds{Authorized: 100, Captured: 100}})
+	})
+	t.Run("terminal return freezes principal", func(t *testing.T) {
+		p := newPayment(t)
+		s := Snapshot{Status: PaymentReturned, Funds: Funds{Returned: 100}}
+		apply(t, &p, s)
+		s.Funds.Authorized = 100
+		reject(t, &p, s)
+		s.Funds.Captured = 100
+		reject(t, &p, s)
+		basis := Correction{Actor: "ops", Reason: "Matched capture in provider ledger"}
+		c, err := p.Correct(s, now, basis)
+		if err != nil || c.Correction != basis || c.Before.Funds.Captured != 0 || c.After.Funds.Captured != 100 {
+			t.Fatalf("correction %+v, %v", c, err)
+		}
+	})
+	t.Run("settled partial capture can void remainder", func(t *testing.T) {
+		p := newPayment(t)
+		apply(t, &p, Snapshot{Status: PaymentAuthorized, Funds: Funds{Authorized: 100}})
+		f := Funds{Authorized: 100, Captured: 40, Settled: 40}
+		c := apply(t, &p, Snapshot{Status: PaymentSettled, Funds: f})
+		if c.After.Status != PaymentPartiallyCaptured || p.Status != PaymentPartiallyCaptured {
+			t.Errorf("settlement masked partial capture: %+v", p.Snapshot)
+		}
+		apply(t, &p, Snapshot{Status: PaymentVoided, Funds: f})
+		if p.Funds.Captured != 40 || p.Funds.Settled != 40 {
+			t.Fatal(p.Funds)
+		}
+	})
+	t.Run("persisted settlement retains open authorization", func(t *testing.T) {
+		for _, existingStatus := range []PaymentStatus{PaymentSettled, PaymentCaptured} {
+			p := newPayment(t)
+			p.Snapshot = Snapshot{Status: existingStatus, Funds: Funds{Authorized: 100, Captured: 40, Settled: 40}}
+			before := p.Snapshot
+			change := apply(t, &p, Snapshot{Status: PaymentVoided, Funds: before.Funds})
+			if change.Before != before || p.Funds.Settled != 40 || p.Funds.Captured != 40 {
+				t.Fatal(change)
+			}
+		}
+	})
 	t.Run("pending and expiring action", func(t *testing.T) {
 		p := newPayment(t)
 		apply(t, &p, Snapshot{Status: PaymentPending})
@@ -61,7 +113,7 @@ func TestPaymentTransitions(t *testing.T) {
 		apply(t, &p, Snapshot{Status: PaymentRequiresAction, Action: action})
 		apply(t, &p, Snapshot{Status: PaymentAuthorized, Funds: Funds{Authorized: 100}})
 		reject(t, &p, Snapshot{Status: PaymentCaptured, Funds: Funds{Authorized: 100, Captured: 101}})
-		apply(t, &p, Snapshot{Status: PaymentCaptured, Funds: Funds{Authorized: 100, Captured: 40}})
+		apply(t, &p, Snapshot{Status: PaymentPartiallyCaptured, Funds: Funds{Authorized: 100, Captured: 40}})
 		apply(t, &p, Snapshot{Status: PaymentVoided, Funds: Funds{Authorized: 100, Captured: 40}})
 		reject(t, &p, Snapshot{Status: PaymentCaptured, Funds: Funds{Authorized: 100, Captured: 100}})
 	})
@@ -158,4 +210,33 @@ func TestPaymentTransitions(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestMarketCapabilities(t *testing.T) {
+	us := Market{Country: "US", Currency: "USD", Method: MethodVisa}
+	ca := Market{Country: "CA", Currency: "CAD", Method: MethodVisa}
+	caps := Capabilities{Create: true, Capture: true, Refund: true, Markets: []MarketCapability{
+		{Market: us, PartialCapture: true},
+		{Market: ca, PartialRefund: true},
+	}}
+	for _, c := range []struct {
+		kind          OperationKind
+		market        Market
+		partial, want bool
+	}{
+		{OpCreate, us, false, true}, {OpRefund, ca, true, true}, {OpRefund, us, true, false},
+		{OpCapture, ca, true, false}, {OpCapture, us, true, true}, {OpRefund, us, false, true},
+		{OpCreate, us, true, false}, {OpVoid, us, false, false},
+		{OpCreate, Market{"US", "USD", MethodMastercard}, false, false},
+		{OpCreate, Market{"CA", "USD", MethodVisa}, false, false},
+		{OpCreate, Market{"US", "CAD", MethodVisa}, false, false},
+		{OpCreate, Market{}, false, false},
+	} {
+		if got := caps.SupportsIn(c.kind, c.market, c.partial); got != c.want {
+			t.Errorf("SupportsIn(%s,%+v,partial=%v) = %v, want %v", c.kind, c.market, c.partial, got, c.want)
+		}
+	}
+	if (Capabilities{Create: true}).SupportsIn(OpCreate, us, false) {
+		t.Error("missing market eligibility must fail closed")
+	}
 }

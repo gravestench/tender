@@ -10,7 +10,7 @@ func TestMoneyValidation(t *testing.T) {
 	for _, c := range []struct {
 		code string
 		exp  int
-	}{{"USD", 2}, {"JPY", 0}, {"KWD", 3}} {
+	}{{"USD", 2}, {"JPY", 0}, {"KWD", 3}, {"EUR", 2}, {"CAD", 2}, {"BHD", 3}, {"CLF", 4}} {
 		m, err := NewMoney(1234, c.code)
 		if err != nil || m.Minor != 1234 || m.Currency != c.code {
 			t.Fatalf("NewMoney(%s) = %+v, %v", c.code, m, err)
@@ -19,7 +19,7 @@ func TestMoneyValidation(t *testing.T) {
 			t.Errorf("exponent(%s) = %d, %v", c.code, exp, err)
 		}
 	}
-	for _, code := range []string{"", "usd", "ZZZ"} {
+	for _, code := range []string{"", "usd", "ZZZ", "XAU", "XXX", "BGN"} {
 		if _, err := NewMoney(1, code); !errors.Is(err, ErrValidation) {
 			t.Errorf("accepted currency %q: %v", code, err)
 		}

@@ -10,16 +10,18 @@ import (
 type PaymentStatus string
 
 const (
-	PaymentCreated        PaymentStatus = "created"
-	PaymentPending        PaymentStatus = "pending"
-	PaymentRequiresAction PaymentStatus = "requires_action"
-	PaymentAuthorized     PaymentStatus = "authorized"
-	PaymentCaptured       PaymentStatus = "captured"
-	PaymentSettled        PaymentStatus = "settled"
-	PaymentReturned       PaymentStatus = "returned"
-	PaymentDeclined       PaymentStatus = "declined"
-	PaymentVoided         PaymentStatus = "voided"
-	PaymentFailed         PaymentStatus = "failed"
+	PaymentCreated           PaymentStatus = "created"
+	PaymentPending           PaymentStatus = "pending"
+	PaymentRequiresAction    PaymentStatus = "requires_action"
+	PaymentAuthorized        PaymentStatus = "authorized"
+	PaymentPartiallyCaptured PaymentStatus = "partially_captured"
+	PaymentCaptured          PaymentStatus = "captured"
+	PaymentExpired           PaymentStatus = "expired"
+	PaymentSettled           PaymentStatus = "settled"
+	PaymentReturned          PaymentStatus = "returned"
+	PaymentDeclined          PaymentStatus = "declined"
+	PaymentVoided            PaymentStatus = "voided"
+	PaymentFailed            PaymentStatus = "failed"
 )
 
 // Funds records cumulative gross amounts in the payment currency. Refunds,
@@ -70,13 +72,15 @@ func (s Snapshot) validate(limit int64, at time.Time) error {
 		valid = s.Funds == (Funds{})
 	case PaymentAuthorized:
 		valid = s.Funds.Authorized > 0 && s.Funds.Captured == 0
+	case PaymentPartiallyCaptured:
+		valid = s.Funds.Captured > 0 && s.Funds.Captured < s.Funds.Authorized
 	case PaymentCaptured:
-		valid = s.Funds.Captured > 0
+		valid = s.Funds.Captured > 0 && s.Funds.Captured == s.Funds.Authorized
 	case PaymentSettled:
 		valid = s.Funds.Settled > 0
 	case PaymentReturned:
 		valid = s.Funds.Returned > 0
-	case PaymentVoided:
+	case PaymentVoided, PaymentExpired:
 		valid = s.Funds.Captured == 0 || s.Funds.Captured < s.Funds.Authorized
 	}
 	if !valid {
@@ -89,8 +93,9 @@ func (s Snapshot) canAdvance(next Snapshot) bool {
 	if !next.Funds.includes(s.Funds) {
 		return false
 	}
-	if s.Status == PaymentVoided {
-		return next.Status == PaymentVoided && next.Funds.Authorized == s.Funds.Authorized && next.Funds.Captured == s.Funds.Captured
+	switch s.Status {
+	case PaymentVoided, PaymentExpired, PaymentReturned:
+		return next.Status == s.Status && next.Funds.Authorized == s.Funds.Authorized && next.Funds.Captured == s.Funds.Captured
 	}
 	if s.Status == next.Status {
 		return true
@@ -100,10 +105,10 @@ func (s Snapshot) canAdvance(next Snapshot) bool {
 		return true
 	case PaymentPending, PaymentRequiresAction:
 		return next.Status != PaymentCreated
-	case PaymentAuthorized:
-		return next.Status == PaymentCaptured || next.Status == PaymentSettled || next.Status == PaymentVoided
+	case PaymentAuthorized, PaymentPartiallyCaptured:
+		return next.Status == PaymentPartiallyCaptured || next.Status == PaymentCaptured || next.Status == PaymentVoided || next.Status == PaymentExpired || next.Status == PaymentReturned
 	case PaymentCaptured:
-		return next.Status == PaymentSettled || next.Status == PaymentVoided || next.Status == PaymentReturned
+		return next.Status == PaymentReturned
 	case PaymentSettled:
 		return next.Status == PaymentReturned
 	default:
@@ -149,8 +154,38 @@ type Change struct {
 	Correction    Correction
 }
 
+// principalSnapshot preserves the collection state when processing a settlement
+// observation for an authorization-based payment. Bank settlement has no card
+// principal and retains its distinct settled status.
+func (s Snapshot) principalSnapshot(previous PaymentStatus) Snapshot {
+	if s.Status != PaymentSettled || s.Funds.Settled <= 0 || s.Funds.Authorized <= 0 {
+		return s
+	}
+	switch previous {
+	case PaymentVoided, PaymentExpired, PaymentReturned:
+		s.Status = previous
+	default:
+		switch {
+		case s.Funds.Captured == 0:
+			s.Status = PaymentAuthorized
+		case s.Funds.Captured < s.Funds.Authorized:
+			s.Status = PaymentPartiallyCaptured
+		default:
+			s.Status = PaymentCaptured
+		}
+	}
+	return s
+}
+
 func (p *Payment) Apply(next Snapshot, at time.Time) (Change, error) {
-	if !p.Snapshot.canAdvance(next) {
+	// Older stored snapshots used captured for partial captures and settled
+	// for card settlements. Preserve the actual prior record in the audit.
+	current := p.Snapshot.principalSnapshot(p.Status)
+	if current.Status == PaymentCaptured && current.Funds.Captured > 0 && current.Funds.Captured < current.Funds.Authorized {
+		current.Status = PaymentPartiallyCaptured
+	}
+	next = next.principalSnapshot(current.Status)
+	if !current.canAdvance(next) {
 		return Change{}, fmt.Errorf("%w: payment transition would reverse a recorded outcome", ErrValidation)
 	}
 	return p.record(next, at, Correction{})
@@ -162,7 +197,7 @@ func (p *Payment) Correct(next Snapshot, at time.Time, basis Correction) (Change
 	if strings.TrimSpace(basis.Actor) == "" || strings.TrimSpace(basis.Reason) == "" {
 		return Change{}, fmt.Errorf("%w: correction requires actor and reason", ErrValidation)
 	}
-	return p.record(next, at, basis)
+	return p.record(next.principalSnapshot(p.Status), at, basis)
 }
 
 func (p *Payment) record(next Snapshot, at time.Time, basis Correction) (Change, error) {

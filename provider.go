@@ -73,10 +73,35 @@ const (
 	OpRefund  OperationKind = "refund"
 )
 
+// PaymentMethod identifies a checkout rail or network.
+type PaymentMethod string
+
+const (
+	MethodVisa       PaymentMethod = "visa"
+	MethodMastercard PaymentMethod = "mastercard"
+	MethodPayPal     PaymentMethod = "paypal"
+	MethodKlarna     PaymentMethod = "klarna"
+	MethodACH        PaymentMethod = "ach"
+)
+
+// Market is an exact combination of merchant country (ISO 3166-1 alpha-2),
+// payment currency (ISO 4217), and checkout method.
+type Market struct {
+	Country, Currency string
+	Method            PaymentMethod
+}
+
+// MarketCapability advertises one verified market and its partial operations.
+type MarketCapability struct {
+	Market                        Market
+	PartialCapture, PartialRefund bool
+}
+
 type Capabilities struct {
 	Create, Confirm, Capture, Void, Refund bool
 	Query                                  bool
 	ActionModes                            []ActionMode
+	Markets                                []MarketCapability
 }
 
 // Supports reports whether the adapter implements a particular mutation.
@@ -95,6 +120,25 @@ func (c Capabilities) Supports(kind OperationKind) bool {
 	default:
 		return false
 	}
+}
+
+// SupportsIn checks a mutation against an explicitly advertised combination.
+// Only capture and refund can be requested as partial operations.
+func (c Capabilities) SupportsIn(kind OperationKind, market Market, partial bool) bool {
+	if !c.Supports(kind) || len(market.Country) != 2 || market.Method == "" {
+		return false
+	}
+	if _, err := CurrencyExponent(market.Currency); err != nil {
+		return false
+	}
+	for _, entry := range c.Markets {
+		if entry.Market == market {
+			if !partial || kind == OpCapture && entry.PartialCapture || kind == OpRefund && entry.PartialRefund {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ProviderRequest carries the durable reservation and the current payment.
