@@ -204,7 +204,7 @@ func (h *Webhook) Process(ctx context.Context, id string) error {
 			return empty, err
 		}
 		// Wait for the in-flight POST/GET comparison before a callback can apply funds.
-		if op.Status == tender.OperationReserved {
+		if op.Status == tender.OperationReserved && (op.DispatchUntil.IsZero() || h.api.cfg.Now().Before(op.DispatchUntil)) {
 			return empty, tender.ErrConflict
 		}
 		if op.Kind != tender.OpConfirm || op.AttemptID != p.AttemptID || op.PaymentID != p.ID || op.Amount != p.Amount {

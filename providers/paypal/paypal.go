@@ -77,7 +77,7 @@ func New(c Config) (*Adapter, error) {
 var market = tender.Market{Country: "US", Currency: "USD", Method: tender.MethodPayPal}
 
 func (a *Adapter) Capabilities() tender.Capabilities {
-	c := tender.Capabilities{Refund: true, Query: true, Markets: []tender.MarketCapability{{Market: market, PartialRefund: true}}}
+	c := tender.Capabilities{Refund: true, Query: true, QueryAfterDispatch: true, Markets: []tender.MarketCapability{{Market: market, PartialRefund: true}}}
 	if a.cfg.Scope.Environment == tender.EnvironmentMock {
 		c.Create = true
 		c.Confirm = true

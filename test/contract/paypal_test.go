@@ -643,6 +643,19 @@ func TestPayPalContradictoryCaptureEvidence(t *testing.T) {
 func TestPayPalFixtureCurrentStatus(t *testing.T) {
 	h := newWallet(t, store.NewMemory())
 	ctx := t.Context()
+	var originalCreate []byte
+	h.engine = h.engineWith(t, walletTransport(func(req *http.Request) (*http.Response, error) {
+		if req.Method == "POST" && req.URL.Path == "/sim/v2/checkout/orders" {
+			var err error
+			originalCreate, err = io.ReadAll(req.Body)
+			req.Body.Close()
+			if err != nil {
+				return nil, err
+			}
+			req.Body = io.NopCloser(bytes.NewReader(originalCreate))
+		}
+		return h.server.Client().Transport.RoundTrip(req)
+	}))
 	p := h.create(t)
 	h.decide(t, p.Payment.ProviderReference, "approve")
 	// Exercise the fixture's API directly with the same access and request IDs.
@@ -662,7 +675,11 @@ func TestPayPalFixtureCurrentStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	check := func(orig tender.Result, route, orderStatus, capStatus string) {
-		req, _ := http.NewRequestWithContext(ctx, "POST", h.cfg.BaseURL+route, strings.NewReader("{}"))
+		body := []byte("{}")
+		if orig.Operation.Kind == tender.OpCreate {
+			body = originalCreate
+		}
+		req, _ := http.NewRequestWithContext(ctx, "POST", h.cfg.BaseURL+route, bytes.NewReader(body))
 		req.Header.Set("Authorization", "Bearer "+tok.Token)
 		req.Header.Set("PayPal-Request-Id", orig.Operation.ProviderKey)
 		req.Header.Set("Prefer", "return=representation")
@@ -788,15 +805,94 @@ func TestPayPalCallbackWaitsForCaptureComparison(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { _, err := e.Confirm(ctx, walletReq("confirm", 1000)); done <- err }()
 	<-pending
+	var op tender.OperationRecord
+	if err := h.db.Transact(ctx, func(tx tender.Tx) error { var err error; op, err = tx.OperationByKey(dbScope, "confirm"); return err }); err != nil {
+		close(release)
+		t.Fatal(err)
+	}
+	_, earlyQuery := e.Recover(ctx, op.ID)
 	id := h.event(t)
 	early := h.hook.Process(ctx, id)
 	before, err := e.Get(ctx, p.Payment.ID)
 	close(release)
 	confirmed := <-done
+	if !errors.Is(earlyQuery, tender.ErrConflict) {
+		t.Fatalf("concurrent recovery bypassed response comparison: %v", earlyQuery)
+	}
 	if !errors.Is(early, tender.ErrConflict) || err != nil || before.Funds.Captured != 0 || confirmed != nil {
 		t.Fatalf("early callback %v, gross %d, confirm %v", early, before.Funds.Captured, confirmed)
 	}
 	if err := h.hook.Process(ctx, id); err != nil {
 		t.Fatal("stored event failed after response", err)
+	}
+}
+
+func TestPayPalAbandonedReservation(t *testing.T) {
+	for _, source := range []string{"query", "webhook"} {
+		t.Run(source, func(t *testing.T) {
+			h := newWallet(t, store.NewMemory())
+			ctx := t.Context()
+			created := h.create(t)
+			h.decide(t, created.Payment.ProviderReference, "approve")
+			real, err := h.engine.Confirm(ctx, walletReq("confirm", 1000))
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := h.event(t)
+			delivery := <-h.deliveries
+			// Restore exactly the durable state left by a worker that died after
+			// PayPal captured the order but before the HTTP reply was committed.
+			db := store.NewMemory()
+			p := created.Payment
+			op := real.Operation
+			op.Status = tender.OperationReserved
+			op.ProviderReference = ""
+			until := h.cfg.Now().Add(10 * time.Second)
+			if err = db.Transact(ctx, func(tx tender.Tx) error {
+				if err := tx.InsertPayment(p); err != nil {
+					return err
+				}
+				return tx.InsertOperation(tender.OperationRecord{Operation: op, PaymentVersion: p.Version, DispatchUntil: until})
+			}); err != nil {
+				t.Fatal(err)
+			}
+			adapter, err := paypal.New(h.cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			e, err := tender.NewEngine(tender.EngineConfig{Store: db, Provider: adapter, Scope: p.Scope, ProviderName: p.Provider, Market: p.Market, MerchantAccount: p.MerchantAccount, Now: h.cfg.Now})
+			if err != nil {
+				t.Fatal(err)
+			}
+			hook, err := adapter.Webhook(db, e, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest("POST", "/hooks", bytes.NewReader(delivery.body))
+			req.Header = delivery.header
+			reply := httptest.NewRecorder()
+			hook.ServeHTTP(reply, req)
+			if reply.Code != 202 {
+				t.Fatal("verified receipt missing")
+			}
+			recover := func() error {
+				if source == "webhook" {
+					return hook.Process(ctx, id)
+				}
+				_, err := e.Recover(ctx, op.ID)
+				return err
+			}
+			if err = recover(); !errors.Is(err, tender.ErrConflict) {
+				t.Fatal("active dispatch fence ignored", err)
+			}
+			h.clock.Store(until.Unix())
+			if err = recover(); err != nil {
+				t.Fatal("abandoned reservation still blocked at expiry", err)
+			}
+			paid, err := e.Get(ctx, p.ID)
+			if err != nil || paid.Funds.Captured != p.Amount.Minor {
+				t.Fatal("recovered payment not collected", err)
+			}
+		})
 	}
 }

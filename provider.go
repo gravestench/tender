@@ -100,8 +100,11 @@ type MarketCapability struct {
 type Capabilities struct {
 	Create, Confirm, Capture, Void, Refund bool
 	Query                                  bool
-	ActionModes                            []ActionMode
-	Markets                                []MarketCapability
+	// QueryAfterDispatch defers recovery reads until the original mutation has
+	// completed its response checks or its durable dispatch deadline expires.
+	QueryAfterDispatch bool
+	ActionModes        []ActionMode
+	Markets            []MarketCapability
 }
 
 // Supports reports whether the adapter implements a particular mutation.

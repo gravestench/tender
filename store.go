@@ -14,7 +14,8 @@ const ErrNotFound ErrorKind = "not_found"
 type OperationRecord struct {
 	Operation
 	PaymentVersion uint64
-	// DispatchUntil leases one same-key HTTP call on replayable operations.
+	// DispatchUntil leases a replayable HTTP call or fences recovery reads
+	// while a provider checks its mutation response.
 	// A recovery takeover marks the operation unknown before leaving storage.
 	DispatchUntil time.Time
 	Failure       ErrorKind

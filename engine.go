@@ -304,7 +304,7 @@ func (e *Engine) reserve(ctx context.Context, kind OperationKind, r Request, pre
 			}
 		}
 		s = state{p, OperationRecord{Operation: op, PaymentVersion: p.Version}}
-		if op.ReplayFingerprint != "" {
+		if op.ReplayFingerprint != "" || e.caps.QueryAfterDispatch {
 			s.op.DispatchUntil = e.config.Now().UTC().Add(e.config.Timeout)
 		}
 		if err := tx.InsertOperation(s.op); err != nil {
@@ -827,6 +827,9 @@ func (e *Engine) Recover(ctx context.Context, operationID string) (Result, error
 	err := e.config.Store.Transact(ctx, func(tx Tx) error {
 		var err error
 		original, err = e.load(tx, operationID)
+		if err == nil && e.caps.QueryAfterDispatch && original.op.Status == OperationReserved && e.config.Now().UTC().Before(original.op.DispatchUntil) {
+			return ErrConflict
+		}
 		if err == nil && !e.caps.Query {
 			return e.claimReplay(tx, &original)
 		}
