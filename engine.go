@@ -335,7 +335,7 @@ func (e *Engine) retryableCreate(tx Tx, predecessor string, r Request) (state, e
 		return state{}, fmt.Errorf("%w: create is not eligible for another attempt", ErrConflict)
 	}
 	switch op.Failure {
-	case ErrRateLimit, ErrAuthentication, ErrValidation, ErrUnsupported:
+	case ErrRateLimit, ErrAuthentication, ErrValidation, ErrUnsupported, ErrNotDispatched:
 		// These adapter errors are definitive rejections before any remote effect.
 	default:
 		return state{}, fmt.Errorf("%w: create did not receive a definite no-effect rejection", ErrConflict)
@@ -415,7 +415,7 @@ func definitiveFailure(cause error) ErrorKind {
 		errors.Is(cause, context.DeadlineExceeded) || errors.Is(cause, context.Canceled) {
 		return ""
 	}
-	for _, kind := range []ErrorKind{ErrDeclined, ErrValidation, ErrAuthentication, ErrUnsupported, ErrRateLimit} {
+	for _, kind := range []ErrorKind{ErrDeclined, ErrValidation, ErrAuthentication, ErrUnsupported, ErrRateLimit, ErrNotDispatched} {
 		if errors.Is(cause, kind) {
 			return kind
 		}

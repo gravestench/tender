@@ -65,14 +65,17 @@ func (o order) matches(p tender.Payment) bool {
 	u, want := o.Units[0], purchase(p)
 	return u.Reference == want.Reference && u.Custom == want.Custom && u.Amount == want.Amount && u.Payee == want.Payee
 }
-func (o order) wallet() bool {
+func (o order) buyerID() string {
 	var buyer struct {
 		ID string `json:"account_id"`
 	}
-	return len(o.Sources) == 1 && json.Unmarshal(o.Sources["paypal"], &buyer) == nil && idPattern.MatchString(buyer.ID)
+	if len(o.Sources) != 1 || json.Unmarshal(o.Sources["paypal"], &buyer) != nil || !idPattern.MatchString(buyer.ID) {
+		return ""
+	}
+	return buyer.ID
 }
 func (o order) singleCapture(p tender.Payment) (capture, bool) {
-	if !o.matches(p) || !o.wallet() || o.Status != "COMPLETED" || o.Units[0].Payments == nil || len(o.Units[0].Payments.Captures) != 1 {
+	if !o.matches(p) || o.buyerID() == "" || o.Status != "COMPLETED" || o.Units[0].Payments == nil || len(o.Units[0].Payments.Captures) != 1 {
 		return capture{}, false
 	}
 	c := o.Units[0].Payments.Captures[0]
@@ -141,33 +144,36 @@ func (a *Adapter) Execute(ctx context.Context, r tender.ProviderRequest) (tender
 	case tender.OpConfirm:
 		o, err := a.getOrder(ctx, p.ProviderReference)
 		if err != nil {
-			return empty, err
+			return empty, beforeDispatch(err)
 		}
 		if !o.matches(p) {
 			return empty, tender.ErrConflict
 		}
-		if o.Status != "APPROVED" || !o.wallet() {
+		if o.Status != "APPROVED" || o.buyerID() == "" {
 			return empty, tender.ErrValidation
 		}
 		var receipt order
 		if err := a.call(ctx, "POST", "/v2/checkout/orders/"+o.ID+"/capture", r.Operation.ProviderKey, []byte("{}"), &receipt); err != nil {
 			return empty, err
 		}
-		if receipt.ID != o.ID {
-			return empty, tender.ErrUnknownOutcome
+		current, err := a.getOrder(ctx, p.ProviderReference)
+		// PayPal's capture representation may omit the purchase-unit amount/payee;
+		// the authenticated order GET supplies those fields. Both resources must
+		// nevertheless identify the approved buyer, order, unit and capture.
+		if err != nil || !receipt.correlates(o, current, p) {
+			pending := observation(r)
+			pending.Status = tender.OperationPending
+			pending.Snapshot = tender.Snapshot{Status: tender.PaymentPending, ProviderStatus: evidenceConflict, ProviderEvidenceDigest: buyerDigest(p, o.buyerID())}
+			return pending, nil
 		}
-		result, err := a.Query(ctx, r)
-		if err != nil {
-			return empty, tender.ErrUnknownOutcome
-		}
-		return result, nil
+		return captured(r, current)
 	case tender.OpRefund:
 		if p.VerifiedMethod != tender.MethodPayPal || r.Operation.Amount.Minor > p.Funds.Captured-p.Funds.Refunded {
 			return empty, tender.ErrValidation
 		}
 		o, err := a.getOrder(ctx, p.ProviderReference)
 		if err != nil {
-			return empty, err
+			return empty, beforeDispatch(err)
 		}
 		c, ok := o.singleCapture(p)
 		if !ok || (c.Status != "COMPLETED" && c.Status != "PARTIALLY_REFUNDED") {
@@ -186,19 +192,39 @@ func (a *Adapter) Execute(ctx context.Context, r tender.ProviderRequest) (tender
 		return empty, tender.ErrUnsupported
 	}
 }
+
+const evidenceConflict = "CaptureEvidenceConflict"
+
+func buyerDigest(p tender.Payment, buyer string) [32]byte {
+	raw, _ := json.Marshal([]string{binding(p), buyer})
+	return sha256.Sum256(raw)
+}
+func (receipt order) correlates(approved, current order, p tender.Payment) bool {
+	cap, ok := current.singleCapture(p)
+	if !ok || receipt.ID != approved.ID || current.ID != approved.ID || current.buyerID() != approved.buyerID() || receipt.buyerID() != approved.buyerID() || len(receipt.Units) != 1 {
+		return false
+	}
+	u := receipt.Units[0]
+	if u.Reference != approved.Units[0].Reference || u.Custom != "" && u.Custom != p.ID || u.Payee.Merchant != "" && u.Payee.Merchant != p.MerchantAccount || u.Amount != (amount{}) && u.Amount != wireMoney(p.Amount) || u.Payments == nil || len(u.Payments.Captures) != 1 {
+		return false
+	}
+	c := u.Payments.Captures[0]
+	return c.ID == cap.ID && c.Amount == cap.Amount && c.Final && receipt.Status == "COMPLETED" && (c.Status == cap.Status || c.Status == "PENDING")
+}
 func captured(r tender.ProviderRequest, o order) (tender.Observation, error) {
 	obs := observation(r)
 	c, ok := o.singleCapture(r.Payment)
-	if !ok {
+	if !ok || r.Operation.ProviderReference != "" && r.Operation.ProviderReference != c.ID || r.Payment.ProviderEvidenceDigest != ([32]byte{}) && r.Payment.ProviderEvidenceDigest != buyerDigest(r.Payment, o.buyerID()) {
 		return tender.Observation{}, tender.ErrUnknownOutcome
 	}
 	obs.OperationReference = c.ID
 	switch c.Status {
 	case "PENDING":
 		obs.Status = tender.OperationPending
-		obs.Snapshot = tender.Snapshot{Status: tender.PaymentPending, ProviderStatus: "PENDING", VerifiedMethod: tender.MethodPayPal}
+		obs.Snapshot = tender.Snapshot{Status: tender.PaymentPending, ProviderStatus: "PENDING", VerifiedMethod: tender.MethodPayPal, ProviderEvidenceDigest: buyerDigest(r.Payment, o.buyerID())}
 	case "COMPLETED":
 		obs.Snapshot.Action = tender.CustomerAction{}
+		obs.Snapshot.ProviderEvidenceDigest = [32]byte{}
 		obs.Snapshot.Status = tender.PaymentCaptured
 		obs.Snapshot.ProviderStatus = "COMPLETED"
 		obs.Snapshot.VerifiedMethod = tender.MethodPayPal
@@ -216,6 +242,9 @@ func (a *Adapter) Query(ctx context.Context, r tender.ProviderRequest) (tender.O
 	var empty tender.Observation
 	if err := a.validate(r); err != nil {
 		return empty, err
+	}
+	if r.Operation.Kind == tender.OpConfirm && r.Payment.ProviderStatus == evidenceConflict {
+		return empty, tender.ErrUnknownOutcome
 	}
 	if r.Operation.Kind != tender.OpConfirm && (r.Operation.Kind != tender.OpRefund || !idPattern.MatchString(r.Operation.ProviderReference)) {
 		return empty, tender.ErrUnsupported

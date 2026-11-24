@@ -38,6 +38,10 @@ const { launchBrowser, guardCheckoutPage } = require("./browser-guard.cjs");
       assert.equal(state.Status, "captured");
       assert.equal(state.Funds.Captured, state.Minor);
       assert.equal(state.Fulfilled, true);
+      await page.waitForFunction(async () => {
+        const state = await (await fetch(location.pathname + "/status")).json();
+        return state.CaptureReceiptProcessed === true;
+      }, undefined, {polling: 50, timeout: 12000});
     } else {
       await page.getByText("PayPal is unavailable for this checkout.").waitFor();
       assert.equal(await page.getByRole("button").count(), 0);

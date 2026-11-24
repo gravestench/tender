@@ -4,17 +4,21 @@ package e2e_test
 
 import (
 	"context"
+	"encoding/json"
 	"github.com/jackc/pgx/v5"
 	"net/url"
 	"os"
 	"os/exec"
 	"testing"
+	"time"
 )
 
 func TestPayPalCheckout(t *testing.T) {
 	for _, scenario := range []string{"component", "popup", "redirect"} {
 		t.Run(scenario, func(t *testing.T) {
-			dsn, schema, cfg := demoSchema(t)
+			// Force the callback worker to retry until the browser has finished.
+			// Capture and fulfillment alone are insufficient evidence of inbox drain.
+			dsn, schema, cfg := demoSchema(t, `ALTER TABLE tender_provider_events ADD CONSTRAINT hold_wallet_receipt CHECK (processed_at IS NULL OR processed_at >= received_at + interval '2 seconds')`)
 			t.Run("browser", func(t *testing.T) {
 				d := launch(t, "TENDER_CONSUMER_PROVIDER=paypal", "TENDER_PAYPAL_MOCK_PRESENTATION="+scenario, "TENDER_CONSUMER_DATABASE_URL="+dsn, "TENDER_CONSUMER_SCHEMA="+schema)
 				cmd := exec.CommandContext(t.Context(), "node", "../../examples/consumer/mock-paypal-browser.cjs")
@@ -29,6 +33,47 @@ func TestPayPalCheckout(t *testing.T) {
 				}
 				if got := request(t, c, "POST", d.Origin+page.path+"/wallet/start", d.Origin, url.Values{"csrf": {token(t, page)}, "amount": {"1"}}); got.status != 400 {
 					t.Fatal("client price accepted", got.status)
+				}
+				if scenario == "component" {
+					fields := url.Values{"csrf": {token(t, page)}}
+					base := d.Origin + page.path
+					for _, step := range []string{"start", "confirm", "approve"} {
+						expected := 200
+						if step == "confirm" {
+							expected = 409
+						}
+						if r := request(t, c, "POST", base+"/wallet/"+step, d.Origin, fields); r.status != expected {
+							t.Fatalf("interrupted checkout %s = %d", step, r.status)
+						}
+					}
+					// A browser can disconnect after approval and before its confirm POST.
+					if st := status(t, c, base); st.Status == "captured" || st.Fulfilled {
+						t.Fatal("buyer approval alone collected funds")
+					}
+					for _, step := range []string{"approve", "confirm"} {
+						if r := request(t, c, "POST", base+"/wallet/"+step, d.Origin, fields); r.status != 200 {
+							t.Fatalf("resumed checkout %s = %d", step, r.status)
+						}
+					}
+					if st := status(t, c, base); st.Status != "captured" || !st.Fulfilled {
+						t.Fatal("resumed wallet did not collect once")
+					}
+					deadline := time.Now().Add(12 * time.Second)
+					for {
+						var state struct{ CaptureReceiptProcessed bool }
+						reply := request(t, c, "GET", base+"/status", "", nil)
+						if reply.status != 200 || json.Unmarshal([]byte(reply.body), &state) != nil {
+							t.Fatal("unreadable wallet receipt status")
+						}
+						if state.CaptureReceiptProcessed {
+							break
+						}
+						if time.Now().After(deadline) {
+							t.Fatal("timed out waiting for durable wallet capture receipt")
+						}
+						time.Sleep(25 * time.Millisecond)
+					}
+
 				}
 				if scenario != "component" {
 					if got := request(t, c, "POST", d.Origin+page.path+"/wallet/start", d.Origin, url.Values{"csrf": {token(t, page)}}); got.status != 409 {
@@ -53,7 +98,7 @@ func TestPayPalCheckout(t *testing.T) {
 				t.Fatal(err)
 			}
 			if scenario == "component" {
-				if payments != 1 || deliveries != 1 || events != 1 || operations != 2 {
+				if payments != 2 || deliveries != 2 || events != 2 || operations != 5 {
 					t.Fatalf("wallet database counts %d %d %d %d", payments, deliveries, events, operations)
 				}
 			} else if payments+deliveries+events+operations != 0 {

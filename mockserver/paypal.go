@@ -117,6 +117,10 @@ func (f *ppFixture) buyer(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	o, ok := f.readOrder(r.PathValue("id"))
+	if ok && o.Status == "APPROVED" && r.PathValue("decision") == "approve" {
+		w.WriteHeader(204)
+		return
+	}
 	if !ok || o.Status != "PAYER_ACTION_REQUIRED" {
 		w.WriteHeader(409)
 		return
@@ -202,8 +206,22 @@ func (f *ppFixture) mutate(route, id, key string, raw []byte) (PayPalRecord, boo
 	k := PayPalKey(f.cfg.MerchantAccount, key)
 	var fx PayPalRecord
 	if rec, ok := f.records[k]; ok {
-		err := json.Unmarshal(rec.Data, &fx)
-		return fx, false, err == nil && fx.Route == route
+		if json.Unmarshal(rec.Data, &fx) != nil || fx.Route != route {
+			return fx, false, false
+		}
+		// A duplicate returns the current state of the original resource and
+		// never reapplies the operation or sends another notification.
+		if route == "refund" {
+			ref, found := f.records["paypal/refund/"+fx.ResourceID]
+			fx.Reply = ref.Data
+			return fx, false, found
+		}
+		o, found := f.readOrder(fx.OrderID)
+		if !found {
+			return fx, false, false
+		}
+		fx.Reply, _ = json.Marshal(o)
+		return fx, false, true
 	}
 	fx.Route = route
 	fx.MerchantAccount = f.cfg.MerchantAccount

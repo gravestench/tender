@@ -175,8 +175,17 @@ func (wc *walletCheckout) submit(w http.ResponseWriter, r *http.Request, o order
 		if step == "cancel" {
 			status = "cancelled"
 		} else {
-			_, err = wc.engine.Confirm(ctx, tender.Request{PaymentID: o.PaymentID, Amount: o.Total, Key: "wallet/confirm/" + o.ID})
+			status = "approved"
 		}
+	case "confirm":
+		p, getErr := wc.engine.Get(ctx, o.PaymentID)
+		if getErr != nil || !wc.action(p, o) {
+			http.Error(w, "Wallet action unavailable", 409)
+			return
+		}
+		// Buyer approval can outlive the browser request. Only this independently
+		// authenticated order confirmation can collect funds.
+		_, err = wc.engine.Confirm(ctx, tender.Request{PaymentID: o.PaymentID, Amount: o.Total, Key: "wallet/confirm/" + rand.Text()})
 	default:
 		http.NotFound(w, r)
 		return

@@ -307,6 +307,7 @@ type orderStatus struct {
 	Minor                                int64
 	Funds                                *tender.Funds `json:",omitempty"`
 	Fulfilled                            bool
+	CaptureReceiptProcessed              bool `json:",omitempty"`
 }
 
 func (a *app) read(ctx context.Context, o order) (orderStatus, bool, error) {
@@ -327,6 +328,9 @@ func (a *app) read(ctx context.Context, o order) (orderStatus, bool, error) {
 	}
 	if a.ledger != nil {
 		err = a.ledger.QueryRowContext(ctx, `SELECT EXISTS (SELECT FROM consumer_fulfillments WHERE merchant_id=$1 AND environment=$2 AND order_id=$3 AND payment_id=$4)`, a.scope.MerchantID, a.scope.Environment, o.ID, p.ID).Scan(&st.Fulfilled)
+	}
+	if err == nil && a.provider == "paypal" && a.ledger != nil && p.ProviderReference != "" {
+		err = a.ledger.QueryRowContext(ctx, `SELECT EXISTS (SELECT FROM tender_provider_events WHERE merchant_id=$1 AND environment=$2 AND provider='paypal' AND merchant_account=$3 AND processed_at IS NOT NULL AND evidence->>'OrderID'=$4 AND evidence->>'Kind'='PAYMENT.CAPTURE.COMPLETED')`, p.Scope.MerchantID, p.Scope.Environment, p.MerchantAccount, p.ProviderReference).Scan(&st.CaptureReceiptProcessed)
 	}
 	return st, allowAction(p), err
 }

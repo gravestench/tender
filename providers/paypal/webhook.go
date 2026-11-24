@@ -189,6 +189,9 @@ func (h *Webhook) Process(ctx context.Context, id string) error {
 		if err != nil {
 			return empty, err
 		}
+		if p.ProviderEvidenceDigest != ([32]byte{}) && p.ProviderEvidenceDigest != buyerDigest(p, o.buyerID()) {
+			return empty, tender.ErrConflict
+		}
 		c, ok := o.singleCapture(p)
 		if !ok || p.Provider != "paypal" || p.MerchantAccount != event.Merchant || p.Market != market || p.ProviderReference != event.OrderID || c.ID != event.CaptureID || c.Amount != event.Amount {
 			return empty, tender.ErrConflict
@@ -199,6 +202,10 @@ func (h *Webhook) Process(ctx context.Context, id string) error {
 		}
 		if err != nil {
 			return empty, err
+		}
+		// Wait for the in-flight POST/GET comparison before a callback can apply funds.
+		if op.Status == tender.OperationReserved {
+			return empty, tender.ErrConflict
 		}
 		if op.Kind != tender.OpConfirm || op.AttemptID != p.AttemptID || op.PaymentID != p.ID || op.Amount != p.Amount {
 			return empty, tender.ErrConflict

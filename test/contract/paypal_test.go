@@ -397,7 +397,7 @@ func TestPayPalAuthenticatedOrderBinding(t *testing.T) {
 				req.Operation.ProviderKey = "bad\nkey"
 			}
 			o, err := a.Execute(t.Context(), req)
-			if err == nil || o.Snapshot.Funds.Captured != 0 {
+			if err == nil && (o.Status != tender.OperationPending || o.Snapshot.ProviderStatus != "CaptureEvidenceConflict") || o.Snapshot.Funds.Captured != 0 {
 				t.Fatalf("unbound order yielded %d %v", o.Snapshot.Funds.Captured, err)
 			}
 			if field != "captureID" && mutation.Load() != 0 {
@@ -457,5 +457,346 @@ func TestPayPalBearerChallenge(t *testing.T) {
 	h.create(t)
 	if !first.Load() || calls.Load() != 1 || h.tokens.Load() != 2 {
 		t.Fatal("failed to refresh a rejected token exactly once")
+	}
+}
+
+func (h *walletRig) engineWith(t *testing.T, transport http.RoundTripper) *tender.Engine {
+	t.Helper()
+	c := h.cfg
+	c.Transport = transport
+	a, err := paypal.New(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := tender.NewEngine(tender.EngineConfig{Provider: a, Store: h.db, Scope: dbScope, Market: walletMarket, ProviderName: "paypal", MerchantAccount: c.MerchantAccount})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return e
+}
+func TestPayPalNoDispatchRetry(t *testing.T) {
+	for _, kind := range []string{"create", "confirm", "refund"} {
+		t.Run(kind, func(t *testing.T) {
+			h := newWallet(t, store.NewMemory())
+			ctx := t.Context()
+			if kind != "create" {
+				p := h.create(t)
+				h.decide(t, p.Payment.ProviderReference, "approve")
+				if kind == "refund" {
+					if _, err := h.engine.Confirm(ctx, walletReq("confirm", 1000)); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			target := "/sim/v1/oauth2/token"
+			if kind != "create" {
+				target = "/sim/v2/checkout/orders/"
+			}
+			var failed atomic.Bool
+			var sent atomic.Int64
+			e := h.engineWith(t, walletTransport(func(r *http.Request) (*http.Response, error) {
+				if strings.HasPrefix(r.URL.Path, target) && !failed.Swap(true) {
+					return nil, io.ErrUnexpectedEOF
+				}
+				if r.Header.Get("PayPal-Request-Id") != "" {
+					sent.Add(1)
+				}
+				return h.server.Client().Transport.RoundTrip(r)
+			}))
+			r := walletReq("first", 1000)
+			var op func(context.Context, tender.Request) (tender.Result, error)
+			switch kind {
+			case "create":
+				op = e.Create
+				r.OrderID = "order-1"
+			case "confirm":
+				op = e.Confirm
+			case "refund":
+				op = e.Refund
+				r.Amount.Minor = 250
+			}
+			lost, err := op(ctx, r)
+			if !errors.Is(err, tender.ErrNotDispatched) || lost.Operation.Status != tender.OperationFailed || sent.Load() != 0 {
+				t.Fatalf("preflight %s = %s %v; mutation sends %d", kind, lost.Operation.Status, err, sent.Load())
+			}
+			r.Key = "retry"
+			if kind == "create" {
+				_, err = e.RetryCreate(ctx, lost.Operation.ID, r)
+			} else {
+				_, err = op(ctx, r)
+			}
+			if err != nil || sent.Load() != 1 {
+				t.Fatalf("safe retry = %v; sends %d", err, sent.Load())
+			}
+		})
+	}
+}
+func TestPayPalDefinitiveCaptureRejection(t *testing.T) {
+	for _, tc := range []struct {
+		issue, name string
+		code        int
+		want        tender.ErrorKind
+	}{{"INSTRUMENT_DECLINED", "UNPROCESSABLE_ENTITY", 422, tender.ErrDeclined}, {"INVALID_PARAMETER_VALUE", "INVALID_REQUEST", 400, tender.ErrValidation}, {"ORDER_ALREADY_CAPTURED", "UNPROCESSABLE_ENTITY", 422, tender.ErrUnknownOutcome}, {"NEW_ISSUE", "UNPROCESSABLE_ENTITY", 422, tender.ErrUnknownOutcome}} {
+		t.Run(tc.issue, func(t *testing.T) {
+			h := newWallet(t, store.NewMemory())
+			ctx := t.Context()
+			p := h.create(t)
+			h.decide(t, p.Payment.ProviderReference, "approve")
+			var first atomic.Bool
+			e := h.engineWith(t, walletTransport(func(r *http.Request) (*http.Response, error) {
+				if strings.HasSuffix(r.URL.Path, "/capture") && !first.Swap(true) {
+					return &http.Response{StatusCode: tc.code, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(fmt.Sprintf(`{"name":%q,"details":[{"issue":%q,"description":"private text"}]}`, tc.name, tc.issue)))}, nil
+				}
+				return h.server.Client().Transport.RoundTrip(r)
+			}))
+			res, err := e.Confirm(ctx, walletReq("first", 1000))
+			if !errors.Is(err, tc.want) || res.Payment.Funds.Captured != 0 {
+				t.Fatalf("rejection = %s %v", res.Operation.Status, err)
+			}
+			next, err := e.Confirm(ctx, walletReq("second", 1000))
+			if tc.want == tender.ErrUnknownOutcome {
+				if !errors.Is(err, tender.ErrConflict) {
+					t.Fatal("unclassified error released reservation")
+				}
+				return
+			}
+			if err != nil || next.Payment.Funds.Captured != 1000 {
+				t.Fatal("definitive rejection prevented new attempt", err)
+			}
+		})
+	}
+}
+func TestPayPalContradictoryCaptureEvidence(t *testing.T) {
+	for _, tc := range []string{"post capture id", "get capture id", "post buyer", "get buyer"} {
+		t.Run(tc, func(t *testing.T) {
+			h := newWallet(t, store.NewMemory())
+			ctx := t.Context()
+			p := h.create(t)
+			h.decide(t, p.Payment.ProviderReference, "approve")
+			var posted atomic.Bool
+			tr := walletTransport(func(r *http.Request) (*http.Response, error) {
+				res, err := h.server.Client().Transport.RoundTrip(r)
+				if err != nil {
+					return res, err
+				}
+				post := strings.HasSuffix(r.URL.Path, "/capture")
+				if post {
+					posted.Store(true)
+				}
+				if !posted.Load() || post != strings.HasPrefix(tc, "post") || !post && r.Method != "GET" {
+					return res, nil
+				}
+				var obj map[string]any
+				err = json.NewDecoder(res.Body).Decode(&obj)
+				res.Body.Close()
+				if err != nil {
+					return nil, err
+				}
+				if strings.HasSuffix(tc, "buyer") {
+					obj["payment_source"].(map[string]any)["paypal"].(map[string]any)["account_id"] = "OTHERBUYER"
+				} else {
+					obj["purchase_units"].([]any)[0].(map[string]any)["payments"].(map[string]any)["captures"].([]any)[0].(map[string]any)["id"] = "C2WRONG"
+				}
+				raw, _ := json.Marshal(obj)
+				res.Body = io.NopCloser(bytes.NewReader(raw))
+				return res, nil
+			})
+			e := h.engineWith(t, tr)
+			res, err := e.Confirm(ctx, walletReq("capture", 1000))
+			if res.Payment.Funds.Captured != 0 || res.Operation.Status != tender.OperationPending {
+				t.Fatalf("contradictory evidence = %s %d %v", res.Operation.Status, res.Payment.Funds.Captured, err)
+			}
+			_, err = e.Recover(ctx, res.Operation.ID)
+			if !errors.Is(err, tender.ErrUnknownOutcome) {
+				t.Fatal("a single disputed query authorized capture", err)
+			}
+			id := h.event(t)
+			if strings.HasPrefix(tc, "get") {
+				cfg := h.cfg
+				cfg.Transport = tr
+				adapter, err := paypal.New(cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				hook, err := adapter.Webhook(h.db, e, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = hook.Process(ctx, id); !errors.Is(err, tender.ErrConflict) {
+					t.Fatal("genuine signature settled against a conflicting buyer or capture", err)
+				}
+				p, err := e.Get(ctx, p.Payment.ID)
+				if err != nil || p.Funds.Captured != 0 {
+					t.Fatal("conflicting webhook read credited funds")
+				}
+			}
+			if err = h.hook.Process(ctx, id); err != nil {
+				t.Fatal("verified event couldn't recover real capture", err)
+			}
+			paid, _ := e.Get(ctx, p.Payment.ID)
+			if paid.Funds.Captured != 1000 {
+				t.Fatal("no verified capture")
+			}
+		})
+	}
+}
+func TestPayPalFixtureCurrentStatus(t *testing.T) {
+	h := newWallet(t, store.NewMemory())
+	ctx := t.Context()
+	p := h.create(t)
+	h.decide(t, p.Payment.ProviderReference, "approve")
+	// Exercise the fixture's API directly with the same access and request IDs.
+	req, _ := http.NewRequest("POST", h.cfg.BaseURL+"/v1/oauth2/token", strings.NewReader("grant_type=client_credentials"))
+	req.SetBasicAuth(h.cfg.ClientID, h.cfg.Secret)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := h.server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tok struct {
+		Token string `json:"access_token"`
+	}
+	err = json.NewDecoder(resp.Body).Decode(&tok)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := func(orig tender.Result, route, orderStatus, capStatus string) {
+		req, _ := http.NewRequestWithContext(ctx, "POST", h.cfg.BaseURL+route, strings.NewReader("{}"))
+		req.Header.Set("Authorization", "Bearer "+tok.Token)
+		req.Header.Set("PayPal-Request-Id", orig.Operation.ProviderKey)
+		req.Header.Set("Prefer", "return=representation")
+		resp, err := h.server.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		var o struct {
+			Status string
+			Units  []struct {
+				Payments struct{ Captures []struct{ Status string } }
+			} `json:"purchase_units"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&o)
+		if err != nil || o.Status != orderStatus || capStatus != "" && (len(o.Units) != 1 || len(o.Units[0].Payments.Captures) != 1 || o.Units[0].Payments.Captures[0].Status != capStatus) {
+			t.Errorf("replay %s = %s; wanted %s/%s", route, o.Status, orderStatus, capStatus)
+		}
+	}
+	path := "/v2/checkout/orders"
+	check(p, path, "APPROVED", "")
+	c, err := h.engine.Confirm(ctx, walletReq("confirm", 1000))
+	if err != nil {
+		t.Fatal(err)
+	}
+	check(p, path, "COMPLETED", "COMPLETED")
+	_, err = h.engine.Refund(ctx, walletReq("refund", 200))
+	if err != nil {
+		t.Fatal(err)
+	}
+	check(c, path+"/"+p.Payment.ProviderReference+"/capture", "COMPLETED", "PARTIALLY_REFUNDED")
+}
+func TestPayPalBuyerResume(t *testing.T) {
+	h := newWallet(t, store.NewMemory())
+	p := h.create(t)
+	h.decide(t, p.Payment.ProviderReference, "approve")
+	// The provider approved, then the buyer disconnected before host Confirm.
+	h.decide(t, p.Payment.ProviderReference, "approve")
+	r := walletReq("confirm", 1000)
+	res, err := h.engine.Confirm(t.Context(), r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repeat, err := h.engine.Confirm(t.Context(), r)
+	if err != nil || repeat.Operation.ProviderReference != res.Operation.ProviderReference || repeat.Payment.Funds.Captured != 1000 {
+		t.Fatal("resumed confirmation was not idempotent")
+	}
+}
+
+func TestPayPalMutationErrorScope(t *testing.T) {
+	for _, tc := range []struct {
+		kind, issue string
+		code        int
+		want        tender.ErrorKind
+	}{{"create", "MISSING_REQUIRED_PARAMETER", 400, tender.ErrValidation}, {"refund", "REFUND_AMOUNT_EXCEEDED", 422, tender.ErrValidation}, {"refund", "INSTRUMENT_DECLINED", 422, tender.ErrUnknownOutcome}, {"capture", "REFUND_AMOUNT_EXCEEDED", 422, tender.ErrUnknownOutcome}, {"capture", "oversize", 400, tender.ErrUnknownOutcome}} {
+		t.Run(tc.kind+"_"+tc.issue, func(t *testing.T) {
+			h := newWallet(t, store.NewMemory())
+			ctx := t.Context()
+			r := walletReq("error", 1000)
+			if tc.kind != "create" {
+				p := h.create(t)
+				h.decide(t, p.Payment.ProviderReference, "approve")
+				if tc.kind == "refund" {
+					if _, err := h.engine.Confirm(ctx, walletReq("confirm", 1000)); err != nil {
+						t.Fatal(err)
+					}
+					r.Amount.Minor = 250
+				}
+			} else {
+				r.OrderID = "order"
+			}
+			e := h.engineWith(t, walletTransport(func(req *http.Request) (*http.Response, error) {
+				if req.Header.Get("PayPal-Request-Id") == "" {
+					return h.server.Client().Transport.RoundTrip(req)
+				}
+				issue := tc.issue
+				message := "sensitive-message"
+				if issue == "oversize" {
+					issue = "INVALID_PARAMETER_VALUE"
+					message = strings.Repeat("X", 20000)
+				}
+				name := "UNPROCESSABLE_ENTITY"
+				if tc.code == 400 {
+					name = "INVALID_REQUEST"
+				}
+				raw, _ := json.Marshal(map[string]any{"name": name, "message": message, "details": []map[string]string{{"issue": issue}}})
+				return &http.Response{StatusCode: tc.code, Header: make(http.Header), Body: io.NopCloser(bytes.NewReader(raw))}, nil
+			}))
+			call := e.Confirm
+			if tc.kind == "refund" {
+				call = e.Refund
+			} else if tc.kind == "create" {
+				call = e.Create
+			}
+			out, err := call(ctx, r)
+			if !errors.Is(err, tc.want) || strings.Contains(err.Error(), "sensitive") {
+				t.Fatalf("endpoint error = %s %v", out.Operation.Status, err)
+			}
+		})
+	}
+}
+
+func TestPayPalCallbackWaitsForCaptureComparison(t *testing.T) {
+	h := newWallet(t, store.NewMemory())
+	ctx := t.Context()
+	p := h.create(t)
+	h.decide(t, p.Payment.ProviderReference, "approve")
+	pending := make(chan struct{})
+	release := make(chan struct{})
+	e := h.engineWith(t, walletTransport(func(r *http.Request) (*http.Response, error) {
+		res, err := h.server.Client().Transport.RoundTrip(r)
+		if err == nil && strings.HasSuffix(r.URL.Path, "/capture") {
+			close(pending)
+			select {
+			case <-release:
+			case <-r.Context().Done():
+				res.Body.Close()
+				return nil, r.Context().Err()
+			}
+		}
+		return res, err
+	}))
+	done := make(chan error, 1)
+	go func() { _, err := e.Confirm(ctx, walletReq("confirm", 1000)); done <- err }()
+	<-pending
+	id := h.event(t)
+	early := h.hook.Process(ctx, id)
+	before, err := e.Get(ctx, p.Payment.ID)
+	close(release)
+	confirmed := <-done
+	if !errors.Is(early, tender.ErrConflict) || err != nil || before.Funds.Captured != 0 || confirmed != nil {
+		t.Fatalf("early callback %v, gross %d, confirm %v", early, before.Funds.Captured, confirmed)
+	}
+	if err := h.hook.Process(ctx, id); err != nil {
+		t.Fatal("stored event failed after response", err)
 	}
 }

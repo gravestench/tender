@@ -19,13 +19,17 @@ for (const button of controls) {
   button.addEventListener("click", async () => {
     controls.forEach(control => control.disabled = true);
     try {
-      const response = await fetch(location.pathname + "/wallet/" + button.dataset.step, {
-        method: "POST",
-        headers: {"Content-Type": "application/x-www-form-urlencoded"},
-        body: new URLSearchParams({csrf: checkout.dataset.csrf}),
-      });
-      if (!response.ok) throw new Error("wallet unavailable");
-      render((await response.json()).status);
+      async function submit(step) {
+        const response = await fetch(location.pathname + "/wallet/" + step, {
+          method: "POST",
+          headers: {"Content-Type": "application/x-www-form-urlencoded"},
+          body: new URLSearchParams({csrf: checkout.dataset.csrf}),
+        });
+        if (!response.ok) throw new Error("wallet unavailable");
+        return (await response.json()).status;
+      }
+      const status = await submit(button.dataset.step);
+      render(status === "approved" ? await submit("confirm") : status);
     } catch {
       render("unavailable");
     } finally {

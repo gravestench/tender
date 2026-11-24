@@ -50,6 +50,9 @@ func (f Funds) includes(previous Funds) bool {
 // Snapshot is an absolute provider observation. An absent action has its zero
 // value. Funds are cumulative even when a particular operation is partial.
 type Snapshot struct {
+	// ProviderEvidenceDigest binds authenticated provider facts needed to resolve
+	// a pending operation without retaining the original private identifiers.
+	ProviderEvidenceDigest [32]byte `json:",omitzero"`
 	// VerifiedMethod is the payment method established by authenticated provider
 	// evidence. Zero is unknown, including records from older adapters.
 	VerifiedMethod PaymentMethod

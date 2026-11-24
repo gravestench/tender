@@ -15,6 +15,8 @@ const (
 	ErrAuthentication ErrorKind = "authentication"
 	ErrRateLimit      ErrorKind = "rate_limit"
 	ErrTransport      ErrorKind = "transport"
+	// ErrNotDispatched means a prerequisite failed before the provider mutation could have an effect.
+	ErrNotDispatched  ErrorKind = "not_dispatched"
 	ErrUnknownOutcome ErrorKind = "unknown_outcome"
 	ErrConflict       ErrorKind = "conflict"
 )

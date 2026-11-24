@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/netip"
@@ -121,6 +122,9 @@ func (a *Adapter) call(ctx context.Context, method, path, key string, body []byt
 	for attempt := 0; attempt < 2; attempt++ {
 		token, err := a.tokenFor(ctx)
 		if err != nil {
+			if key != "" {
+				return beforeDispatch(err)
+			}
 			return err
 		}
 		req, err := http.NewRequestWithContext(ctx, method, a.cfg.BaseURL+path, bytes.NewReader(body))
@@ -166,7 +170,7 @@ func (a *Adapter) send(req *http.Request, result any, mutation bool) error {
 		return tender.ErrRateLimit
 	case res.StatusCode < 200 || res.StatusCode > 299:
 		if mutation {
-			return tender.ErrUnknownOutcome
+			return a.rejection(req.URL.String(), res)
 		}
 		return tender.ErrTransport
 	}
@@ -178,4 +182,56 @@ func (a *Adapter) send(req *http.Request, result any, mutation bool) error {
 		return tender.ErrTransport
 	}
 	return nil
+}
+
+// beforeDispatch is used only when a prerequisite failed before the mutation
+// was sent, or after a definite 401 refused the original credential.
+func beforeDispatch(err error) error {
+	if errors.Is(err, tender.ErrTransport) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return tender.ErrNotDispatched
+	}
+	return err
+}
+
+func (a *Adapter) rejection(destination string, res *http.Response) error {
+	if res.StatusCode != 400 && res.StatusCode != 422 {
+		return tender.ErrUnknownOutcome
+	}
+	raw, err := io.ReadAll(io.LimitReader(res.Body, 16385))
+	var body struct {
+		Name    string
+		Details []struct{ Issue string }
+	}
+	if err != nil || len(raw) > 16384 || json.Unmarshal(raw, &body) != nil || len(body.Details) == 0 {
+		return tender.ErrUnknownOutcome
+	}
+	path := strings.TrimPrefix(destination, a.cfg.BaseURL)
+	order := path == "/v2/checkout/orders"
+	capture := strings.HasPrefix(path, "/v2/checkout/orders/") && strings.HasSuffix(path, "/capture")
+	refund := strings.HasPrefix(path, "/v2/payments/captures/") && strings.HasSuffix(path, "/refund")
+	var kind tender.ErrorKind
+	for _, detail := range body.Details {
+		var next tender.ErrorKind
+		switch {
+		case res.StatusCode == 400 && body.Name == "INVALID_REQUEST" && (order || capture):
+			switch detail.Issue {
+			case "INVALID_PARAMETER_SYNTAX", "INVALID_PARAMETER_VALUE", "INVALID_STRING_LENGTH", "MISSING_REQUIRED_PARAMETER":
+				next = tender.ErrValidation
+			}
+		case res.StatusCode == 422 && body.Name == "UNPROCESSABLE_ENTITY" && capture:
+			switch detail.Issue {
+			case "INSTRUMENT_DECLINED", "PAYMENT_DENIED":
+				next = tender.ErrDeclined
+			case "ORDER_NOT_APPROVED":
+				next = tender.ErrValidation
+			}
+		case res.StatusCode == 422 && body.Name == "UNPROCESSABLE_ENTITY" && refund && detail.Issue == "REFUND_AMOUNT_EXCEEDED":
+			next = tender.ErrValidation
+		}
+		if next == "" || kind != "" && kind != next {
+			return tender.ErrUnknownOutcome
+		}
+		kind = next
+	}
+	return tender.NewProviderError(kind, body.Details[0].Issue)
 }
