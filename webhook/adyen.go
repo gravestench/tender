@@ -212,7 +212,7 @@ func (h *Adyen) Process(ctx context.Context, id string) error {
 func (h *Adyen) observation(tx tender.EventRecords, e evidence) (tender.Observation, error) {
 	var o tender.Observation
 	kind := map[string]tender.OperationKind{"AUTHORISATION": tender.OpConfirm, "CAPTURE": tender.OpCapture, "CAPTURE_FAILED": tender.OpCapture, "CANCELLATION": tender.OpVoid, "REFUND": tender.OpRefund}[e.Code]
-	if kind == "" {
+	if kind == "" && e.Code != "CHARGEBACK" {
 		return o, tender.ErrUnsupported
 	}
 	scope := h.cfg.Scope
@@ -222,6 +222,12 @@ func (h *Adyen) observation(tx tender.EventRecords, e evidence) (tender.Observat
 	}
 	if p.Provider != "adyen" || p.MerchantAccount != e.Account || original.AttemptID != p.AttemptID {
 		return o, tender.ErrConflict
+	}
+	if p.Market.Method == tender.MethodACH {
+		return achObservation(tx, p, original, e)
+	}
+	if kind == "" {
+		return o, tender.ErrUnsupported
 	}
 	op := original
 	if kind != tender.OpConfirm && original.Kind == tender.OpConfirm {

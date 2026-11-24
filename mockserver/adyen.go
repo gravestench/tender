@@ -291,12 +291,16 @@ func (f *adyenFixtureServer) notification(p AdyenRecord) []byte {
 	if code == "" {
 		return nil
 	}
-	material := strings.Join([]string{psp, original, f.config.MerchantAccount, p.Reference, strconv.FormatInt(p.Value, 10), p.Currency, code, success}, ":")
+	return f.Server.standardNotification(f.config.MerchantAccount, p.Reference, p.Value, p.Currency, psp, original, code, success)
+}
+
+func (f *Server) standardNotification(account, reference string, value int64, currency, psp, original, code, success string) []byte {
+	material := strings.Join([]string{psp, original, account, reference, strconv.FormatInt(value, 10), currency, code, success}, ":")
 	mac := hmac.New(sha256.New, f.key)
 	mac.Write([]byte(material))
 	item := map[string]any{
-		"pspReference": psp, "merchantAccountCode": f.config.MerchantAccount, "merchantReference": p.Reference,
-		"amount": adyenFixtureAmount{p.Currency, p.Value}, "eventCode": code, "success": success,
+		"pspReference": psp, "merchantAccountCode": account, "merchantReference": reference,
+		"amount": adyenFixtureAmount{currency, value}, "eventCode": code, "success": success,
 		"eventDate":      f.clock().UTC().Format(time.RFC3339Nano),
 		"additionalData": map[string]string{"hmacSignature": base64.StdEncoding.EncodeToString(mac.Sum(nil))},
 	}
