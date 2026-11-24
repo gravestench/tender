@@ -215,6 +215,58 @@ func TestReconcileReports(t *testing.T) {
 			t.Fatalf("resolved line remains open: %+v", item)
 		}
 	}
+	// Operation references are unique only within one payment in the core
+	// ledger, so two payments may expose the same PSP on this report route.
+	for _, row := range []struct{ id, ref string }{{"collision-a", "psp-a"}, {"collision-b", "psp-b"}} {
+		p, err := tender.NewPayment(scope, row.id, "order-"+row.id, tender.Money{Minor: 10000, Currency: "USD"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.Provider, p.MerchantAccount, p.AttemptID, p.ProviderReference, p.Market = "adyen", "acct", "attempt-"+row.id, row.ref, card
+		if err := store2.Transact(ctx, func(tx tender.Tx) error { return tx.InsertPayment(p) }); err != nil {
+			t.Fatal(err)
+		}
+		op := tender.OperationRecord{Operation: tender.Operation{Scope: scope, ID: "op-" + row.id, PaymentID: row.id, AttemptID: p.AttemptID, Key: "key-" + row.id, ProviderReference: "shared-operation-psp", Kind: tender.OpCapture, Status: tender.OperationSucceeded, Amount: tender.Money{Minor: 10000, Currency: "USD"}, BaseVersion: 1}}
+		if err := store2.Transact(ctx, func(tx tender.Tx) error { return tx.InsertOperation(op) }); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := restarted.Reconcile(ctx, tender.SettlementReport{ID: "shared-psp-report", Feed: tender.FeedHostVerified, Lines: []tender.SettlementLine{line("shared", "shared-operation-psp", tender.SettlementCaptured, 10000, 0, 10000)}}); !errors.Is(err, tender.ErrConflict) {
+		t.Fatalf("cross-payment operation PSP ambiguity: %v", err)
+	}
+	// A payment PSP may also equal a different payment's operation PSP.
+	bridge := tender.OperationRecord{Operation: tender.Operation{Scope: scope, ID: "op-bridge", PaymentID: "collision-a", AttemptID: "attempt-collision-a", Key: "key-bridge", ProviderReference: "psp-card", Kind: tender.OpCapture, Status: tender.OperationSucceeded, Amount: tender.Money{Minor: 10000, Currency: "USD"}, BaseVersion: 1}}
+	if err := store2.Transact(ctx, func(tx tender.Tx) error { return tx.InsertOperation(bridge) }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restarted.Reconcile(ctx, tender.SettlementReport{ID: "bridge-report", Feed: tender.FeedHostVerified, Lines: []tender.SettlementLine{line("bridge", "psp-card", tender.SettlementCaptured, 10000, 0, 10000)}}); !errors.Is(err, tender.ErrConflict) {
+		t.Fatalf("payment/operation PSP ambiguity: %v", err)
+	}
+	// A real host timestamp carries monotonic and location state that JSONB
+	// cannot preserve. Exact replay after reopening the pool must stay inert.
+	monotonic := tender.SettlementReport{ID: "monotonic-report", Feed: tender.FeedHostVerified, Lines: []tender.SettlementLine{line("clock", "unknown", tender.SettlementCaptured, 10000, 300, 9700)}}
+	monotonic.Lines[0].ObservedAt = time.Now()
+	if _, err := restarted.Reconcile(ctx, monotonic); err != nil {
+		t.Fatal(err)
+	}
+	if err := db2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db3 := open()
+	defer db3.Close()
+	reopened, err := tender.NewEngine(tender.EngineConfig{Store: postgres.New(db3), Provider: storageProvider{}, Scope: scope, ProviderName: "adyen", MerchantAccount: "acct", Market: card})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.Reconcile(ctx, monotonic); err != nil {
+		t.Fatal(err)
+	}
+	if err := db3.QueryRowContext(ctx, `SELECT count(*) FROM tender_reconciliation_history WHERE merchant_id=$1 AND run_id=$2`, scope.MerchantID, monotonic.ID).Scan(&historyCount); err != nil {
+		t.Fatal(err)
+	}
+	if historyCount != 1 {
+		t.Fatalf("exact monotonic-time replay added %d history rows", historyCount)
+	}
 	if _, err := bankEngine.Reconcile(ctx, tender.SettlementReport{ID: "unsupported", Feed: tender.ReportFeed("provider_auto")}); !errors.Is(err, tender.ErrUnsupported) {
 		t.Fatalf("unsupported feed: %v", err)
 	}

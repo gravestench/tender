@@ -98,7 +98,7 @@ func (p storageProvider) Query(_ context.Context, r tender.ProviderRequest) (ten
 func storageObservation(r tender.ProviderRequest, status tender.PaymentStatus, funds tender.Funds) tender.Observation {
 	return tender.Observation{Scope: r.Payment.Scope, PaymentID: r.Payment.ID, AttemptID: r.Operation.AttemptID,
 		MerchantAccount: r.Payment.MerchantAccount, OperationID: r.Operation.ID, ProviderReference: "charge", OperationReference: "effect-" + r.Operation.ID,
-		Amount: r.Operation.Amount, Status: tender.OperationSucceeded, Snapshot: tender.Snapshot{Status: status, Funds: funds}}
+		Amount: r.Operation.Amount, Status: tender.OperationSucceeded, Snapshot: tender.Snapshot{Status: status, Funds: funds, VerifiedMethod: tender.MethodVisa}}
 }
 func storageEngine(t *testing.T, db *sql.DB, p storageProvider, now func() time.Time) *tender.Engine {
 	t.Helper()

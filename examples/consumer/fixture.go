@@ -42,6 +42,7 @@ func (f fixture) Execute(_ context.Context, r tender.ProviderRequest) (tender.Ob
 		snapshot.Action = tender.CustomerAction{Mode: tender.ActionComponent, Data: "fixture-step", ExpiresAt: time.Now().Add(5 * time.Minute)}
 	case r.Operation.Kind == tender.OpCreate && r.Token == "collected", r.Operation.Kind == tender.OpConfirm && r.Token == "fixture-approved":
 		snapshot.Status = tender.PaymentCaptured
+		snapshot.VerifiedMethod = tender.MethodVisa
 		snapshot.Funds = tender.Funds{Authorized: r.Payment.Amount.Minor, Captured: r.Payment.Amount.Minor}
 	default:
 		return tender.Observation{}, tender.ErrUnsupported

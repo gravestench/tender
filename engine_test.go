@@ -34,8 +34,25 @@ func (p *processor) Query(ctx context.Context, r tender.ProviderRequest) (tender
 	return p.query(ctx, r)
 }
 func observed(r tender.ProviderRequest, status tender.PaymentStatus, funds tender.Funds) tender.Observation {
-	return tender.Observation{Scope: r.Payment.Scope, MerchantAccount: r.Payment.MerchantAccount, PaymentID: r.Payment.ID, AttemptID: r.Operation.AttemptID, OperationID: r.Operation.ID, ProviderReference: "remote-" + r.Payment.ID, OperationReference: "remote-" + r.Operation.ID, Amount: r.Operation.Amount, Status: tender.OperationSucceeded, Snapshot: tender.Snapshot{Status: status, Funds: funds}}
+	snapshot := tender.Snapshot{Status: status, Funds: funds}
+	if funds.Authorized > 0 {
+		// The simulated acquirer reports Visa on authorized transactions.
+		snapshot.VerifiedMethod = tender.MethodVisa
+	}
+	return tender.Observation{
+		Scope: r.Payment.Scope, MerchantAccount: r.Payment.MerchantAccount,
+		PaymentID: r.Payment.ID, AttemptID: r.Operation.AttemptID, OperationID: r.Operation.ID,
+		ProviderReference: "remote-" + r.Payment.ID, OperationReference: "remote-" + r.Operation.ID,
+		Amount: r.Operation.Amount, Status: tender.OperationSucceeded, Snapshot: snapshot,
+	}
 }
+
+func bankObservation(r tender.ProviderRequest, status tender.PaymentStatus, funds tender.Funds) tender.Observation {
+	o := observed(r, status, funds)
+	o.Snapshot.VerifiedMethod = tender.MethodACH
+	return o
+}
+
 func authorized(_ context.Context, r tender.ProviderRequest) (tender.Observation, error) {
 	return observed(r, tender.PaymentAuthorized, tender.Funds{Authorized: 100}), nil
 }
@@ -780,7 +797,7 @@ func TestFulfillmentCollectionEvidence(t *testing.T) {
 	t.Run("ACH settlement collects without card principal", func(t *testing.T) {
 		db := store.NewMemory()
 		p := achProcessor{&processor{execute: func(_ context.Context, r tender.ProviderRequest) (tender.Observation, error) {
-			return observed(r, tender.PaymentSettled, tender.Funds{Settled: 100}), nil
+			return bankObservation(r, tender.PaymentSettled, tender.Funds{Settled: 100}), nil
 		}}}
 		e, err := tender.NewEngine(tender.EngineConfig{Store: db, Provider: p, Scope: shop, ProviderName: "bank", MerchantAccount: "account", Market: p.Capabilities().Markets[0].Market})
 		if err != nil {
@@ -831,7 +848,7 @@ func TestACHRequiresSettlementForFulfillment(t *testing.T) {
 	funds := tender.Funds{Authorized: 100, Captured: 100}
 	p := achProcessor{&processor{execute: func(_ context.Context, r tender.ProviderRequest) (tender.Observation, error) {
 		req = r
-		return observed(r, tender.PaymentCaptured, funds), nil
+		return bankObservation(r, tender.PaymentCaptured, funds), nil
 	}}}
 	e, err := tender.NewEngine(tender.EngineConfig{
 		Store: db, Provider: p, Scope: shop, ProviderName: "bank", MerchantAccount: "account",
@@ -851,7 +868,7 @@ func TestACHRequiresSettlementForFulfillment(t *testing.T) {
 	}
 
 	funds.Settled = 100
-	settlement := observed(req, tender.PaymentSettled, funds)
+	settlement := bankObservation(req, tender.PaymentSettled, funds)
 	settled, err := e.ApplyVerified(t.Context(), settlement)
 	if err != nil || settled.Payment.Funds != funds {
 		t.Fatalf("verified full settlement: %+v %v", settled, err)
@@ -872,7 +889,7 @@ func TestACHRequiresSettlementForFulfillment(t *testing.T) {
 	}
 
 	funds.Returned = 100
-	returned, err := e.ApplyVerified(t.Context(), observed(req, tender.PaymentReturned, funds))
+	returned, err := e.ApplyVerified(t.Context(), bankObservation(req, tender.PaymentReturned, funds))
 	if err != nil || returned.Payment.Status != tender.PaymentReturned || returned.Payment.Funds != funds {
 		t.Fatalf("return lost original settlement or failed to reverse collection: %+v %v", returned, err)
 	}
@@ -941,5 +958,46 @@ func TestVerifiedInboxBindsPersistedIdentity(t *testing.T) {
 		return tender.VerifiedEvent{}, nil
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestFulfillmentRequiresVerifiedMethod(t *testing.T) {
+	db := store.NewMemory()
+	var dispatched tender.ProviderRequest
+	provider := &processor{execute: func(_ context.Context, r tender.ProviderRequest) (tender.Observation, error) {
+		dispatched = r
+		o := observed(r, tender.PaymentCaptured, tender.Funds{Authorized: 100, Captured: 100})
+		o.Snapshot.VerifiedMethod = ""
+		return o, nil
+	}}
+	e := openEngine(t, db, provider, shop)
+	got, err := e.Create(t.Context(), purchase())
+	if err != nil || got.Payment.Funds.Captured != 100 || got.Payment.VerifiedMethod != "" {
+		t.Fatalf("capture without method evidence: %+v %v", got.Payment, err)
+	}
+	out, err := db.Outbox(t.Context(), shop)
+	if err != nil || len(out) != 0 {
+		t.Fatalf("unverified method produced a fulfillment notice: %+v %v", out, err)
+	}
+	evidence := observed(dispatched, tender.PaymentCaptured, tender.Funds{Authorized: 100, Captured: 100})
+	evidence.Snapshot.VerifiedMethod = tender.MethodMastercard
+	if _, err := e.ApplyVerified(t.Context(), evidence); !errors.Is(err, tender.ErrConflict) {
+		t.Fatalf("accepted method outside the Visa route: %v", err)
+	}
+	if out, err = db.Outbox(t.Context(), shop); err != nil || len(out) != 0 {
+		t.Fatalf("mismatched method produced a fulfillment notice: %+v %v", out, err)
+	}
+
+	evidence.Snapshot.VerifiedMethod = tender.MethodVisa
+	verified, err := e.ApplyVerified(t.Context(), evidence)
+	if err != nil || verified.Payment.VerifiedMethod != tender.MethodVisa {
+		t.Fatalf("matching provider evidence: %+v %v", verified.Payment, err)
+	}
+	if _, err := e.ApplyVerified(t.Context(), evidence); err != nil {
+		t.Fatal(err)
+	}
+	out, err = db.Outbox(t.Context(), shop)
+	if err != nil || len(out) != 1 || out[0].Version != verified.Payment.Version {
+		t.Fatalf("expected one fulfillment at the verified version: %+v %v", out, err)
 	}
 }

@@ -774,6 +774,9 @@ func (s state) canReconcile(o Observation, source string) bool {
 }
 
 func fullyCollected(p Payment) bool {
+	if p.VerifiedMethod == "" || p.VerifiedMethod != p.Market.Method {
+		return false
+	}
 	f := p.Funds
 	if f.Refunded != 0 || f.Returned != 0 || f.Disputed != 0 {
 		return false

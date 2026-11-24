@@ -174,7 +174,7 @@ func (e *Engine) Reconcile(ctx context.Context, report SettlementReport) (Reconc
 				if err != nil {
 					return err
 				}
-				if result != latest[line.ID] {
+				if !sameReconciliationResult(result, latest[line.ID]) {
 					if err := tx.AppendReconciliationResult(scope, provider, account, report.ID, result); err != nil {
 						return err
 					}
@@ -213,6 +213,13 @@ func (e *Engine) Reconcile(ctx context.Context, report SettlementReport) (Reconc
 		return ReconciliationRun{}, fmt.Errorf("%w: report identity was reused with changed contents", ErrConflict)
 	}
 	return run, nil
+}
+
+// JSONB stores the instant but not Go's monotonic reading or location.
+func sameReconciliationResult(a, b ReconciliationResult) bool {
+	aAt, bAt := a.Line.ObservedAt, b.Line.ObservedAt
+	a.Line.ObservedAt, b.Line.ObservedAt = time.Time{}, time.Time{}
+	return a == b && aAt.Equal(bAt)
 }
 
 func (e *Engine) matchSettlementLine(tx ReconciliationTx, line SettlementLine) (ReconciliationResult, error) {
