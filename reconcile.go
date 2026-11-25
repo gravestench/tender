@@ -415,10 +415,10 @@ func (e *Engine) matchSettlementLines(base Tx, tx ReconciliationTx, lines []Sett
 			seen[key] = i
 		}
 	}
-	// Returned is cumulative in the payment ledger. A partial report can cover
-	// fewer returns than the ledger, but it cannot claim more. A zero ledger
-	// return is the review-only card path, where the verified notice alone is
-	// comparison evidence and no funds are advanced by reconciliation.
+	// A partial report can cover fewer returns than the cumulative ledger, but
+	// cannot claim more than its nonzero Returned total or collected principal.
+	// With zero Returned, an exact verified notice is comparison evidence for
+	// a review-only return; it still cannot exceed collected principal.
 	returned := make(map[string][]int)
 	for i, result := range results {
 		if result.Line.Kind == SettlementReturned && result.Outcome == ReconciliationMatched {
@@ -430,8 +430,9 @@ func (e *Engine) matchSettlementLines(base Tx, tx ReconciliationTx, lines []Sett
 		if err != nil {
 			return nil, err
 		}
-		if payment.Funds.Returned == 0 {
-			continue
+		limit := max(payment.Funds.Captured, payment.Funds.Settled)
+		if payment.Funds.Returned > 0 && payment.Funds.Returned < limit {
+			limit = payment.Funds.Returned
 		}
 		var reported int64
 		for _, i := range indices {
@@ -440,7 +441,7 @@ func (e *Engine) matchSettlementLines(base Tx, tx ReconciliationTx, lines []Sett
 				return nil, err
 			}
 		}
-		if reported > payment.Funds.Returned {
+		if reported > limit {
 			for _, i := range indices {
 				results[i].Outcome = ReconciliationUnconfirmed
 			}

@@ -412,6 +412,26 @@ func TestReconcileSignedAdyenChargeback(t *testing.T) {
 	if err != nil || duplicateRun.Results[0].Outcome != tender.ReconciliationUnconfirmed || duplicateRun.Results[1].Outcome != tender.ReconciliationUnconfirmed || len(duplicateRun.PayoutResults) != 1 || duplicateRun.PayoutResults[0].Outcome != tender.PayoutUnconfirmed {
 		t.Fatalf("one verified chargeback counted twice: %+v, %v", duplicateRun, err)
 	}
+	if status := h.post(h.sim.AdyenAdverseNotification(authRecord, "CHARGEBACK", "DISPUTE456", 100)); status != http.StatusAccepted {
+		t.Fatalf("second signed chargeback callback status: %d", status)
+	}
+	if err := h.hook.Process(t.Context(), h.next()); err != nil {
+		t.Fatal(err)
+	}
+	fields["Modification Reference"] = "DISPUTE456"
+	secondChargeback, err := adyen.ProjectCardSettlement(fields, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	distinctReport := duplicateReport
+	distinctReport.ID = "distinct-signed-chargebacks"
+	distinctReport.Lines = []tender.SettlementLine{chargeback, secondChargeback}
+	distinctReport.Payouts = append([]tender.PayoutLine(nil), duplicateReport.Payouts...)
+	distinctReport.Payouts[0].ID, distinctReport.Payouts[0].PayoutReference = "distinct-chargeback-payout", "distinct-chargeback-bank"
+	distinctRun, err := h.e.Reconcile(t.Context(), distinctReport)
+	if err != nil || distinctRun.Results[0].Outcome != tender.ReconciliationUnconfirmed || distinctRun.Results[1].Outcome != tender.ReconciliationUnconfirmed || len(distinctRun.PayoutResults) != 1 || distinctRun.PayoutResults[0].Outcome != tender.PayoutUnconfirmed {
+		t.Fatalf("two distinct chargebacks exceeded collected principal: %+v, %v", distinctRun, err)
+	}
 	afterOutbox, err := db.Outbox(t.Context(), dbScope)
 	if err != nil || len(afterOutbox) != len(beforeOutbox) {
 		t.Fatalf("reconciliation changed fulfillment outbox: %+v, %v", afterOutbox, err)
