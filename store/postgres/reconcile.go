@@ -30,8 +30,9 @@ func (t *transaction) InsertSettlementLine(scope tender.Scope, provider, account
 
 func (t *transaction) ResolveSettlementReference(scope tender.Scope, provider, account, ref string) (tender.Payment, tender.OperationRecord, error) {
 	// Payment PSPs are unique on the route; operation PSPs are unique only
-	// within one payment. Both namespaces can also overlap. Refuse every
-	// ambiguous match rather than selecting whichever row the planner emits.
+	// within one payment. Klarna can use the same order PSP in both namespaces
+	// for that payment. Collapse that pair to the payment-level observation,
+	// while refusing a reference shared by different payments.
 	const query = `SELECT p.record,NULL::jsonb FROM tender_payments p
 		WHERE p.merchant_id=$1 AND p.environment=$2 AND p.provider=$3 AND p.merchant_account=$4
 		AND tender_reference_digest(p.provider_reference)=tender_reference_digest($5) AND p.provider_reference=$5
@@ -40,37 +41,49 @@ func (t *transaction) ResolveSettlementReference(scope tender.Scope, provider, a
 		ON p.merchant_id=o.merchant_id AND p.environment=o.environment AND p.payment_id=o.payment_id
 		WHERE o.merchant_id=$1 AND o.environment=$2 AND p.provider=$3 AND p.merchant_account=$4
 		AND tender_reference_digest(o.provider_reference)=tender_reference_digest($5) AND o.provider_reference=$5
-		LIMIT 2`
+		LIMIT 3`
 	rows, err := t.tx.QueryContext(t.ctx, query, scope.MerchantID, scope.Environment, provider, account, ref)
 	if err != nil {
 		return tender.Payment{}, tender.OperationRecord{}, dbError(err)
 	}
 	defer rows.Close()
-	if !rows.Next() {
-		if err := rows.Err(); err != nil {
+	var p tender.Payment
+	var op tender.OperationRecord
+	var paymentMatch bool
+	var count int
+	for rows.Next() {
+		count++
+		if count > 2 {
+			return tender.Payment{}, tender.OperationRecord{}, tender.ErrConflict
+		}
+		var paymentRaw, operationRaw []byte
+		if err := rows.Scan(&paymentRaw, &operationRaw); err != nil {
 			return tender.Payment{}, tender.OperationRecord{}, dbError(err)
 		}
-		return tender.Payment{}, tender.OperationRecord{}, tender.ErrNotFound
-	}
-	var paymentRaw, operationRaw []byte
-	if err := rows.Scan(&paymentRaw, &operationRaw); err != nil {
-		return tender.Payment{}, tender.OperationRecord{}, dbError(err)
-	}
-	if rows.Next() {
-		return tender.Payment{}, tender.OperationRecord{}, tender.ErrConflict
+		var matched tender.Payment
+		if err := json.Unmarshal(paymentRaw, &matched); err != nil {
+			return tender.Payment{}, tender.OperationRecord{}, err
+		}
+		if count > 1 && matched.ID != p.ID {
+			return tender.Payment{}, tender.OperationRecord{}, tender.ErrConflict
+		}
+		p = matched
+		if operationRaw == nil {
+			paymentMatch = true
+		} else {
+			if err := json.Unmarshal(operationRaw, &op); err != nil {
+				return tender.Payment{}, tender.OperationRecord{}, err
+			}
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return tender.Payment{}, tender.OperationRecord{}, dbError(err)
 	}
-	var p tender.Payment
-	var op tender.OperationRecord
-	if err := json.Unmarshal(paymentRaw, &p); err != nil {
-		return p, op, err
+	if count == 0 {
+		return tender.Payment{}, tender.OperationRecord{}, tender.ErrNotFound
 	}
-	if operationRaw != nil {
-		if err := json.Unmarshal(operationRaw, &op); err != nil {
-			return p, op, err
-		}
+	if paymentMatch {
+		op = tender.OperationRecord{}
 	}
 	return p, op, nil
 }

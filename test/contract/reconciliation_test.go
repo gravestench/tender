@@ -242,6 +242,53 @@ func TestReconcileReports(t *testing.T) {
 	if _, err := restarted.Reconcile(ctx, tender.SettlementReport{ID: "bridge-report", Feed: tender.FeedHostVerified, Lines: []tender.SettlementLine{line("bridge", "psp-card", tender.SettlementCaptured, 10000, 0, 10000)}}); !errors.Is(err, tender.ErrConflict) {
 		t.Fatalf("payment/operation PSP ambiguity: %v", err)
 	}
+	// Klarna confirmation deliberately binds its order ID to both the
+	// payment and its confirm operation. This is one payment, not two claims.
+	klarnaMarket := tender.Market{Country: "US", Currency: "USD", Method: tender.MethodKlarna}
+	klarnaEngine, err := tender.NewEngine(tender.EngineConfig{Store: store2, Provider: storageProvider{}, Scope: scope, ProviderName: "klarna", MerchantAccount: "acct", Market: klarnaMarket})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kp, err := tender.NewPayment(scope, "klarna", "order-klarna", tender.Money{Minor: 10000, Currency: "USD"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kp.Provider, kp.MerchantAccount, kp.AttemptID, kp.ProviderReference, kp.Market = "klarna", "acct", "attempt-klarna", "klarna-order", klarnaMarket
+	if _, err := kp.Apply(tender.Snapshot{Status: tender.PaymentCaptured, Funds: tender.Funds{Authorized: 10000, Captured: 10000}}, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store2.Transact(ctx, func(tx tender.Tx) error { return tx.InsertPayment(kp) }); err != nil {
+		t.Fatal(err)
+	}
+	kop := tender.OperationRecord{Operation: tender.Operation{Scope: scope, ID: "klarna-confirm", PaymentID: kp.ID, AttemptID: kp.AttemptID, Key: "klarna-confirm-key", ProviderReference: kp.ProviderReference, Kind: tender.OpConfirm, Status: tender.OperationSucceeded, Amount: kp.Amount, BaseVersion: 1}}
+	if err := store2.Transact(ctx, func(tx tender.Tx) error { return tx.InsertOperation(kop) }); err != nil {
+		t.Fatal(err)
+	}
+	kLine := line("klarna-capture", "klarna-order", tender.SettlementCaptured, 10000, 0, 10000)
+	kRun, err := klarnaEngine.Reconcile(ctx, tender.SettlementReport{ID: "klarna-same-order", Feed: tender.FeedHostVerified, Lines: []tender.SettlementLine{kLine}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if kRun.Results[0].Outcome != tender.ReconciliationMatched || kRun.Results[0].PaymentID != kp.ID {
+		t.Fatalf("same-payment Klarna reference: %+v", kRun.Results[0])
+	}
+	// A third claim from another payment must still make the reference
+	// ambiguous even when the first two rows belong to the same payment.
+	other, err := tender.NewPayment(scope, "klarna-other", "order-klarna-other", tender.Money{Minor: 10000, Currency: "USD"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	other.Provider, other.MerchantAccount, other.AttemptID, other.ProviderReference, other.Market = "klarna", "acct", "attempt-klarna-other", "other-order", klarnaMarket
+	if err := store2.Transact(ctx, func(tx tender.Tx) error { return tx.InsertPayment(other) }); err != nil {
+		t.Fatal(err)
+	}
+	otherOp := tender.OperationRecord{Operation: tender.Operation{Scope: scope, ID: "klarna-other-confirm", PaymentID: other.ID, AttemptID: other.AttemptID, Key: "klarna-other-key", ProviderReference: "klarna-order", Kind: tender.OpConfirm, Status: tender.OperationSucceeded, Amount: other.Amount, BaseVersion: 1}}
+	if err := store2.Transact(ctx, func(tx tender.Tx) error { return tx.InsertOperation(otherOp) }); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := klarnaEngine.Reconcile(ctx, tender.SettlementReport{ID: "klarna-cross-payment", Feed: tender.FeedHostVerified, Lines: []tender.SettlementLine{kLine}}); !errors.Is(err, tender.ErrConflict) {
+		t.Fatalf("cross-payment Klarna reference: %v", err)
+	}
 	// A real host timestamp carries monotonic and location state that JSONB
 	// cannot preserve. Exact replay after reopening the pool must stay inert.
 	monotonic := tender.SettlementReport{ID: "monotonic-report", Feed: tender.FeedHostVerified, Lines: []tender.SettlementLine{line("clock", "unknown", tender.SettlementCaptured, 10000, 300, 9700)}}
