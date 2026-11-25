@@ -71,6 +71,7 @@ func PayPalRoutes(c PayPalFixture) func(*Server) http.Handler {
 		mux.HandleFunc("POST /v1/oauth2/token", f.oauth)
 		mux.HandleFunc("POST /fixture/orders/{id}/{decision}", f.buyer)
 		mux.HandleFunc("POST /fixture/capture-next/{status}", f.captureNext)
+		mux.HandleFunc("POST /fixture/orders/{id}/capture-next/{status}", f.captureNext)
 		mux.HandleFunc("POST /fixture/orders/{id}/capture-status/{status}", f.captureStatus)
 		for route, path := range map[string]string{"create": "POST /v2/checkout/orders", "order": "GET /v2/checkout/orders/{id}", "capture": "POST /v2/checkout/orders/{id}/capture", "refund": "POST /v2/payments/captures/{id}/refund", "showRefund": "GET /v2/payments/refunds/{id}", "verify": "POST /v1/notifications/verify-webhook-signature"} {
 			mux.Handle(path, s.Route("paypal."+route, func(w http.ResponseWriter, r *http.Request, step Scenario) { f.serve(w, r, route, step) }))
@@ -146,7 +147,17 @@ func (f *ppFixture) captureNext(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	f.mu.Lock()
-	f.records["paypal/capture-next"] = Record{Key: "paypal/capture-next", Data: []byte(status)}
+	key := "paypal/capture-next"
+	if id := r.PathValue("id"); id != "" {
+		o, ok := f.readOrder(id)
+		if !ok || o.Status != "APPROVED" {
+			f.mu.Unlock()
+			w.WriteHeader(409)
+			return
+		}
+		key += "/" + id
+	}
+	f.records[key] = Record{Key: key, Data: []byte(status)}
 	f.mu.Unlock()
 	w.WriteHeader(204)
 }
@@ -298,9 +309,13 @@ func (f *ppFixture) mutate(route, id, key string, raw []byte) (PayPalRecord, boo
 		fx.Value, fx.Currency = u.Money.Value, u.Money.Currency
 		o.Status = "COMPLETED"
 		captureStatus := "COMPLETED"
-		if next, found := f.records["paypal/capture-next"]; found {
+		pendingKey := "paypal/capture-next/" + id
+		if _, found := f.records[pendingKey]; !found {
+			pendingKey = "paypal/capture-next" // Retain the original contract fixture route.
+		}
+		if next, found := f.records[pendingKey]; found {
 			captureStatus = string(next.Data)
-			delete(f.records, "paypal/capture-next")
+			delete(f.records, pendingKey)
 		}
 		if captureStatus == "DENIED" {
 			captureStatus = "DECLINED"

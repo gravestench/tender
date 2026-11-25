@@ -116,6 +116,7 @@ func (a *app) installPayPal(mux *http.ServeMux, storage tender.Store) (func(), e
 	mux.HandleFunc("POST /orders/{order}/wallet/{step}", a.owned(wallet.submit))
 	mux.HandleFunc("POST /operator/wallet/orders/{order}/refund", wallet.refund)
 	mux.HandleFunc("GET /operator/wallet/orders/{order}/fixture", wallet.fixture)
+	mux.HandleFunc("POST /operator/wallet/orders/{order}/{action}/{state}", wallet.fixtureControl)
 	mux.HandleFunc("GET /paypal.js", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/javascript")
 		io.WriteString(w, walletJS)
@@ -147,6 +148,62 @@ func (wc *walletCheckout) fixture(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(rec.Data)
+		return
+	}
+	http.NotFound(w, r)
+}
+
+// fixtureControl lets a local host test drive a provider capture transition.
+// The request stays in MOCK and is bound to this host's stored order.
+func (wc *walletCheckout) fixtureControl(w http.ResponseWriter, r *http.Request) {
+	if wc.operatorKey == "" || r.Header.Get("Origin") != "" || subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+wc.operatorKey)) != 1 {
+		http.NotFound(w, r)
+		return
+	}
+	action, state := r.PathValue("action"), r.PathValue("state")
+	if action != "capture-next" && action != "capture-status" ||
+		action == "capture-next" && state != "PENDING" && state != "DENIED" ||
+		action == "capture-status" && state != "COMPLETED" && state != "PENDING" && state != "DENIED" {
+		http.NotFound(w, r)
+		return
+	}
+	for _, o := range orders {
+		if r.PathValue("order") != o.ID {
+			continue
+		}
+		p, err := wc.engine.Get(r.Context(), o.PaymentID)
+		if err != nil || p.OrderID != o.ID || p.ProviderReference == "" || p.Provider != "paypal" {
+			http.NotFound(w, r)
+			return
+		}
+		rec, ok := wc.sim.Lookup("paypal/order/" + p.ProviderReference)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		var fixture struct{ Status string }
+		if json.Unmarshal(rec.Data, &fixture) != nil ||
+			action == "capture-next" && fixture.Status != "APPROVED" ||
+			action == "capture-status" && fixture.Status != "COMPLETED" {
+			http.Error(w, "fixture capture unavailable", http.StatusConflict)
+			return
+		}
+		path := "/simulator/fixture/orders/" + p.ProviderReference + "/capture-next/" + state
+		if action == "capture-status" {
+			path = "/simulator/fixture/orders/" + p.ProviderReference + "/capture-status/" + state
+		}
+		req, err := http.NewRequestWithContext(r.Context(), "POST", wc.origin+path, nil)
+		if err != nil {
+			http.Error(w, "fixture unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		res, err := wc.client.Do(req)
+		if err != nil {
+			http.Error(w, "fixture unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		res.Body.Close()
+		w.WriteHeader(res.StatusCode)
 		return
 	}
 	http.NotFound(w, r)

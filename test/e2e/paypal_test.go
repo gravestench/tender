@@ -21,6 +21,160 @@ const walletOperatorFixture = "local-paypal-operator-credential-only"
 
 // Exercise the host checkout, the provider fixture and the durable store.
 func TestPayPalDurableLifecycle(t *testing.T) {
+	t.Run("pending capture completes once after a verified transition and replay", func(t *testing.T) {
+		dsn, schema, cfg := demoSchema(t)
+		var paymentID string
+		t.Run("host", func(t *testing.T) {
+			d := launch(t, "TENDER_CONSUMER_PROVIDER=paypal", "TENDER_PAYPAL_MOCK_PRESENTATION=component", "TENDER_PAYPAL_OPERATOR_KEY="+walletOperatorFixture, "TENDER_CONSUMER_DATABASE_URL="+dsn, "TENDER_CONSUMER_SCHEMA="+schema)
+			guest, other := client(t, d.Origin), client(t, d.Origin)
+			p := request(t, guest, "GET", d.Guest, "", nil)
+			q := request(t, other, "GET", d.Account, "", nil)
+			base := d.Origin + p.path
+			fields := url.Values{"csrf": {token(t, p)}}
+			otherBase := d.Origin + q.path
+			otherFields := url.Values{"csrf": {token(t, q)}}
+			for _, step := range []string{"start", "approve"} {
+				if got := request(t, guest, "POST", base+"/wallet/"+step, d.Origin, fields); got.status != 200 {
+					t.Fatalf("%s: %d %s", step, got.status, got.body)
+				}
+				if got := request(t, other, "POST", otherBase+"/wallet/"+step, d.Origin, otherFields); got.status != 200 {
+					t.Fatalf("other %s: %d %s", step, got.status, got.body)
+				}
+			}
+			orderID := status(t, guest, base).OrderID
+			if got := walletFixtureTransition(t, guest, d.Origin, orderID, "capture-next", "PENDING", ""); got != 404 {
+				t.Fatalf("unauthenticated fixture control: %d", got)
+			}
+			if got := walletFixtureTransition(t, guest, d.Origin, orderID, "capture-next", "PENDING", walletOperatorFixture); got != 204 {
+				t.Fatalf("pending fixture setup: %d", got)
+			}
+			if got := request(t, other, "POST", otherBase+"/wallet/confirm", d.Origin, otherFields); got.status != 200 {
+				t.Fatalf("other confirm after targeted pending setup: %d %s", got.status, got.body)
+			}
+			if got := status(t, other, otherBase); got.Status != "captured" || !got.Fulfilled {
+				t.Fatalf("pending setup changed another order: %+v", got)
+			}
+			if got := request(t, guest, "POST", base+"/wallet/confirm", d.Origin, fields); got.status != 200 {
+				t.Fatalf("pending confirm: %d %s", got.status, got.body)
+			}
+			pending := status(t, guest, base)
+			paymentID = pending.PaymentID
+			if pending.Status != "pending" || pending.Fulfilled {
+				t.Fatalf("pending fulfilled an order: %+v", pending)
+			}
+			provider := walletProviderState(t, guest, d.Origin, orderID)
+			if len(provider.Units) != 1 || len(provider.Units[0].Payments.Captures) != 1 || provider.Units[0].Payments.Captures[0].Status != "PENDING" {
+				t.Fatalf("provider pending capture: %+v", provider)
+			}
+			if got := walletFixtureTransition(t, guest, d.Origin, orderID, "capture-status", "COMPLETED", walletOperatorFixture); got != 204 {
+				t.Fatalf("complete pending capture: %d", got)
+			}
+			deadline := time.Now().Add(12 * time.Second)
+			for {
+				completed := status(t, guest, base)
+				if completed.Status == "captured" && completed.Fulfilled {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("verified completion did not fulfill: %+v", completed)
+				}
+				time.Sleep(25 * time.Millisecond)
+			}
+			for range 2 {
+				if got := walletFixtureTransition(t, guest, d.Origin, orderID, "capture-status", "COMPLETED", walletOperatorFixture); got != 204 {
+					t.Fatalf("replayed completion: %d", got)
+				}
+			}
+			if got := status(t, other, otherBase); got.Status != "captured" || !got.Fulfilled {
+				t.Fatalf("other order changed: %+v", got)
+			}
+		})
+		if t.Failed() {
+			return
+		}
+		paypalResetPGlite(t, cfg)
+		t.Run("restart", func(t *testing.T) {
+			d := launch(t, "TENDER_CONSUMER_PROVIDER=paypal", "TENDER_PAYPAL_MOCK_PRESENTATION=component", "TENDER_CONSUMER_DATABASE_URL="+dsn, "TENDER_CONSUMER_SCHEMA="+schema)
+			c := client(t, d.Origin)
+			p := request(t, c, "GET", d.Guest, "", nil)
+			got := status(t, c, d.Origin+p.path)
+			if got.PaymentID != paymentID || got.Status != "captured" || !got.Fulfilled {
+				t.Fatalf("restart lost completion: %+v", got)
+			}
+		})
+		if t.Failed() {
+			return
+		}
+		conn := paypalInspect(t, cfg, schema)
+		var captures, events, outbox, fulfilled, other int
+		err := conn.QueryRow(t.Context(), `SELECT (SELECT count(*) FROM tender_operations WHERE payment_id=$1 AND record->>'Kind'='confirm' AND status='succeeded'), (SELECT count(*) FROM tender_provider_events WHERE provider='paypal' AND processed_at IS NOT NULL), (SELECT count(*) FROM tender_outbox WHERE payment_id=$1 AND consumed_at IS NOT NULL), (SELECT count(*) FROM consumer_fulfillments WHERE payment_id=$1), (SELECT count(*) FROM consumer_fulfillments WHERE payment_id<>$1)`, paymentID).Scan(&captures, &events, &outbox, &fulfilled, &other)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if captures != 1 || events != 3 || outbox != 1 || fulfilled != 1 || other != 1 {
+			t.Fatalf("pending completion counts: captures=%d events=%d outbox=%d fulfilled=%d other=%d", captures, events, outbox, fulfilled, other)
+		}
+	})
+	t.Run("denied capture never fulfills and survives restart", func(t *testing.T) {
+		dsn, schema, cfg := demoSchema(t)
+		var paymentID string
+		t.Run("host", func(t *testing.T) {
+			d := launch(t, "TENDER_CONSUMER_PROVIDER=paypal", "TENDER_PAYPAL_MOCK_PRESENTATION=component", "TENDER_PAYPAL_OPERATOR_KEY="+walletOperatorFixture, "TENDER_CONSUMER_DATABASE_URL="+dsn, "TENDER_CONSUMER_SCHEMA="+schema)
+			c := client(t, d.Origin)
+			p := request(t, c, "GET", d.Guest, "", nil)
+			base := d.Origin + p.path
+			fields := url.Values{"csrf": {token(t, p)}}
+			for _, step := range []string{"start", "approve"} {
+				if got := request(t, c, "POST", base+"/wallet/"+step, d.Origin, fields); got.status != 200 {
+					t.Fatalf("%s: %d %s", step, got.status, got.body)
+				}
+			}
+			orderID := status(t, c, base).OrderID
+			if got := walletFixtureTransition(t, c, d.Origin, orderID, "capture-next", "DENIED", walletOperatorFixture); got != 204 {
+				t.Fatalf("denied fixture setup: %d", got)
+			}
+			if got := request(t, c, "POST", base+"/wallet/confirm", d.Origin, fields); got.status != 409 {
+				t.Fatalf("denied confirm: %d %s", got.status, got.body)
+			}
+			got := status(t, c, base)
+			paymentID = got.PaymentID
+			if got.Status != "declined" || got.Fulfilled {
+				t.Fatalf("denied capture fulfilled: %+v", got)
+			}
+			provider := walletProviderState(t, c, d.Origin, orderID)
+			if len(provider.Units) != 1 || len(provider.Units[0].Payments.Captures) != 1 || provider.Units[0].Payments.Captures[0].Status != "DECLINED" {
+				t.Fatalf("provider denied capture: %+v", provider)
+			}
+			if got := walletFixtureTransition(t, c, d.Origin, orderID, "capture-status", "DENIED", walletOperatorFixture); got != 204 {
+				t.Fatalf("replayed denial: %d", got)
+			}
+		})
+		if t.Failed() {
+			return
+		}
+		paypalResetPGlite(t, cfg)
+		t.Run("restart", func(t *testing.T) {
+			d := launch(t, "TENDER_CONSUMER_PROVIDER=paypal", "TENDER_PAYPAL_MOCK_PRESENTATION=component", "TENDER_CONSUMER_DATABASE_URL="+dsn, "TENDER_CONSUMER_SCHEMA="+schema)
+			c := client(t, d.Origin)
+			p := request(t, c, "GET", d.Guest, "", nil)
+			got := status(t, c, d.Origin+p.path)
+			if got.PaymentID != paymentID || got.Status != "declined" || got.Fulfilled {
+				t.Fatalf("restart changed denial: %+v", got)
+			}
+		})
+		if t.Failed() {
+			return
+		}
+		conn := paypalInspect(t, cfg, schema)
+		var failed, events, outbox, fulfilled int
+		err := conn.QueryRow(t.Context(), `SELECT (SELECT count(*) FROM tender_operations WHERE payment_id=$1 AND record->>'Kind'='confirm' AND status='failed'), (SELECT count(*) FROM tender_provider_events WHERE provider='paypal' AND processed_at IS NOT NULL), (SELECT count(*) FROM tender_outbox WHERE payment_id=$1), (SELECT count(*) FROM consumer_fulfillments WHERE payment_id=$1)`, paymentID).Scan(&failed, &events, &outbox, &fulfilled)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if failed != 1 || events != 1 || outbox != 0 || fulfilled != 0 {
+			t.Fatalf("denied capture counts: failed=%d events=%d outbox=%d fulfilled=%d", failed, events, outbox, fulfilled)
+		}
+	})
 	t.Run("cancel reload and abandoned approval never collect funds", func(t *testing.T) {
 		dsn, schema, cfg := demoSchema(t)
 		var paymentID string
@@ -287,6 +441,20 @@ func paypalInspect(t *testing.T, cfg *pgx.ConnConfig, schema string) *pgx.Conn {
 	return conn
 }
 
+func paypalResetPGlite(t *testing.T, cfg *pgx.ConnConfig) {
+	t.Helper()
+	if os.Getenv("TENDER_TEST_PGLITE") != "1" {
+		return
+	}
+	conn, err := connectDemo(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 type walletFixtureOrder struct {
 	Status string `json:"status"`
 	Units  []struct {
@@ -313,6 +481,23 @@ func walletProviderState(t *testing.T, c *http.Client, origin, orderID string) w
 		t.Fatalf("provider fixture: %d", res.StatusCode)
 	}
 	return state
+}
+
+func walletFixtureTransition(t *testing.T, c *http.Client, origin, orderID, action, state, key string) int {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), "POST", origin+"/operator/wallet/orders/"+orderID+"/"+action+"/"+state, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	res, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	return res.StatusCode
 }
 
 func containsRefund(raw string, want int64) bool {
