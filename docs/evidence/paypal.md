@@ -1,0 +1,13 @@
+# PayPal wallet qualification
+
+Updated 2026-11-24. The direct PayPal Orders v2 and Payments v2 adapter uses US/USD capture-on-confirm and refund. The loopback simulator, memory/PostgreSQL contracts and Chromium consumer are **MOCK evidence**. Official merchant sandbox evidence is **BLOCKED**; the ordinary web wallet method is disabled under the strict on-page policy.
+
+| Scenario | Local observation | Official sandbox observation |
+| --- | --- | --- |
+| Approval, capture and refund | A synthetic approved buyer, authenticated order read and signed-fixture capture receipt bind to one scoped order. Duplicate callbacks and idempotent replay keep one collection. | **BLOCKED:** merchant REST app, seller and buyer accounts and genuine capture/refund records. |
+| Lost capture response and recovery | A pre-POST buyer digest survives a lost/malformed response; switched-buyer evidence is rejected. Signed callback plus authenticated read can resolve an abandoned reservation. | **BLOCKED:** genuine transaction webhook and provider order details. |
+| Rejection and timeout | Documented definitive 403/422 responses close only the rejected attempt. Unknown/mixed errors stay held; zero-dispatch timeout can retry. | **BLOCKED:** official negative cases and provider history. |
+| Browser containment | Chromium MOCK component approval stays on the same page; synthetic popup/redirect options are disabled before an order reservation. | **BLOCKED:** supported desktop/mobile provider SDK path, cookie settings and any approved popup policy. |
+| Settlement and fees | Local report reconciliation can flag ledger discrepancies; PayPal automatic report import is unsupported. | **BLOCKED:** genuine settlement, processor fees, payout and bank deposit comparison. |
+
+The read-only sandbox proof `TestPayPalSandboxTransaction` requires an original transaction-generated webhook, matching buyer, order and capture from the merchant's sandbox account, not a dashboard simulator event. Follow [the PayPal setup guide](../providers/paypal.md). Record timestamp, API/SDK version, merchant account, expected/observed totals, redacted order/capture/event IDs, device and navigation trace before changing this record to PASS. [PayPal webhook simulator limitations](https://developer.paypal.com/api/rest/webhooks/simulator/).

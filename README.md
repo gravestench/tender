@@ -1,30 +1,41 @@
 # Tender
 
-Tender is a Go module for applications that own their checkout and payment records. Its v1.0 target covers Visa and Mastercard acquiring, PayPal, Klarna, and ACH. The host owns order totals, checkout policy, fulfillment, storage configuration, and deployment.
+Tender is an independent Go payment library for applications that own their checkout and payment records. Its v1.0 target covers Visa and Mastercard acquiring, PayPal, Klarna and US ACH debit. The host owns trusted order totals, merchant eligibility, checkout policy, fulfillment, storage, operator review and deployment. The module path is `github.com/gravestench/tender`; Go 1.26 or newer is required.
 
-Tender is under development. Check the [capability matrix](docs/capabilities.md) before planning a provider integration. It records the target scope and which sandbox checks still need evidence.
+**Development status:** the four adapter protocols, embeddable HTTP simulator, durable PostgreSQL store, independent consumer and offline checks are under review. No provider is qualified for production, and full-scope `v1.0.0` is **not tagged**. Official sandbox access, genuine transaction and settlement proof, and mobile/desktop on-page checks are missing. See the [capability matrix](docs/capabilities.md) and [release ledger](docs/evidence/release-gates.md) before exposing a method.
 
-## Development
+## Use in a host
 
-The module path is `github.com/gravestench/tender`. Use Go 1.26 or newer.
+A host imports `github.com/gravestench/tender`, chooses a scoped provider adapter and a durable `Store`, then creates an `Engine` for that merchant and environment. Keep provider API keys server-side. The host passes its authenticated order ID, server-calculated amount and stable idempotency key; a browser cannot choose the amount. Mount verified callback handlers and run inbox, recovery, fulfillment and reconciliation workers. The [standalone consumer](examples/consumer/README.md) is an executable example using MOCK and local PostgreSQL. The [Blacktop integration seam](docs/blacktop-integration.md) maps these boundaries to its existing order flow without changing Blacktop.
+
+Use the [provider guides](docs/providers/adyen.md), [PayPal](docs/providers/paypal.md), [Klarna](docs/providers/klarna.md) and [ACH](docs/providers/ach.md) for exact scope and setup. Card entry belongs in Adyen hosted fields. ACH account entry belongs in the provider's Sessions browser path; real ACH remains disabled until a signed mandate design is approved. Ordinary PayPal and Klarna web approval is disabled under the strict no-redirect/no-unapproved-popup policy.
+
+## Verify locally
+
+The default unit suite is offline. A disposable PostgreSQL 17 database in `TENDER_TEST_DATABASE_URL` is needed for the tagged integration and browser suites. Install Node and the pinned Playwright runner with `npm ci`, then `npx playwright install chromium` for local Chromium checks. The browser suite also needs OpenSSL. Pull request CI provisions these dependencies.
 
 ```sh
 go build ./...
 go test ./...
 go test -race ./...
 go vet ./...
+go test -tags=integration ./test/contract/...
+go test -tags=e2e ./test/e2e/...
+(cd examples/consumer && GOWORK=off go build ./...)
 ```
 
-The default checks are offline. The [milestone backlog](docs/backlog.md) tracks the tagged contract, end-to-end, and sandbox suites. Sandbox verification uses a separate opt-in job with official test credentials.
+Official sandbox verification is a separate, protected manual workflow. Run only with the selected merchant's test credentials, registered HTTPS staging and sanitized provider records. Missing evidence produces a visible **BLOCKED** result. A local mock success never enables real traffic. [Evidence and workflow setup](docs/evidence/release-gates.md).
 
-## Design and release
+## Design, operations and release
 
-- [PostgreSQL setup and recovery](docs/storage.md)
+- [PostgreSQL migrations and recovery](docs/storage.md)
+- [Security boundary and threat model](docs/security.md)
+- [Host operations and activation](docs/operations.md)
 - [Architecture decisions](docs/adr/README.md)
 - [v1.0 implementation plan](docs/superpowers/plans/2026-11-24-tender-v1.md)
 - [Changelog](CHANGELOG.md)
 
-Tender follows semantic versioning. APIs may change during development. From v1.0, compatible changes use minor or patch releases, and breaking changes use a new Go module major version with migration guidance. Production activation requires separate approval for each merchant and provider.
+Tender follows semantic versioning. APIs may change during development. From v1.0, compatible changes use minor or patch releases and breaking changes use a new Go module major version with migration guidance. A library release and each merchant's production activation are separate decisions. Tender can reduce an application software dependency; an acquirer, wallet, financing provider or ACH originating bank still charges under its own agreement. Measure any Blacktop cost reduction against actual merchant fees and payout records.
 
 ## License
 

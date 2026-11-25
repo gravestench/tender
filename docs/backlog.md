@@ -24,7 +24,7 @@ The milestone numbers follow the Tender v1.0 implementation handoff. Exit criter
 - Adyen access and commercial onboarding for the reference cards slice.
 - PayPal sandbox seller and buyer credentials, plus wallet browser-flow validation.
 - Klarna regional product selection and playground access, plus embedded-flow validation.
-- ACH partner selection, contracting and sandbox access, plus checkout-compatible consent and return fixtures.
+- Adyen ACH/giact merchant contracting and sandbox access, plus approved signed-mandate handling, checkout-compatible consent and genuine return/report fixtures.
 - Protected sandbox secrets and a controlled HTTPS callback endpoint for each provider.
 - A merchant and provider-approved production pilot, including assessment scope, certification where applicable, and approval for narrowly scoped live transactions.
 

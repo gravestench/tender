@@ -1,0 +1,40 @@
+# Operations and merchant activation
+
+This guide describes the host work around Tender. The module does not run a listener, migration service, report downloader or fulfillment worker. A host supplies a trusted order, provider configuration, durable store, checkout, callback routes and operator controls. Start with [the independent consumer](../examples/consumer/README.md), then adapt the [Blacktop seam](blacktop-integration.md).
+
+## Bring up an environment
+
+1. Choose exactly one `Scope` per merchant and environment. Bind the `Engine` and adapter to the same provider account, currency and eligible market. Set an explicit method enable switch in the host; keep it off for any unqualified SANDBOX/LIVE route.
+2. Create a separate PostgreSQL database or schema and runtime role. Apply the [versioned migrations](storage.md) in order with a migration role, verify a restore, then start the application pool with the intended search path on every connection. Do not let runtime code create or drop payment tables.
+3. Configure the exact provider host, account, API key, signing keys and registered HTTPS origin. Inject secrets from a protected source and redact URL queries, request bodies and credentials from request logging. Mount provider callbacks on authenticated/verified HTTPS routes. MOCK uses only loopback endpoints and synthetic keys.
+4. Start workers for pending verified inbox receipts, recovery of uncertain operations, outbox fulfillment, capture-failure review and authenticated settlement reconciliation. Each worker needs a scoped lease or idempotent destination. Alert if a receipt or unknown outcome exceeds the documented recovery window.
+5. Exercise offline tests and a protected provider sandbox qualification. Compare host amount, currency, provider reference, action and status to genuine provider records. Enable a method only for its tested merchant, device and browser modes after approval.
+
+## Financial processing
+
+A successful `Engine.Create` or a browser approval is not a fulfillment signal. The host may fulfill only a committed, verified full-collection outbox entry and must atomically deduplicate it with its own order ledger. Keep the original order ID and trusted total immutable. An unresolved result or `ErrUnknownOutcome` stops another monetary operation while the engine recovers using its reserved provider key.
+
+Deliver callbacks in two stages. The HTTP handler verifies the provider signature or postback and durably stores a normalized receipt, then returns its acknowledgment. A worker calls the provider-specific `Process` method and retries pending receipts until they are applied or an operator resolves a correlation conflict. Poll the inbox after restart even when `OnStored` is used. A callback can arrive before the HTTP response and must remain available for later processing. See [storage](storage.md) for transaction and worker queries.
+
+A verified `CAPTURE_FAILED` holds collection and creates a durable review item. A later failure does not erase the original capture or outbox history; the host reviews compensation. ACH is initially pending, may settle days later, and may return after settlement. Never turn an ACH authorization into guaranteed cash or infer a bank account's approval from a synthetic fixture. Provider settlement records and a bank deposit must be compared separately.
+
+The host authenticates and downloads each processor report. It normalizes only permitted fields, then calls reconciliation using a stable report identity, provider, merchant and environment. Tender stores matching, discrepancy and resolution history without changing payment funds or fulfillment. Investigate unmatched references, changed report content, amount/currency differences, fee/net arithmetic, returns and duplicate payout rows. Keep report ingestion read-only with respect to the provider; unsupported feeds report `ErrUnsupported`. Hosts choose the schedule, alert thresholds and who may clear discrepancies.
+
+## Monitoring and incident playbooks
+
+Emit redacted metrics by merchant, environment, provider and method: API latency and status, rate limits, pending operations, unknown outcomes, oldest unprocessed verified receipt, outbox delivery age, capture-failure review age, settlement report lag and open discrepancies. Correlation IDs should be opaque scoped payment/operation IDs, never a card, bank or buyer secret. Log stage, status and error kind; exclude provider raw request/response bodies.
+
+| Incident | Immediate host action | Recovery evidence |
+| --- | --- | --- |
+| Provider API outage or timeout | Disable new starts for that method; retain reservations; leave uncertain operations held. | Re-query with the original provider key where supported; process signed events and report rows. |
+| Callback outage or invalid signatures | Keep the method disabled if collection cannot be verified; restore HTTPS route and keys. | Drain pending receipts, inspect provider delivery history and correlate exact account/payment references. |
+| Capture failure or ACH return | Stop further fulfillment if possible and open the durable review item. | Compare signed event, original operation, report row and customer order; record any compensation once. |
+| Report mismatch or missing payout | Suspend automated closeout for affected scope; preserve both original report and discrepancy history. | Re-download authenticated report, compare provider portal, fee/net arithmetic and bank deposit. |
+| Credential compromise | Disable the route; rotate provider and callback credentials; preserve audit data. | Review transaction and callback history since exposure, then requalify the route. |
+| Database restore | Stop all writers, restore the full store and host fulfillment ledger together or reconcile their split state. | Compare provider records, pending keys, inbox/outbox and reports before resuming. |
+
+## Release and production controls
+
+The offline suite exercises synthetic provider HTTP contracts and browser containment. The protected sandbox suite must use the same adapter against genuine test endpoints and a controlled HTTPS callback. Missing credentials or provider records produce a visible **BLOCKED** failure. Do not put sandbox secrets in pull request jobs or run LIVE transactions in CI. [Current evidence](evidence/release-gates.md) lists the remaining gates.
+
+A library release does not activate a merchant. For each provider, obtain commercial approval and fee terms, determine assessment and mandate obligations, verify supported regions/currencies and browser modes, approve credentials, run a low-value live pilot, reconcile authorization/capture/refund or return and bank deposit, then enable broader traffic with a rollback switch. Tender cannot eliminate acquiring, PayPal, Klarna, originating bank or network fees. Compare an actual merchant quote and observed effective cost against Blacktop's existing stack before claiming savings.

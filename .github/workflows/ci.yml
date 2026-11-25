@@ -30,6 +30,11 @@ jobs:
         run: go test -race ./...
       - name: Vet
         run: go vet ./...
+      - name: Independent consumer build
+        working-directory: examples/consumer
+        env:
+          GOWORK: 'off'
+        run: go build ./...
 
   postgres:
     runs-on: ubuntu-latest
@@ -52,7 +57,41 @@ jobs:
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: '1.26.x'
-      - name: PostgreSQL storage contract
+      - name: PostgreSQL and provider contracts
         env:
           TENDER_TEST_DATABASE_URL: postgres://postgres:tender_test@127.0.0.1:${{ job.services.postgres.ports[5432] }}/tender_test?sslmode=disable
-        run: go test -race -tags=integration -count=1 -timeout=2m ./test/contract/... -run '^TestPostgres'
+        run: go test -race -tags=integration -count=1 -timeout=4m ./test/contract/...
+
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17.11
+        env:
+          POSTGRES_DB: tender_test
+          POSTGRES_PASSWORD: tender_test
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U postgres -d tender_test"
+          --health-interval 5s --health-timeout 3s --health-retries 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: '1.26.x'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install pinned browser runner
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Install Chromium and OS dependencies
+        run: npx playwright install --with-deps chromium
+      - name: Offline browser and durable consumer
+        env:
+          TENDER_TEST_DATABASE_URL: postgres://postgres:tender_test@127.0.0.1:${{ job.services.postgres.ports[5432] }}/tender_test?sslmode=disable
+        run: go test -race -count=1 -timeout=5m -tags=e2e,integration ./test/e2e/...

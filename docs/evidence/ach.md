@@ -1,0 +1,12 @@
+# US ACH debit qualification
+
+Updated 2026-11-24. The reference route is Adyen Checkout v72 Sessions with Adyen Web 6.45.2 and giact consumer ecommerce for one-time US/USD WEB debits. Its default browser path sends account fields to Adyen, while Go receives only session and projected payment evidence. MOCK contracts exercise authorization, a signed failure hold, settlement, return after settlement, report matching, lost response and idempotent replay. Official ACH compatibility is **BLOCKED**.
+
+| Scenario | Local observation | Official merchant observation |
+| --- | --- | --- |
+| Bank entry and consent | Synthetic browser component stays on page and the host receives no bank account/routing field. | **BLOCKED:** ACH/giact enrollment, registered origin, credentialed browser transport and a merchant-approved signed mandate presentation/retention design. |
+| Debit and refusal | The fixture reports pending authorization or refusal; signed correlated failure creates a review hold. | **BLOCKED:** actual provider test debit, giact validation outcome and generated signed receipt. |
+| Settlement and return | Signed/host-authenticated projected evidence can record gross settlement and later return without erasing collection history. | **BLOCKED:** genuine settled and returned test debit, corresponding Standard events and Settlement details report. |
+| Bank reach and price | ACH network routing can cover eligible personal bank/credit-union accounts through the provider. | **BLOCKED:** account-specific acceptance, fee quote and actual net payout. |
+
+`TestACHSandboxSessions` probes an activated merchant's official test session and pinned browser component. `TestACHSandboxReport` compares exported host identity with two genuine provider CSV rows. They require separate evidence and do not constitute a signed mandate. Follow [the ACH setup guide](../providers/ach.md) and [partner decision](../adr/0005-us-ach-partner.md). Record merchant, UTC time, API/SDK version, consent version, device, expected/observed status, sanitized PSP/modification references, amount and bank deposit evidence. Never record bank numbers or account holder personal data.

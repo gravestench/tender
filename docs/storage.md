@@ -6,13 +6,14 @@ Tender stores the host order claim, payment, attempt and operation reservation b
 
 Use PostgreSQL 17 with a UTF-8 database. Choose a schema where only trusted roles can create objects. Set that schema as the search path for the migration session and **every** connection in the application pool. The example uses an existing schema named `tender`.
 
-Apply outstanding `migrations/*.up.sql` files in lexicographic order before starting workers. Each script contains `BEGIN` and `COMMIT`. Record each successfully applied version in the host migration ledger. A fresh installation needs `001_initial`, `002_reference_integrity` and `003_capture_failures`. Existing installations apply each version after their last recorded migration. The scripts are also available through `postgres.Migrations` in Go.
+Apply outstanding `migrations/*.up.sql` files in lexicographic order before starting workers. Each script contains `BEGIN` and `COMMIT`. Record each successfully applied version in the host migration ledger. A fresh installation needs `001_initial`, `002_reference_integrity`, `003_capture_failures` and `004_reconciliation_digest`. Existing installations apply each version after their last recorded migration. The scripts are also available through `postgres.Migrations` in Go.
 
 ```sh
 PGOPTIONS='-c search_path=tender' psql "$TENDER_MIGRATION_DSN" -X -v ON_ERROR_STOP=1 \
   -f store/postgres/migrations/001_initial.up.sql \
   -f store/postgres/migrations/002_reference_integrity.up.sql \
-  -f store/postgres/migrations/003_capture_failures.up.sql
+  -f store/postgres/migrations/003_capture_failures.up.sql \
+  -f store/postgres/migrations/004_reconciliation_digest.up.sql
 ```
 
 Grant the runtime role schema usage, table privileges for its operations, and sequence usage for inserts. Reserve DDL for the migration role. The host owns the SQL driver, pool, credentials, network settings and shutdown. With pgx v5, a PostgreSQL URL can include `search_path=tender` and `sslmode=verify-full` for a remote database. Configure a trusted CA for the server certificate. The `store/postgres` package uses the Go standard library and accepts a pool opened with any PostgreSQL `database/sql` driver that supports serializable transactions and SQLSTATE errors via `SQLState() string`.
@@ -103,12 +104,14 @@ WHERE (merchant_id, environment, provider, merchant_account) = ($1,$2,$3,$4)
 
 The reconciliation history foreign key checks the matched payment's scope, provider and account against the run. Applying `002` validates this constraint against existing rows and rolls back the migration if a historical payment belongs to a different route. Review the report and affected history before correcting a prior mismatch.
 
-For a reconciliation run, commit its start before processing. Append one history row per result or subsequent resolution, and commit the final batch and run completion together.
+`Engine.Reconcile(ctx, SettlementReport)` accepts a host-authenticated normalized feed. The `FeedHostVerified` marker is an assertion by trusted host code, not an authentication mechanism for shopper input. Provider auto-download feeds return `ErrUnsupported` until implemented. One transaction records the report, its input digest, projected lines, run and result history; an exact replay does not duplicate results. Reusing a report ID with changed contents records `report_conflict` and returns `ErrConflict`. Reprocessing after an unmatched line becomes resolvable appends a resolution without rewriting its earlier discrepancy. Reconciliation does not modify payment funds or the fulfillment outbox. For ACH, apply the independently authenticated Adyen report through the ACH signed-report path before interpreting ledger comparison as settlement authority. Query `ReconciliationHistory` for the full audit and `OpenReconciliationDiscrepancies` for the latest unresolved state by scoped report line. The host owns download authentication, scheduling, alerting and operator review.
+
+The underlying run/history SQL can also support host inspection. Preserve the original report identity and projected input digest on every replay.
 
 ```sql
 INSERT INTO tender_reconciliation_runs
-    (merchant_id, environment, provider, merchant_account, run_id, report_id)
-VALUES ($1,$2,$3,$4,$5,$6);
+    (merchant_id, environment, provider, merchant_account, run_id, report_id, input_digest)
+VALUES ($1,$2,$3,$4,$5,$6,$7);
 
 INSERT INTO tender_reconciliation_history
     (merchant_id, environment, provider, merchant_account, run_id, line_id,
@@ -121,10 +124,11 @@ WHERE (merchant_id, environment, provider, merchant_account, run_id) = ($1,$2,$3
 
 ## Rollback
 
-Before deployment, back up existing Tender data and verify restore access. A code rollback can keep a compatible schema. Before removing the initial schema, stop all Tender writers and workers, identify pending operations and outbox work, and preserve the full database for recovery. On a disposable database or after the host has explicitly approved deleting the records, run the down migrations in reverse order using the same role and search path. Downgrading `003` removes the capture failure review queue and its evidence lookup index. Preserve its review history first. Downgrading `002` restores full-width reference indexes and fails atomically if a stored reference exceeds the old B-tree limit. Preserve the references and the current schema in that case.
+Before deployment, back up existing Tender data and verify restore access. A code rollback can keep a compatible schema. Before removing the initial schema, stop all Tender writers and workers, identify pending operations and outbox work, and preserve the full database for recovery. On a disposable database or after the host has explicitly approved deleting the records, run the down migrations in reverse order using the same role and search path. Downgrading `004` removes the reconciliation run input digest and weakens same-ID content conflict detection; retain a backup and do not process reports with older code. Downgrading `003` removes the capture failure review queue and its evidence lookup index. Preserve its review history first. Downgrading `002` restores full-width reference indexes and fails atomically if a stored reference exceeds the old B-tree limit. Preserve the references and the current schema in that case.
 
 ```sh
 PGOPTIONS='-c search_path=tender' psql "$TENDER_MIGRATION_DSN" -X -v ON_ERROR_STOP=1 \
+  -f store/postgres/migrations/004_reconciliation_digest.down.sql \
   -f store/postgres/migrations/003_capture_failures.down.sql \
   -f store/postgres/migrations/002_reference_integrity.down.sql \
   -f store/postgres/migrations/001_initial.down.sql

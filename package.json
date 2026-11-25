@@ -1,0 +1,9 @@
+{
+  "name": "tender-offline-browser-tests",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Pinned browser runner for Tender's offline checkout checks",
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}

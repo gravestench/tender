@@ -1,0 +1,103 @@
+name: Protected provider sandbox qualification
+
+on:
+  workflow_dispatch:
+    inputs:
+      qualification:
+        description: 'Run one real provider test against controlled HTTPS test infrastructure'
+        required: true
+        type: choice
+        options:
+          - adyen_browser
+          - adyen_portal
+          - paypal_transaction
+          - klarna_order
+          - ach_sessions
+          - ach_report
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sandbox-${{ inputs.qualification }}
+  cancel-in-progress: false
+
+jobs:
+  qualification:
+    environment: sandbox
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PAYMENTS_ENV: sandbox
+      TENDER_ADYEN_API_KEY: ${{ secrets.TENDER_ADYEN_API_KEY }}
+      TENDER_ADYEN_CLIENT_KEY: ${{ secrets.TENDER_ADYEN_CLIENT_KEY }}
+      TENDER_ADYEN_MERCHANT_ACCOUNT: ${{ secrets.TENDER_ADYEN_MERCHANT_ACCOUNT }}
+      TENDER_ADYEN_HMAC_KEY: ${{ secrets.TENDER_ADYEN_HMAC_KEY }}
+      TENDER_ADYEN_VISA_ORIGIN: ${{ vars.TENDER_ADYEN_VISA_ORIGIN }}
+      TENDER_ADYEN_MC_ORIGIN: ${{ vars.TENDER_ADYEN_MC_ORIGIN }}
+      TENDER_ADYEN_VISA_CHALLENGE_TICKET: ${{ secrets.TENDER_ADYEN_VISA_CHALLENGE_TICKET }}
+      TENDER_ADYEN_MC_FRICTIONLESS_TICKET: ${{ secrets.TENDER_ADYEN_MC_FRICTIONLESS_TICKET }}
+      TENDER_ADYEN_MC_PURCHASE_TICKET: ${{ secrets.TENDER_ADYEN_MC_PURCHASE_TICKET }}
+      TENDER_ADYEN_TEST_ACS_ORIGIN: ${{ vars.TENDER_ADYEN_TEST_ACS_ORIGIN }}
+      TENDER_ADYEN_EVIDENCE_ORDER: ${{ secrets.TENDER_ADYEN_EVIDENCE_ORDER }}
+      TENDER_CONSUMER_DATABASE_URL: ${{ secrets.TENDER_CONSUMER_DATABASE_URL }}
+      TENDER_CONSUMER_SCHEMA: ${{ vars.TENDER_CONSUMER_SCHEMA }}
+      TENDER_PAYPAL_CLIENT_ID: ${{ secrets.TENDER_PAYPAL_CLIENT_ID }}
+      TENDER_PAYPAL_SECRET: ${{ secrets.TENDER_PAYPAL_SECRET }}
+      TENDER_PAYPAL_MERCHANT_ACCOUNT: ${{ secrets.TENDER_PAYPAL_MERCHANT_ACCOUNT }}
+      TENDER_PAYPAL_WEBHOOK_ID: ${{ secrets.TENDER_PAYPAL_WEBHOOK_ID }}
+      TENDER_KLARNA_API_KEY: ${{ secrets.TENDER_KLARNA_API_KEY }}
+      TENDER_ACH_TEST_ORIGIN: ${{ vars.TENDER_ACH_TEST_ORIGIN }}
+      TENDER_ACH_GIACT_ENABLED: ${{ vars.TENDER_ACH_GIACT_ENABLED }}
+      ADYEN_ACCOUNTING_CSV_B64: ${{ secrets.TENDER_ADYEN_ACCOUNTING_CSV_B64 }}
+      PAYPAL_PROOF_B64: ${{ secrets.TENDER_PAYPAL_SANDBOX_PROOF_B64 }}
+      KLARNA_HOST_EVIDENCE_B64: ${{ secrets.TENDER_KLARNA_HOST_EVIDENCE_B64 }}
+      ACH_HOST_EVIDENCE_B64: ${{ secrets.TENDER_ACH_HOST_EVIDENCE_B64 }}
+      ACH_SETTLED_CSV_B64: ${{ secrets.TENDER_ACH_SETTLED_CSV_B64 }}
+      ACH_RETURNED_CSV_B64: ${{ secrets.TENDER_ACH_RETURNED_CSV_B64 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: '1.26.x'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install pinned browser runner
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Prepare protected evidence paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          write_evidence() {
+            local value="$1" name="$2" variable="$3" path
+            path="$RUNNER_TEMP/$name"
+            if [[ -n "$value" ]]; then printf '%s' "$value" | base64 -d > "$path"; fi
+            printf '%s=%s\n' "$variable" "$path" >> "$GITHUB_ENV"
+          }
+          write_evidence "$ADYEN_ACCOUNTING_CSV_B64" adyen-accounting.csv TENDER_ADYEN_ACCOUNTING_CSV
+          write_evidence "$PAYPAL_PROOF_B64" paypal-proof.json TENDER_PAYPAL_SANDBOX_PROOF_FILE
+          write_evidence "$KLARNA_HOST_EVIDENCE_B64" klarna-host.json TENDER_KLARNA_HOST_EVIDENCE
+          write_evidence "$ACH_HOST_EVIDENCE_B64" ach-host.json TENDER_ACH_HOST_EVIDENCE
+          write_evidence "$ACH_SETTLED_CSV_B64" ach-settled.csv TENDER_ACH_SETTLED_CSV
+          write_evidence "$ACH_RETURNED_CSV_B64" ach-returned.csv TENDER_ACH_RETURNED_CSV
+      - name: Run selected official test
+        shell: bash
+        run: |
+          set -euo pipefail
+          case '${{ inputs.qualification }}' in
+            adyen_browser) pattern='^TestAdyenSandboxBrowser$' ;;
+            adyen_portal) pattern='^TestAdyenSandboxPortal$' ;;
+            paypal_transaction) pattern='^TestPayPalSandboxTransaction$' ;;
+            klarna_order) pattern='^TestKlarnaSandboxOrderRecord$' ;;
+            ach_sessions) pattern='^TestACHSandboxSessions$' ;;
+            ach_report) pattern='^TestACHSandboxReport$' ;;
+            *) exit 2 ;;
+          esac
+          go test -count=1 -timeout=8m -tags=sandbox ./test/sandbox/... -run "$pattern" -v
