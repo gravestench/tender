@@ -38,6 +38,10 @@ type memoryTx struct {
 	captureFailures []tender.CaptureFailureNotice
 	adverse         map[tender.AdverseKey]tender.AdverseNotice
 	returnClaims    map[returnClaimKey]returnClaimOwner
+	bankReviews     map[bankReviewKey]tender.BankDepositResult
+	bankHistory     []tender.BankDepositResult
+	bankClaims      map[bankClaimKey]bankClaimOwner
+	bankReferences  map[bankReferenceKey]bankClaimOwner
 }
 
 // Memory serializes transactions and publishes a new snapshot only on commit.
@@ -47,7 +51,7 @@ type Memory struct {
 }
 
 func NewMemory() *Memory {
-	return &Memory{lock: make(chan struct{}, 1), state: memoryTx{events: make(map[tender.VerifiedEventKey]inboxEvent), payments: make(map[key]tender.Payment), operations: make(map[key]tender.OperationRecord), adverse: make(map[tender.AdverseKey]tender.AdverseNotice), returnClaims: make(map[returnClaimKey]returnClaimOwner)}}
+	return &Memory{lock: make(chan struct{}, 1), state: memoryTx{events: make(map[tender.VerifiedEventKey]inboxEvent), payments: make(map[key]tender.Payment), operations: make(map[key]tender.OperationRecord), adverse: make(map[tender.AdverseKey]tender.AdverseNotice), returnClaims: make(map[returnClaimKey]returnClaimOwner), bankReviews: make(map[bankReviewKey]tender.BankDepositResult), bankClaims: make(map[bankClaimKey]bankClaimOwner), bankReferences: make(map[bankReferenceKey]bankClaimOwner)}}
 }
 
 func (m *Memory) acquire(ctx context.Context) error {
@@ -73,6 +77,7 @@ func (m *Memory) Transact(ctx context.Context, fn func(tender.Tx) error) error {
 		history: slices.Clone(m.state.history), outbox: slices.Clone(m.state.outbox), captureFailures: slices.Clone(m.state.captureFailures),
 		adverse:      maps.Clone(m.state.adverse),
 		returnClaims: maps.Clone(m.state.returnClaims),
+		bankReviews:  maps.Clone(m.state.bankReviews), bankHistory: slices.Clone(m.state.bankHistory), bankClaims: maps.Clone(m.state.bankClaims), bankReferences: maps.Clone(m.state.bankReferences),
 	}
 	if err := fn(&tx); err != nil {
 		return err

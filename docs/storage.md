@@ -6,7 +6,7 @@ Tender stores the host order claim, payment, attempt and operation reservation b
 
 Use PostgreSQL 17 with a UTF-8 database. Choose a schema where only trusted roles can create objects. Set that schema as the search path for the migration session and **every** connection in the application pool. The example uses an existing schema named `tender`.
 
-Apply outstanding `migrations/*.up.sql` files in lexicographic order before starting workers. Each script contains `BEGIN` and `COMMIT`. Record each successfully applied version in the host migration ledger. A fresh installation applies `001` through `007`. If your `v0.1.0-alpha.1` schema has migrations through `004`, apply `005_payout_batches`, `006_adverse_review`, and `007_return_evidence_claims` in that order. For other installations, start after the last recorded version. The scripts are also available through `postgres.Migrations` in Go.
+Apply outstanding `migrations/*.up.sql` files in lexicographic order before starting workers. Each script contains `BEGIN` and `COMMIT`. Record each successfully applied version in the host migration ledger. A fresh installation applies `001` through `008`. If your `v0.1.0-alpha.1` schema has migrations through `004`, apply `005_payout_batches`, `006_adverse_review`, `007_return_evidence_claims`, and `008_bank_deposits` in that order. For other installations, start after the last recorded version. The scripts are also available through `postgres.Migrations` in Go.
 
 ```sh
 PGOPTIONS='-c search_path=tender' psql "$TENDER_MIGRATION_DSN" -X -v ON_ERROR_STOP=1 \
@@ -16,7 +16,8 @@ PGOPTIONS='-c search_path=tender' psql "$TENDER_MIGRATION_DSN" -X -v ON_ERROR_ST
   -f store/postgres/migrations/004_reconciliation_digest.up.sql \
   -f store/postgres/migrations/005_payout_batches.up.sql \
   -f store/postgres/migrations/006_adverse_review.up.sql \
-  -f store/postgres/migrations/007_return_evidence_claims.up.sql
+  -f store/postgres/migrations/007_return_evidence_claims.up.sql \
+  -f store/postgres/migrations/008_bank_deposits.up.sql
 ```
 
 Grant the runtime role schema usage, table privileges for its operations, and sequence usage for inserts. Reserve DDL for the migration role. The host owns the SQL driver, pool, credentials, network settings and shutdown. With pgx v5, a PostgreSQL URL can include `search_path=tender` and `sslmode=verify-full` for a remote database. Configure a trusted CA for the server certificate. The `store/postgres` package uses the Go standard library and accepts a pool opened with any PostgreSQL `database/sql` driver that supports serializable transactions and SQLSTATE errors via `SQLState() string`.
@@ -115,12 +116,13 @@ WHERE (merchant_id, environment, provider, merchant_account, run_id) = ($1,$2,$3
 
 Before deployment, back up existing Tender data and verify restore access. A code rollback can keep a compatible schema. Before removing the initial schema, stop all Tender writers and workers, identify pending operations and outbox work, and preserve the full database for recovery. On a disposable database or after the host has explicitly approved deleting the records, run the down migrations in reverse order using the same role and search path.
 
-Run `007_return_evidence_claims.down.sql` before `006_adverse_review.down.sql` because the claims table references adverse reviews and settlement rows. Downgrading `007` deletes the links that bind each verified adverse event to one settlement row. Back up those claims before downgrading and restore them before resuming return reconciliation that depends on them. Downgrading `006` removes adverse review records. Downgrading `005` removes payout source projections and result history. Retain each history before removing its migration.
+Run `008_bank_deposits.down.sql` before `007_return_evidence_claims.down.sql` and `005_payout_batches.down.sql`. Downgrading `008` permanently deletes bank deposit reviews, immutable verdict history, and bank movement/reference claims. Export and back up those records first, stop bank ingestion, and do not resume on older code until the statement evidence and claims are restored or independently reconciled. Run `007_return_evidence_claims.down.sql` before `006_adverse_review.down.sql` because the claims table references adverse reviews and settlement rows. Downgrading `007` deletes the links that bind each verified adverse event to one settlement row. Back up those claims before downgrading and restore them before resuming return reconciliation that depends on them. Downgrading `006` removes adverse review records. Downgrading `005` removes payout source projections and result history. Retain each history before removing its migration.
 
 Downgrading `004` removes the reconciliation run input digest and weakens same-ID content conflict detection. Retain a backup and suspend report processing on older code. Downgrading `003` removes the capture failure review queue and its evidence lookup index. Preserve its review history first. Downgrading `002` restores full-width reference indexes and fails atomically if a stored reference exceeds the old B-tree limit. Preserve the references and the current schema in that case.
 
 ```sh
 PGOPTIONS='-c search_path=tender' psql "$TENDER_MIGRATION_DSN" -X -v ON_ERROR_STOP=1 \
+  -f store/postgres/migrations/008_bank_deposits.down.sql \
   -f store/postgres/migrations/007_return_evidence_claims.down.sql \
   -f store/postgres/migrations/006_adverse_review.down.sql \
   -f store/postgres/migrations/005_payout_batches.down.sql \
@@ -140,3 +142,11 @@ Provide a disposable database using a role with `CREATE` on that database. Each 
 TENDER_TEST_DATABASE_URL='postgres://tender_test@localhost/tender_test?sslmode=disable' \
   go test -race -count=1 -tags=integration ./test/contract/... -run '^TestPostgres'
 ```
+
+### Independent bank deposit review
+
+`Engine.ReconcileBankDeposit` accepts a host-authenticated projection of one bank statement movement after a processor payout has been reconciled. The host must authenticate the independent statement, assign an opaque destination bank-account token and a stable movement ID, preserve the original statement outside Tender, and supply its SHA-256 digest, canonical payout reference, booking time, currency and merchant-positive minor-unit amount. Tender accepts only bounded opaque tokens and the digest; it does not accept bank account numbers, holder details, or statement text. A digest records artifact identity, not proof that the bank issued it.
+
+The bank result is separate from `PayoutMatched`. It is `matched` only when the latest persisted scoped provider payout result is `PayoutMatched`, its payout reference, currency and positive amount exactly equal the bank evidence, and the bank movement and scoped provider payout reference have not been claimed by another payout. Missing or unconfirmed provider history cannot produce a bank match. Mismatches and reused identities stay visible as separate review results; a changed statement digest or financial content under the same bank movement ID is a conflict. An identical replay is idempotent. If the provider payout is later demoted, the same reconciliation transaction changes the current bank verdict to `provider_unconfirmed` and appends an immutable history row without waiting for bank replay; the original movement claim remains reserved. A later provider restoration does not automatically restore the bank match. Explicit replay of the same bank evidence against the restored provider payout may restore it and appends another history row. SQL writes are transactional. A serialization conflict should be retried with the same evidence, never a new movement ID.
+
+The PostgreSQL store has trusted reconciliation history and supports this comparison. The memory reference store does not implement `ReconciliationTx`; it models claim isolation but `ReconcileBankDeposit` returns `ErrUnsupported` there. No bank result changes payment funds, settlement principal, or fulfillment. Before production acceptance, compare actual authenticated provider report artifacts and the original independent bank statement for the same merchant, bank destination, payout, and time window. The host must prove that its extracted canonical reference actually appears on that statement.

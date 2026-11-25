@@ -116,6 +116,21 @@ func (t *transaction) AppendPayoutReconciliationResult(scope tender.Scope, provi
 		return err
 	}
 	_, err = t.tx.ExecContext(t.ctx, `INSERT INTO tender_reconciliation_payout_history(merchant_id,environment,provider,merchant_account,run_id,payout_id,outcome,evidence) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, scope.MerchantID, scope.Environment, provider, account, runID, r.PayoutID, r.Outcome, string(raw))
+	if err != nil || r.Outcome == tender.PayoutMatched {
+		return dbError(err)
+	}
+	// A later provider discrepancy invalidates an operational bank match in
+	// this same transaction. Keep the original claim and append the verdict.
+	_, err = t.tx.ExecContext(t.ctx, `WITH demoted AS (
+	  UPDATE tender_bank_deposit_reviews
+	  SET outcome=$7,evidence=jsonb_set(evidence,'{Outcome}',to_jsonb($7::text)),recorded_at=CURRENT_TIMESTAMP
+	  WHERE merchant_id=$1 AND environment=$2 AND provider=$3 AND merchant_account=$4 AND report_id=$5 AND payout_id=$6 AND outcome='matched'
+	  RETURNING merchant_id,environment,provider,merchant_account,report_id,payout_id,bank_account_token,movement_id,outcome,evidence,recorded_at
+	)
+	INSERT INTO tender_bank_deposit_review_history
+	  (merchant_id,environment,provider,merchant_account,report_id,payout_id,bank_account_token,movement_id,outcome,evidence,recorded_at)
+	SELECT merchant_id,environment,provider,merchant_account,report_id,payout_id,bank_account_token,movement_id,outcome,evidence,recorded_at FROM demoted`,
+		scope.MerchantID, scope.Environment, provider, account, runID, r.PayoutID, tender.BankDepositProviderUnconfirmed)
 	return dbError(err)
 }
 
