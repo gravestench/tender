@@ -35,6 +35,13 @@ type Adyen struct {
 	keys [][]byte
 }
 
+// merchantOperationReferenceReader lets a dispute distinguish its own new
+// modification PSP from a reference already bound to any operation on this
+// provider route. Stores without this read fail closed for card disputes.
+type merchantOperationReferenceReader interface {
+	OperationByMerchantReference(tender.Scope, string, string, string) (tender.OperationRecord, error)
+}
+
 func NewAdyen(c AdyenConfig) (*Adyen, error) {
 	if c.Store == nil || c.Engine == nil || c.Scope.Validate() != nil || c.MerchantAccount == "" || len(c.HMACKeys) == 0 {
 		return nil, tender.ErrValidation
@@ -267,7 +274,11 @@ func (h *Adyen) adverse(tx tender.EventRecords, id string, e evidence) (tender.A
 		n.Kind = "chargeback"
 		// A modification PSP belonging to an operation is not an independent
 		// dispute identity. Do not let such a collision authorize a return.
-		if _, err := tx.OperationByReference(h.cfg.Scope, p.ID, e.PSP); err == nil {
+		lookup, ok := tx.(merchantOperationReferenceReader)
+		if !ok {
+			return tender.AdverseNotice{}, tender.ErrUnsupported
+		}
+		if _, err := lookup.OperationByMerchantReference(h.cfg.Scope, "adyen", e.Account, e.PSP); err == nil {
 			return tender.AdverseNotice{}, tender.ErrConflict
 		} else if !errors.Is(err, tender.ErrNotFound) {
 			return tender.AdverseNotice{}, err
