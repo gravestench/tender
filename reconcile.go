@@ -309,7 +309,7 @@ func (e *Engine) Reconcile(ctx context.Context, report SettlementReport) (Reconc
 			for _, r := range history {
 				latest[r.LineID] = r
 			}
-			results, err := e.matchSettlementLines(tx, report.Lines)
+			results, err := e.matchSettlementLines(base, tx, report.Lines)
 			if err != nil {
 				return err
 			}
@@ -359,7 +359,7 @@ func (e *Engine) Reconcile(ctx context.Context, report SettlementReport) (Reconc
 				return err
 			}
 		}
-		results, err := e.matchSettlementLines(tx, report.Lines)
+		results, err := e.matchSettlementLines(base, tx, report.Lines)
 		if err != nil {
 			return err
 		}
@@ -393,7 +393,7 @@ func (e *Engine) Reconcile(ctx context.Context, report SettlementReport) (Reconc
 // Each successful modification operation or verified adverse identity can
 // contribute principal once to a report. Split provider rows need a separate,
 // proven aggregate contract.
-func (e *Engine) matchSettlementLines(tx ReconciliationTx, lines []SettlementLine) ([]ReconciliationResult, error) {
+func (e *Engine) matchSettlementLines(base Tx, tx ReconciliationTx, lines []SettlementLine) ([]ReconciliationResult, error) {
 	type movementKey struct{ paymentID, modification string }
 	seen := make(map[movementKey]int)
 	results := make([]ReconciliationResult, len(lines))
@@ -413,6 +413,37 @@ func (e *Engine) matchSettlementLines(tx ReconciliationTx, lines []SettlementLin
 			results[i].Outcome = ReconciliationUnconfirmed
 		} else {
 			seen[key] = i
+		}
+	}
+	// Returned is cumulative in the payment ledger. A partial report can cover
+	// fewer returns than the ledger, but it cannot claim more. A zero ledger
+	// return is the review-only card path, where the verified notice alone is
+	// comparison evidence and no funds are advanced by reconciliation.
+	returned := make(map[string][]int)
+	for i, result := range results {
+		if result.Line.Kind == SettlementReturned && result.Outcome == ReconciliationMatched {
+			returned[result.PaymentID] = append(returned[result.PaymentID], i)
+		}
+	}
+	for paymentID, indices := range returned {
+		payment, err := base.Payment(e.config.Scope, paymentID)
+		if err != nil {
+			return nil, err
+		}
+		if payment.Funds.Returned == 0 {
+			continue
+		}
+		var reported int64
+		for _, i := range indices {
+			reported, err = checkedReportSum(reported, results[i].ExpectedMinor)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if reported > payment.Funds.Returned {
+			for _, i := range indices {
+				results[i].Outcome = ReconciliationUnconfirmed
+			}
 		}
 	}
 	return results, nil

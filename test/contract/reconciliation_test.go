@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"testing"
@@ -419,6 +420,87 @@ func TestReconcileSignedAdyenChargeback(t *testing.T) {
 		if afterOutbox[i].ID != beforeOutbox[i].ID || afterOutbox[i].Version != beforeOutbox[i].Version {
 			t.Fatalf("reconciliation changed fulfillment outbox: %+v", afterOutbox)
 		}
+	}
+}
+
+func TestReconcileCumulativePartialReturns(t *testing.T) {
+	cases := []struct {
+		name    string
+		ledger  int64
+		amounts []int64
+		want    tender.ReconciliationOutcome
+	}{
+		{name: "contradictory-single", ledger: 50, amounts: []int64{100}, want: tender.ReconciliationUnconfirmed},
+		{name: "partial-report-subset", ledger: 100, amounts: []int64{50}, want: tender.ReconciliationMatched},
+		{name: "complete-partial-returns", ledger: 150, amounts: []int64{100, 50}, want: tender.ReconciliationMatched},
+		{name: "cumulative-overage", ledger: 150, amounts: []int64{100, 100}, want: tender.ReconciliationUnconfirmed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := postgres.New(postgresFixture(t)())
+			scope := tender.Scope{MerchantID: "partial-return-shop", Environment: tender.EnvironmentMock}
+			market := tender.Market{Country: "US", Currency: "USD", Method: tender.MethodACH}
+			now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+			payment, err := tender.NewPayment(scope, "partial-return", "order-partial-return", tender.Money{Minor: 10000, Currency: "USD"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			payment.Provider, payment.MerchantAccount, payment.Market, payment.AttemptID, payment.ProviderReference = "adyen", "acct", market, "attempt-partial", "psp-partial"
+			if _, err := payment.Apply(tender.Snapshot{Status: tender.PaymentReturned, Funds: tender.Funds{Settled: 10000, Returned: tc.ledger}}, now); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.Transact(t.Context(), func(tx tender.Tx) error { return tx.InsertPayment(payment) }); err != nil {
+				t.Fatal(err)
+			}
+			engine, err := tender.NewEngine(tender.EngineConfig{Store: store, Provider: storageProvider{}, Scope: scope, ProviderName: "adyen", MerchantAccount: "acct", Market: market})
+			if err != nil {
+				t.Fatal(err)
+			}
+			report := tender.SettlementReport{ID: "partial-return-report", Feed: tender.FeedHostVerified}
+			var totalReturn int64
+			for i, amount := range tc.amounts {
+				totalReturn += amount
+				id := fmt.Sprintf("partial-%d", i)
+				notice := tender.AdverseNotice{Scope: scope, Provider: "adyen", MerchantAccount: "acct", PaymentID: payment.ID, ProviderEventID: "event-" + id, Kind: "returned", OriginalReference: payment.ProviderReference, ModificationReference: id, Amount: tender.Money{Minor: amount, Currency: "USD"}, ObservedAt: now}
+				raw, err := json.Marshal(notice)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := store.Transact(t.Context(), func(tx tender.Tx) error {
+					return tx.(tender.VerifiedEventTx).InsertVerifiedEvent(tender.VerifiedEventKey{Scope: scope, Provider: "adyen", MerchantAccount: "acct", ID: notice.ProviderEventID}, raw)
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if err := engine.ProcessVerifiedAdverseEvent(t.Context(), notice.ProviderEventID, func(_ tender.EventRecords, raw json.RawMessage) (tender.AdverseNotice, error) {
+					var n tender.AdverseNotice
+					err := json.Unmarshal(raw, &n)
+					return n, err
+				}); err != nil {
+					t.Fatal(err)
+				}
+				report.Lines = append(report.Lines, tender.SettlementLine{ID: id, ProviderReference: payment.ProviderReference, OriginalReference: payment.ProviderReference, ModificationReference: id, BatchID: "partial-batch", SourcePartID: "partial-part", SourceSectionID: "partial-section", Kind: tender.SettlementReturned, Currency: "USD", GrossMinor: -amount, NetMinor: -amount, ObservedAt: now})
+			}
+			payoutTotal := -totalReturn
+			report.Payouts = []tender.PayoutLine{{ID: "partial-payout", BatchID: "partial-batch", SourcePartID: "partial-part", SourceSectionID: "partial-section", Currency: "USD", PayoutReference: "partial-bank-movement", AmountMinor: payoutTotal, ObservedAt: now}}
+			report.Parts = []tender.ReportPart{{ID: "partial-part", SectionID: "partial-section", Digest: "authenticated-partial-artifact", Number: 1, TotalParts: 1, DeclaredRows: len(report.Lines) + 1}}
+			report.Sections = []tender.ReportSection{{ID: "partial-section", BatchID: "partial-batch", Currency: "USD", Number: 1, TotalSections: 1, DeclaredRows: len(report.Lines) + 1, DeclaredNetMinor: &payoutTotal, DeclaredPayoutMinor: &payoutTotal}}
+			run, err := engine.Reconcile(t.Context(), report)
+			if err != nil || len(run.Results) != len(tc.amounts) || len(run.PayoutResults) != 1 {
+				t.Fatalf("partial-return run: %+v, %v", run, err)
+			}
+			for _, result := range run.Results {
+				if result.Outcome != tc.want {
+					t.Fatalf("ledger returned %d, notices %v: %+v", tc.ledger, tc.amounts, run.Results)
+				}
+			}
+			wantPayout := tender.PayoutUnconfirmed
+			if tc.want == tender.ReconciliationMatched {
+				wantPayout = tender.PayoutMatched
+			}
+			if run.PayoutResults[0].Outcome != wantPayout {
+				t.Fatalf("ledger returned %d, notices %v: payout %+v", tc.ledger, tc.amounts, run.PayoutResults)
+			}
+		})
 	}
 }
 
