@@ -67,7 +67,7 @@ func (t *transaction) StoreBankDepositResult(scope tender.Scope, provider, accou
 		return tender.BankDepositResult{}, err
 	}
 	if priorExists {
-		_, err = t.tx.ExecContext(t.ctx, `UPDATE tender_bank_deposit_reviews SET outcome=$9,evidence=$10
+		_, err = t.tx.ExecContext(t.ctx, `UPDATE tender_bank_deposit_reviews SET outcome=$9,evidence=$10,recorded_at=CURRENT_TIMESTAMP
     WHERE merchant_id=$1 AND environment=$2 AND provider=$3 AND merchant_account=$4 AND report_id=$5 AND payout_id=$6 AND bank_account_token=$7 AND movement_id=$8`,
 			scope.MerchantID, scope.Environment, provider, account, r.ReportID, r.PayoutID, e.BankAccountToken, e.MovementID, r.Outcome, string(raw))
 	} else {
@@ -76,6 +76,13 @@ func (t *transaction) StoreBankDepositResult(scope tender.Scope, provider, accou
   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
 			scope.MerchantID, scope.Environment, provider, account, r.ReportID, r.PayoutID, e.BankAccountToken, e.MovementID, r.Outcome, string(raw))
 	}
+	if err != nil {
+		return tender.BankDepositResult{}, dbError(err)
+	}
+	_, err = t.tx.ExecContext(t.ctx, `INSERT INTO tender_bank_deposit_review_history
+  (merchant_id,environment,provider,merchant_account,report_id,payout_id,bank_account_token,movement_id,outcome,evidence)
+  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+		scope.MerchantID, scope.Environment, provider, account, r.ReportID, r.PayoutID, e.BankAccountToken, e.MovementID, r.Outcome, string(raw))
 	if err != nil {
 		return tender.BankDepositResult{}, dbError(err)
 	}

@@ -53,6 +53,7 @@ func (t *memoryTx) StoreBankDepositResult(scope tender.Scope, provider, account 
 		return prior, nil
 	}
 	t.bankReviews[k] = r
+	t.bankHistory = append(t.bankHistory, r)
 	return r, nil
 }
 

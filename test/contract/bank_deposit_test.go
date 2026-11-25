@@ -264,24 +264,96 @@ func TestBankDepositConcurrentClaims(t *testing.T) {
 }
 
 func TestBankDepositFollowsLatestProviderVerdict(t *testing.T) {
-	_, db, engine, _, evidence := bankDepositFixture(t)
+	_, db, engine, scope, evidence := bankDepositFixture(t)
 	if got, err := engine.ReconcileBankDeposit(t.Context(), "report-1", "payout-1", evidence); err != nil || got.Outcome != tender.BankDepositMatched {
 		t.Fatalf("initial match: %+v, %v", got, err)
 	}
-	_, err := db.ExecContext(t.Context(), `INSERT INTO tender_reconciliation_payout_history(merchant_id,environment,provider,merchant_account,run_id,payout_id,outcome,evidence)
-  SELECT merchant_id,environment,provider,merchant_account,run_id,payout_id,'ledger_unconfirmed',jsonb_set(evidence,'{Outcome}','"ledger_unconfirmed"')
-  FROM tender_reconciliation_payout_history WHERE run_id='report-1' AND payout_id='payout-1' ORDER BY seq DESC LIMIT 1`)
-	if err != nil {
+	var firstRecordedAt time.Time
+	if err := db.QueryRowContext(t.Context(), `SELECT recorded_at FROM tender_bank_deposit_reviews WHERE report_id='report-1' AND payout_id='payout-1'`).Scan(&firstRecordedAt); err != nil {
 		t.Fatal(err)
 	}
+	store := postgres.New(db)
+	var initial tender.PayoutReconciliationResult
+	if err := store.Transact(t.Context(), func(tx tender.Tx) error {
+		var err error
+		initial, err = tx.(tender.BankDepositTx).PayoutResult(scope, "adyen", "acct", "report-1", "payout-1")
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	demoted := initial
+	demoted.Outcome = tender.PayoutUnconfirmed
+	if err := store.Transact(t.Context(), func(tx tender.Tx) error {
+		return tx.(tender.ReconciliationTx).AppendPayoutReconciliationResult(scope, "adyen", "acct", "report-1", demoted)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// No bank replay occurs here. The persisted operational view must already be safe.
+	var currentOutcome, currentDigest string
+	var currentAt time.Time
+	if err := db.QueryRowContext(t.Context(), `SELECT outcome,evidence->'Evidence'->>'StatementSHA256',recorded_at FROM tender_bank_deposit_reviews WHERE report_id='report-1' AND payout_id='payout-1'`).Scan(&currentOutcome, &currentDigest, &currentAt); err != nil {
+		t.Fatal(err)
+	}
+	if currentOutcome != string(tender.BankDepositProviderUnconfirmed) || currentDigest != evidence.StatementSHA256 {
+		t.Fatalf("stale or changed current bank review: %s %s", currentOutcome, currentDigest)
+	}
+	checkHistory := func(want ...tender.BankDepositOutcome) {
+		t.Helper()
+		rows, err := db.QueryContext(t.Context(), `SELECT outcome,evidence->'Evidence'->>'StatementSHA256',recorded_at FROM tender_bank_deposit_review_history WHERE report_id='report-1' AND payout_id='payout-1' ORDER BY seq`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer rows.Close()
+		i := 0
+		for rows.Next() {
+			var outcome, digest string
+			var at time.Time
+			if err := rows.Scan(&outcome, &digest, &at); err != nil {
+				t.Fatal(err)
+			}
+			if i >= len(want) || outcome != string(want[i]) || digest != evidence.StatementSHA256 {
+				t.Fatalf("history row %d: %s %s", i, outcome, digest)
+			}
+			if i == 0 && !at.Equal(firstRecordedAt) {
+				t.Fatalf("original verdict timestamp changed: %s != %s", at, firstRecordedAt)
+			}
+			if i == len(want)-1 && !at.Equal(currentAt) {
+				t.Fatalf("current timestamp %s differs from latest history %s", currentAt, at)
+			}
+			i++
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		if i != len(want) {
+			t.Fatalf("history count %d, want %d", i, len(want))
+		}
+	}
+	checkHistory(tender.BankDepositMatched, tender.BankDepositProviderUnconfirmed)
 	got, err := engine.ReconcileBankDeposit(t.Context(), "report-1", "payout-1", evidence)
 	if err != nil || got.Outcome != tender.BankDepositProviderUnconfirmed {
-		t.Fatalf("stale bank match survived provider demotion: %+v, %v", got, err)
+		t.Fatalf("bank replay after demotion: %+v, %v", got, err)
 	}
-	var stored string
-	if err := db.QueryRowContext(t.Context(), `SELECT outcome FROM tender_bank_deposit_reviews WHERE report_id='report-1' AND payout_id='payout-1'`).Scan(&stored); err != nil || stored != string(tender.BankDepositProviderUnconfirmed) {
-		t.Fatalf("stored bank verdict %q: %v", stored, err)
+	checkHistory(tender.BankDepositMatched, tender.BankDepositProviderUnconfirmed)
+	if err := store.Transact(t.Context(), func(tx tender.Tx) error {
+		return tx.(tender.ReconciliationTx).AppendPayoutReconciliationResult(scope, "adyen", "acct", "report-1", initial)
+	}); err != nil {
+		t.Fatal(err)
 	}
+	if err := db.QueryRowContext(t.Context(), `SELECT outcome FROM tender_bank_deposit_reviews WHERE report_id='report-1' AND payout_id='payout-1'`).Scan(&currentOutcome); err != nil {
+		t.Fatal(err)
+	}
+	if currentOutcome != string(tender.BankDepositProviderUnconfirmed) {
+		t.Fatalf("provider restoration auto-matched bank review: %s", currentOutcome)
+	}
+	got, err = engine.ReconcileBankDeposit(t.Context(), "report-1", "payout-1", evidence)
+	if err != nil || got.Outcome != tender.BankDepositMatched {
+		t.Fatalf("explicit bank replay after restoration: %+v, %v", got, err)
+	}
+	if err := db.QueryRowContext(t.Context(), `SELECT recorded_at FROM tender_bank_deposit_reviews WHERE report_id='report-1' AND payout_id='payout-1'`).Scan(&currentAt); err != nil {
+		t.Fatal(err)
+	}
+	checkHistory(tender.BankDepositMatched, tender.BankDepositProviderUnconfirmed, tender.BankDepositMatched)
 }
 
 func TestBankDepositCrossScopeIsolation(t *testing.T) {
@@ -304,5 +376,21 @@ func TestBankDepositCrossScopeIsolation(t *testing.T) {
 	}
 	if _, err := engine.ReconcileBankDeposit(t.Context(), "report-2", "payout-2", independent); !errors.Is(err, tender.ErrValidation) {
 		t.Fatalf("cross-scope evidence entered original engine: %v", err)
+	}
+}
+
+func TestBankDepositDownMigrationOrder(t *testing.T) {
+	_, db, engine, _, evidence := bankDepositFixture(t)
+	if got, err := engine.ReconcileBankDeposit(t.Context(), "report-1", "payout-1", evidence); err != nil || got.Outcome != tender.BankDepositMatched {
+		t.Fatalf("seed bank claim: %+v, %v", got, err)
+	}
+	for _, name := range []string{"008_bank_deposits.down.sql", "007_return_evidence_claims.down.sql", "006_adverse_review.down.sql", "005_payout_batches.down.sql"} {
+		script, err := postgres.Migrations.ReadFile("migrations/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.ExecContext(t.Context(), string(script)); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
 	}
 }

@@ -61,3 +61,10 @@
 - Focused bank-deposit SQL contracts passed with `-race` against an isolated PGlite socket server, using pgx `default_query_exec_mode=exec` to avoid prepared statement collisions across PGlite connections. The native PostgreSQL concurrency subtest is explicitly skipped for this single-client emulator.
 - Native PostgreSQL could not start because the host exhausted macOS SysV shared-memory identifiers. The full integration suite cannot run on PGlite: the existing multi-connection `TestPostgresConflictingOperations` held for 60 seconds and the single-client socket server crashed on `ECONNRESET`. Native PostgreSQL CI remains the remaining test gate for concurrent claim serialization.
 - These results are offline contract evidence only. No real bank statement or provider sandbox artifact was used.
+
+### Review follow-up: migration and verdict history
+
+- [x] Extend the red SQL contract to require current bank demotion without bank replay and immutable matched → unconfirmed → matched history with stable original timestamps.
+- [x] Add `tender_bank_deposit_review_history` in migration `008`, append first and changed verdicts, and demote current bank state from the existing provider-payout append transaction.
+- [x] Test memory transition history, seeded reverse migration order, and corrected install/rollback commands.
+- [x] Rerun full race tests, normal/integration vet, and focused SQL race tests on isolated PGlite. Native PostgreSQL concurrency remains a CI gate because this host cannot allocate another SysV shared-memory identifier.

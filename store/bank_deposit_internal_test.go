@@ -87,3 +87,26 @@ func TestMemoryConcurrentBankMovementClaim(t *testing.T) {
 		t.Fatalf("concurrent claim outcomes: %+v", counts)
 	}
 }
+
+func TestMemoryBankVerdictHistory(t *testing.T) {
+	m := NewMemory()
+	scope := tender.Scope{MerchantID: "shop", Environment: tender.EnvironmentMock}
+	first := memoryDeposit(scope, "payout-a", "movement-a", "reference-a")
+	record := func(r tender.BankDepositResult) {
+		t.Helper()
+		if err := m.Transact(t.Context(), func(tx tender.Tx) error {
+			_, err := tx.(tender.BankDepositTx).StoreBankDepositResult(scope, "adyen", "acct", r)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	record(first)
+	demoted := first
+	demoted.Outcome = tender.BankDepositProviderUnconfirmed
+	record(demoted)
+	record(demoted)
+	if len(m.state.bankHistory) != 2 || m.state.bankHistory[0].Outcome != tender.BankDepositMatched || m.state.bankHistory[1].Outcome != tender.BankDepositProviderUnconfirmed {
+		t.Fatalf("bank verdict transition history: %+v", m.state.bankHistory)
+	}
+}

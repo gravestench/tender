@@ -39,6 +39,7 @@ type memoryTx struct {
 	adverse         map[tender.AdverseKey]tender.AdverseNotice
 	returnClaims    map[returnClaimKey]returnClaimOwner
 	bankReviews     map[bankReviewKey]tender.BankDepositResult
+	bankHistory     []tender.BankDepositResult
 	bankClaims      map[bankClaimKey]bankClaimOwner
 	bankReferences  map[bankReferenceKey]bankClaimOwner
 }
@@ -76,7 +77,7 @@ func (m *Memory) Transact(ctx context.Context, fn func(tender.Tx) error) error {
 		history: slices.Clone(m.state.history), outbox: slices.Clone(m.state.outbox), captureFailures: slices.Clone(m.state.captureFailures),
 		adverse:      maps.Clone(m.state.adverse),
 		returnClaims: maps.Clone(m.state.returnClaims),
-		bankReviews:  maps.Clone(m.state.bankReviews), bankClaims: maps.Clone(m.state.bankClaims), bankReferences: maps.Clone(m.state.bankReferences),
+		bankReviews:  maps.Clone(m.state.bankReviews), bankHistory: slices.Clone(m.state.bankHistory), bankClaims: maps.Clone(m.state.bankClaims), bankReferences: maps.Clone(m.state.bankReferences),
 	}
 	if err := fn(&tx); err != nil {
 		return err
