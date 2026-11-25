@@ -79,7 +79,7 @@ The restart test creates a separate schema in a disposable database, injects a f
 
 ## Verify the tagged offline alpha
 
-The development `go.mod` uses a local replacement for Tender. After the **MOCK-only** `v0.1.0-alpha.2` tag is published, run the following from the repository root with the tag available locally. The commands export the example into a temporary directory outside this checkout and resolve Tender from the public Go module proxy.
+The development `go.mod` requires the placeholder `v0.0.0` and uses a local replacement for Tender. Remove both entries before installing the published **MOCK-only** `v0.1.0-alpha.2` tag. Run the following from the repository root with the tag available locally. The commands export the example into a temporary directory outside this checkout and resolve Tender from the public Go module proxy.
 
 ```sh
 TENDER_ALPHA_DIR=$(mktemp -d)
@@ -87,11 +87,11 @@ git archive v0.1.0-alpha.2 -- examples/consumer store/postgres/migrations | tar 
 cd "$TENDER_ALPHA_DIR/examples/consumer"
 export GOWORK=off GOPROXY=https://proxy.golang.org
 export GOMODCACHE="$TENDER_ALPHA_DIR/go-mod-cache" GOCACHE="$TENDER_ALPHA_DIR/go-build-cache"
-go mod edit -dropreplace=github.com/gravestench/tender
+go mod edit -dropreplace=github.com/gravestench/tender -droprequire=github.com/gravestench/tender
 go get github.com/gravestench/tender@v0.1.0-alpha.2
 go mod tidy
 go list -m -json github.com/gravestench/tender
 go build -o "$TENDER_ALPHA_DIR/tender-consumer" .
 ```
 
-Check that `Version` is `v0.1.0-alpha.2` and that `Replace` is absent. Run the resulting binary on loopback in MOCK to exercise a synthetic checkout. For durable tests, use the [tag-matched PostgreSQL migrations](../../docs/storage.md) and the example's host ledger migration. The alpha.1 import, build and USD 25.99 loopback capture remain recorded separately. For alpha.2 results and qualification status, see the [release ledger](../../docs/evidence/release-gates.md).
+Check that `Version` is `v0.1.0-alpha.2` and that `Replace` is absent. Run the resulting binary on loopback in MOCK to exercise a synthetic checkout. For durable tests, use the [tag-matched PostgreSQL migrations](../../docs/storage.md) and the example's host ledger migration. The alpha.2 external build captured USD 25.99 in MOCK and kept one durable fulfillment record after duplicate submission and restart. The release ledger records that result alongside the earlier alpha.1 check. [Release evidence](../../docs/evidence/release-gates.md)
