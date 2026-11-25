@@ -46,6 +46,17 @@ func sandboxMerchant(t *testing.T) {
 	}
 }
 
+func portalMerchant() error {
+	if os.Getenv("PAYMENTS_ENV") != "sandbox" {
+		return errors.New("BLOCKED: select PAYMENTS_ENV=sandbox")
+	}
+	merchant := os.Getenv("TENDER_ADYEN_MERCHANT_ACCOUNT")
+	if !regexp.MustCompile(`^[A-Za-z0-9_-]{1,80}$`).MatchString(merchant) {
+		return errors.New("BLOCKED: supply the scoped Adyen test merchant account")
+	}
+	return nil
+}
+
 var ticketPath = regexp.MustCompile(`^/session/[A-Za-z0-9]+$`)
 
 func browserTicket(name, env string) (*url.URL, error) {
@@ -77,24 +88,24 @@ func mockHost(host string) bool {
 	if _, err := netip.ParseAddr(host); err == nil {
 		return true
 	}
-	for _, suffix := range []string{"localhost", ".localhost", ".test", ".invalid", ".example", "example.com", ".example.com", "example.org", ".example.org", "example.net", ".example.net"} {
-		if host == suffix || strings.HasSuffix(host, suffix) {
+	for _, apex := range []string{"localhost", "test", "invalid", "example", "example.com", "example.org", "example.net"} {
+		if host == apex || strings.HasSuffix(host, "."+apex) {
 			return true
 		}
 	}
 	return !strings.Contains(host, ".")
 }
 
-func freshEvidenceFile(path string) error {
+func regularEvidenceFile(path string) error {
 	stat, err := os.Lstat(path)
 	if err != nil || !stat.Mode().IsRegular() {
 		return errors.New("BLOCKED: supply a regular merchant evidence file")
 	}
-	age := time.Since(stat.ModTime())
-	if age > 30*24*time.Hour || age < -5*time.Minute {
-		return errors.New("BLOCKED: merchant evidence is stale or future-dated")
-	}
 	return nil
+}
+
+func freshProviderTime(observed, now time.Time) bool {
+	return !observed.IsZero() && !observed.Before(now.Add(-30*24*time.Hour)) && !observed.After(now.Add(5*time.Minute))
 }
 
 func TestAdyenSandboxBrowser(t *testing.T) {
@@ -129,7 +140,9 @@ func TestAdyenSandboxBrowser(t *testing.T) {
 // Run after the operator captured and refunded the qualified order and Adyen
 // produced an accounting export. This check is read-only and can be rerun.
 func TestAdyenSandboxPortal(t *testing.T) {
-	sandboxMerchant(t)
+	if err := portalMerchant(); err != nil {
+		t.Fatal(err)
+	}
 	required := []string{"TENDER_ADYEN_ACCOUNTING_CSV", "TENDER_CONSUMER_DATABASE_URL", "TENDER_CONSUMER_SCHEMA", "TENDER_ADYEN_EVIDENCE_ORDER"}
 	for _, name := range required {
 		if os.Getenv(name) == "" {
@@ -156,7 +169,7 @@ func TestAdyenSandboxPortal(t *testing.T) {
 	if err != nil || json.Unmarshal(raw, &payment) != nil || payment.Provider != "adyen" || payment.MerchantAccount != merchant || payment.ProviderReference == "" || payment.Market.Country != "US" || payment.Amount.Currency != "USD" || payment.Amount.Minor <= 0 || payment.Status != tender.PaymentCaptured || payment.VerifiedMethod != payment.Market.Method || payment.Funds.Disputed != 0 || payment.Funds.Returned != 0 || payment.Funds.Captured != payment.Amount.Minor || payment.Funds.Refunded != payment.Amount.Minor {
 		t.Fatal("sandbox payment, capture and refund facts do not match")
 	}
-	rows, err := tx.Query(t.Context(), `SELECT evidence->>'eventCode',evidence->>'pspReference',evidence->>'merchantReference' FROM tender_provider_events WHERE merchant_id='consumer-demo' AND environment='SANDBOX' AND provider='adyen' AND merchant_account=$1 AND processed_at IS NOT NULL AND evidence->>'success'='true' AND evidence#>>'{amount,currency}'='USD' AND (evidence#>>'{amount,value}')::bigint=$2 AND (evidence->>'pspReference'=$3 OR evidence->>'originalReference'=$3)`, merchant, payment.Amount.Minor, payment.ProviderReference)
+	rows, err := tx.Query(t.Context(), `SELECT evidence->>'eventCode',evidence->>'pspReference',evidence->>'merchantReference',received_at FROM tender_provider_events WHERE merchant_id='consumer-demo' AND environment='SANDBOX' AND provider='adyen' AND merchant_account=$1 AND processed_at IS NOT NULL AND evidence->>'success'='true' AND evidence#>>'{amount,currency}'='USD' AND (evidence#>>'{amount,value}')::bigint=$2 AND (evidence->>'pspReference'=$3 OR evidence->>'originalReference'=$3)`, merchant, payment.Amount.Minor, payment.ProviderReference)
 	if err != nil {
 		t.Fatal("cannot read verified provider events")
 	}
@@ -164,8 +177,9 @@ func TestAdyenSandboxPortal(t *testing.T) {
 	var ref string
 	for rows.Next() {
 		var code, psp, mref string
-		if rows.Scan(&code, &psp, &mref) != nil {
-			t.Fatal("invalid event")
+		var receivedAt time.Time
+		if rows.Scan(&code, &psp, &mref, &receivedAt) != nil || !freshProviderTime(receivedAt, time.Now()) {
+			t.Fatal("BLOCKED: signed provider event receipt is invalid or stale")
 		}
 		if previous := psps[code]; previous != "" && previous != psp {
 			t.Fatal("multiple modification PSPs for a full-amount operation")
@@ -196,7 +210,7 @@ func TestAdyenSandboxPortal(t *testing.T) {
 	default:
 		t.Fatal("unexpected market")
 	}
-	if err := freshEvidenceFile(os.Getenv("TENDER_ADYEN_ACCOUNTING_CSV")); err != nil {
+	if err := regularEvidenceFile(os.Getenv("TENDER_ADYEN_ACCOUNTING_CSV")); err != nil {
 		t.Fatal(err)
 	}
 	file, err := os.Open(os.Getenv("TENDER_ADYEN_ACCOUNTING_CSV"))
@@ -363,17 +377,70 @@ func TestSandboxBrowserRejectsMockOrigin(t *testing.T) {
 	}
 }
 
+func TestSandboxOriginUsesDomainBoundaries(t *testing.T) {
+	if mockHost("notexample.com") || mockHost("notexample.org") || mockHost("notexample.net") {
+		t.Fatal("rejected a public domain ending in the reserved apex name")
+	}
+	for _, host := range []string{"example.com", "sub.example.com", "example.org", "sub.example.net"} {
+		if !mockHost(host) {
+			t.Fatalf("accepted reserved host %s", host)
+		}
+	}
+}
+
+func TestAdyenPortalPreflightUsesOnlyScopedSecrets(t *testing.T) {
+	t.Setenv("PAYMENTS_ENV", "sandbox")
+	t.Setenv("TENDER_ADYEN_MERCHANT_ACCOUNT", "merchant")
+	t.Setenv("TENDER_ADYEN_API_KEY", "")
+	t.Setenv("TENDER_ADYEN_CLIENT_KEY", "")
+	t.Setenv("TENDER_ADYEN_HMAC_KEY", "")
+	if err := portalMerchant(); err != nil {
+		t.Fatalf("read-only portal preflight required browser/API/HMAC secrets: %v", err)
+	}
+}
+
+func TestAdyenPortalWorkflowScopesSecrets(t *testing.T) {
+	raw, err := os.ReadFile("../../.github/workflows/sandbox.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := bytes.Index(raw, []byte("      - name: Run adyen_portal\n"))
+	if start < 0 {
+		t.Fatal("protected portal step missing")
+	}
+	step := raw[start:]
+	if end := bytes.Index(step[len("      - name: Run adyen_portal\n"):], []byte("\n      - name: Run ")); end >= 0 {
+		step = step[:len("      - name: Run adyen_portal\n")+end]
+	}
+	for _, required := range []string{"TENDER_ADYEN_MERCHANT_ACCOUNT:", "TENDER_ADYEN_EVIDENCE_ORDER:", "TENDER_CONSUMER_DATABASE_URL:", "TENDER_ADYEN_ACCOUNTING_CSV_B64:"} {
+		if !bytes.Contains(step, []byte(required)) {
+			t.Fatalf("portal step lacks %s", required)
+		}
+	}
+	for _, forbidden := range []string{"TENDER_ADYEN_API_KEY:", "TENDER_ADYEN_CLIENT_KEY:", "TENDER_ADYEN_HMAC_KEY:"} {
+		if bytes.Contains(step, []byte(forbidden)) {
+			t.Fatalf("read-only portal step exposes %s", forbidden)
+		}
+	}
+}
+
 func TestSandboxHarnessRejectsStaleEvidence(t *testing.T) {
 	path := t.TempDir() + "/report.csv"
 	if err := os.WriteFile(path, []byte("report"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	stale := time.Now().Add(-31 * 24 * time.Hour)
-	if err := os.Chtimes(path, stale, stale); err != nil {
+	if err := regularEvidenceFile(path); err != nil {
 		t.Fatal(err)
 	}
-	if err := freshEvidenceFile(path); err == nil {
-		t.Fatal("accepted a stale sandbox export")
+	if freshProviderTime(time.Now().Add(-31*24*time.Hour), time.Now()) {
+		t.Fatal("accepted stale provider evidence after CI decoded it to a fresh file")
+	}
+}
+
+func TestSandboxProviderTimeBounds(t *testing.T) {
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	if !freshProviderTime(now.Add(-24*time.Hour), now) || freshProviderTime(time.Time{}, now) || freshProviderTime(now.Add(-31*24*time.Hour), now) || freshProviderTime(now.Add(6*time.Minute), now) {
+		t.Fatal("provider evidence time bounds are wrong")
 	}
 }
 

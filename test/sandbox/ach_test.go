@@ -5,11 +5,13 @@ package sandbox_test
 import (
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"io"
 	"net/url"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +27,39 @@ import (
 func validACHOrigin(raw string) bool {
 	u, err := url.Parse(raw)
 	return err == nil && u.Scheme == "https" && u.User == nil && u.Host != "" && raw == "https://"+u.Host && !mockHost(u.Hostname())
+}
+
+func validACHReportBooking(raw []byte, now time.Time) bool {
+	if len(raw) > 65536 {
+		return false
+	}
+	reader := csv.NewReader(bytes.NewReader(raw))
+	header, err := reader.Read()
+	if err != nil {
+		return false
+	}
+	index := slices.Index(header, "Booking Date (AMS)")
+	if index < 0 {
+		return false
+	}
+	for i, name := range header {
+		if i != index && name == "Booking Date (AMS)" {
+			return false
+		}
+	}
+	row, err := reader.Read()
+	if err != nil || len(row) != len(header) {
+		return false
+	}
+	if _, err = reader.Read(); err != io.EOF {
+		return false
+	}
+	zone, err := time.LoadLocation("Europe/Amsterdam")
+	if err != nil {
+		return false
+	}
+	bookedAt, err := time.ParseInLocation("2006-01-02 15:04:05", row[index], zone)
+	return err == nil && freshProviderTime(bookedAt, now)
 }
 
 func TestACHSandboxSessions(t *testing.T) {
@@ -100,7 +135,7 @@ func TestACHSandboxReport(t *testing.T) {
 		Minor                                                                int64
 	}
 	var host hostRecord
-	if err := freshEvidenceFile(os.Getenv("TENDER_ACH_HOST_EVIDENCE")); err != nil {
+	if err := regularEvidenceFile(os.Getenv("TENDER_ACH_HOST_EVIDENCE")); err != nil {
 		t.Fatal(err)
 	}
 	f, err := os.Open(os.Getenv("TENDER_ACH_HOST_EVIDENCE"))
@@ -116,15 +151,19 @@ func TestACHSandboxReport(t *testing.T) {
 		env, kind, mod string
 		gross          int64
 	}{{"TENDER_ACH_SETTLED_CSV", "Settled", host.SettlementModification, host.Minor}, {"TENDER_ACH_RETURNED_CSV", "Chargeback", host.ReturnModification, -host.Minor}} {
-		if err := freshEvidenceFile(os.Getenv(c.env)); err != nil {
+		if err := regularEvidenceFile(os.Getenv(c.env)); err != nil {
 			t.Fatal(err)
 		}
 		report, err := os.Open(os.Getenv(c.env))
 		if err != nil {
 			t.Fatalf("BLOCKED: supply %s from the test merchant Settlement details report", c.env)
 		}
-		l, err := ach.ReadSettlement(report)
+		reportRaw, readErr := io.ReadAll(io.LimitReader(report, 65537))
 		report.Close()
+		if readErr != nil || !validACHReportBooking(reportRaw, time.Now()) {
+			t.Fatalf("BLOCKED: %s report has no fresh provider booking date", c.kind)
+		}
+		l, err := ach.ReadSettlement(bytes.NewReader(reportRaw))
 		if err != nil || l.Account != host.Merchant || l.PSP != host.PSP || l.MerchantReference != host.Reference || l.Modification != c.mod || l.Type != c.kind || l.Gross != c.gross {
 			t.Fatalf("test merchant %s row differs from trusted host evidence", c.kind)
 		}
@@ -133,10 +172,25 @@ func TestACHSandboxReport(t *testing.T) {
 }
 
 func TestACHSandboxRejectsMockOrigin(t *testing.T) {
-	if !validACHOrigin("https://checkout.merchant.com") {
+	if !validACHOrigin("https://checkout.merchant.com") || !validACHOrigin("https://notexample.com") {
 		t.Fatal("rejected a public HTTPS origin")
 	}
 	if validACHOrigin("https://127.0.0.1") || validACHOrigin("https://merchant.example.test") {
 		t.Fatal("accepted a mock browser origin for official ACH qualification")
+	}
+}
+
+func TestACHSandboxRejectsStaleReportBooking(t *testing.T) {
+	const report = "Merchant Account,Booking Date (AMS),Psp Reference\nmerchant,2020-01-02 03:04:05,psp\n"
+	if validACHReportBooking([]byte(report), time.Now()) {
+		t.Fatal("accepted a stale provider report copied to a fresh CI temp file")
+	}
+	zone, err := time.LoadLocation("Europe/Amsterdam")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh := "Merchant Account,Booking Date (AMS),Psp Reference\nmerchant," + time.Now().In(zone).Format("2006-01-02 15:04:05") + ",psp\n"
+	if !validACHReportBooking([]byte(fresh), time.Now()) {
+		t.Fatal("rejected a recent AMS provider booking row")
 	}
 }

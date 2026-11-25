@@ -26,6 +26,11 @@ func validKlarnaHost(host klarnaHostEvidence, merchant string) bool {
 	return merchant != "" && host.MerchantAccount == merchant && klarnaUUID.MatchString(host.OrderID) && klarnaUUID.MatchString(host.CaptureID) && klarnaUUID.MatchString(host.RefundID) && klarna.IsUSFinancing("US", "USD", host.FinancingMethod) && host.MerchantReference1 != "" && host.MerchantReference2 != "" && host.OrderAmount > 0 && host.CapturedAmount > 0 && host.CapturedAmount <= host.OrderAmount && host.RefundedAmount > 0 && host.RefundedAmount < host.CapturedAmount
 }
 
+func validKlarnaCapture(id string, amount int64, capturedAt, expectedID string, expectedAmount int64, now time.Time) bool {
+	when, err := time.Parse(time.RFC3339Nano, capturedAt)
+	return err == nil && id == expectedID && amount == expectedAmount && freshProviderTime(when, now)
+}
+
 // TestKlarnaSandboxOrderRecord compares a previously purchased, partially
 // refunded order in the NA playground with independently exported host values.
 // It only reads. A pass establishes order-record agreement for this sample.
@@ -37,7 +42,7 @@ func TestKlarnaSandboxOrderRecord(t *testing.T) {
 	if !strings.HasPrefix(key, "klarna_test_api_") || path == "" || merchant == "" {
 		t.Fatal("BLOCKED: supply the Klarna NA playground API key, merchant account and host export")
 	}
-	if err := freshEvidenceFile(path); err != nil {
+	if err := regularEvidenceFile(path); err != nil {
 		t.Fatal(err)
 	}
 	f, err := os.Open(path)
@@ -106,6 +111,27 @@ func TestKlarnaSandboxOrderRecord(t *testing.T) {
 	if !capture || !refund {
 		t.Fatal("capture or refund reference missing from playground order")
 	}
+	// The order record is read through merchant authentication. Check the
+	// separately authenticated capture's provider timestamp; CI file mtime is
+	// fresh whenever a base64 export is decoded and proves nothing.
+	request, err := http.NewRequestWithContext(t.Context(), "GET", klarna.PlaygroundURL+"/ordermanagement/v1/orders/"+host.OrderID+"/captures/"+host.CaptureID, nil)
+	if err != nil {
+		t.Fatal("invalid capture request")
+	}
+	request.Header.Set("Authorization", "Basic "+key)
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal("BLOCKED: NA playground capture details unavailable")
+	}
+	defer response.Body.Close()
+	var captured struct {
+		ID     string `json:"capture_id"`
+		Amount int64  `json:"captured_amount"`
+		At     string `json:"captured_at"`
+	}
+	if response.StatusCode != 200 || json.NewDecoder(io.LimitReader(response.Body, 65536)).Decode(&captured) != nil || !validKlarnaCapture(captured.ID, captured.Amount, captured.At, host.CaptureID, host.CapturedAmount, time.Now()) {
+		t.Fatal("BLOCKED: authenticated capture is mismatched or stale")
+	}
 	t.Fatal("BLOCKED: read-only order record does not prove host-issued adapter mutation, genuine callback, authenticated payout report, or approved on-page financing path")
 }
 
@@ -120,5 +146,14 @@ func TestKlarnaSandboxEvidenceRejectsWrongMerchantAndProduct(t *testing.T) {
 	host.FinancingMethod = "pay_now"
 	if validKlarnaHost(host, "seller-a") {
 		t.Fatal("accepted an unrelated payment product")
+	}
+}
+
+func TestKlarnaSandboxRejectsStaleAuthenticatedCapture(t *testing.T) {
+	if validKlarnaCapture("capture", 1000, "2020-01-02T03:04:05Z", "capture", 1000, time.Now()) {
+		t.Fatal("accepted an old capture returned by the authenticated provider API")
+	}
+	if !validKlarnaCapture("capture", 1000, time.Now().UTC().Format(time.RFC3339Nano), "capture", 1000, time.Now()) {
+		t.Fatal("rejected a recent matching authenticated capture")
 	}
 }

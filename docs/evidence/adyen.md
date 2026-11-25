@@ -29,7 +29,7 @@ GOPROXY=off go test -race -count=1 -tags=e2e,integration ./test/e2e/...
 
 ## Run a protected sandbox qualification
 
-Configure the test merchant, controlled HTTPS origins, callbacks and shopper described in the consumer README. The first phase exercises the browser and the second reads accounting evidence after the operator captures and refunds. The browser ticket must use a public registered HTTPS merchant origin; loopback and reserved mock domains are rejected. Evidence files older than 30 days are rejected. Each phase now ends with visible **BLOCKED** even if its partial probe succeeds: a complete qualification must correlate the same host-issued order across browser result, signed event and authenticated report. Official merchant evidence remains outstanding.
+Configure the test merchant, controlled HTTPS origins, callbacks and shopper described in the consumer README. The first phase exercises the browser and the second reads accounting evidence after the operator captures and refunds. The browser ticket must use a public registered HTTPS merchant origin; loopback and reserved mock domains are rejected. The portal probe requires the merchant/evidence/DB settings only; the browser API, client and HMAC secrets are not passed to its workflow step. Its processed signed events must have a host receipt time within 30 days; a freshly decoded report file does not establish freshness. Each phase ends with visible **BLOCKED** even if its partial probe succeeds: a complete qualification must correlate the same host-issued order across browser result, signed event and authenticated report. Official merchant evidence remains outstanding.
 
 ```sh
 PAYMENTS_ENV=sandbox go test -count=1 -tags=sandbox ./test/sandbox/... -run '^TestAdyenSandboxBrowser$'
