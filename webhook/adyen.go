@@ -204,7 +204,8 @@ func (h *Adyen) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // Process applies one already authenticated inbox row atomically. Unresolved
 // rows remain pending for host retry or investigation.
 func (h *Adyen) Process(ctx context.Context, id string) error {
-	if strings.HasPrefix(id, "REFUND_FAILED.") {
+	if strings.HasPrefix(id, "REFUND_FAILED.") || strings.HasPrefix(id, "REFUNDED_REVERSED.") ||
+		strings.HasPrefix(id, "CHARGEBACK_REVERSED.") || strings.HasPrefix(id, "SECOND_CHARGEBACK.") {
 		return h.processAdverse(ctx, id)
 	}
 	if strings.HasPrefix(id, "CHARGEBACK.") {
@@ -245,11 +246,12 @@ func (h *Adyen) processObservation(ctx context.Context, id string) error {
 }
 
 // adverse projects only independently HMAC-signed financial exceptions. The
-// notice records host review work; neither a dispute nor refund failure erases
+// notice records host review work; dispute and refund exceptions never erase
 // previously collected, refunded or fulfilled history.
 func (h *Adyen) adverse(tx tender.EventRecords, id string, e evidence) (tender.AdverseNotice, error) {
 	var n tender.AdverseNotice
-	if _, ok := e.canonical(); !ok || e.id() != id || e.Account != h.cfg.MerchantAccount || e.Success != "true" || e.Code != "CHARGEBACK" && e.Code != "REFUND_FAILED" {
+	if _, ok := e.canonical(); !ok || e.id() != id || e.Account != h.cfg.MerchantAccount || e.Success != "true" ||
+		e.Code != "CHARGEBACK" && e.Code != "REFUND_FAILED" && e.Code != "CHARGEBACK_REVERSED" && e.Code != "SECOND_CHARGEBACK" && e.Code != "REFUNDED_REVERSED" {
 		return n, tender.ErrConflict
 	}
 	p, refOp, err := adyen.ResolveReference(tx, h.cfg.Scope, e.Ref)
@@ -283,6 +285,55 @@ func (h *Adyen) adverse(tx tender.EventRecords, id string, e evidence) (tender.A
 		} else if !errors.Is(err, tender.ErrNotFound) {
 			return tender.AdverseNotice{}, err
 		}
+		return n, nil
+	}
+	if e.Code == "CHARGEBACK_REVERSED" || e.Code == "SECOND_CHARGEBACK" {
+		reader, ok := tx.(tender.AdverseEvidenceReader)
+		if !ok {
+			return tender.AdverseNotice{}, tender.ErrUnsupported
+		}
+		prior, err := reader.AdverseEvidence(h.cfg.Scope, "adyen", e.Account, p.ID)
+		if err != nil {
+			return tender.AdverseNotice{}, err
+		}
+		var chargebacks, reversals int
+		for _, item := range prior {
+			if item.ModificationReference != e.PSP {
+				continue
+			}
+			if item.PaymentID != p.ID || item.OriginalReference != e.Original || item.Amount != n.Amount {
+				return tender.AdverseNotice{}, tender.ErrConflict
+			}
+			switch item.Kind {
+			case "chargeback":
+				chargebacks++
+			case "chargeback_reversed":
+				reversals++
+			default:
+				return tender.AdverseNotice{}, tender.ErrConflict
+			}
+		}
+		if chargebacks != 1 || e.Code == "CHARGEBACK_REVERSED" && reversals != 0 || e.Code == "SECOND_CHARGEBACK" && reversals != 1 {
+			return tender.AdverseNotice{}, tender.ErrConflict
+		}
+		if e.Code == "CHARGEBACK_REVERSED" {
+			n.Kind = "chargeback_reversed"
+		} else {
+			n.Kind = "second_chargeback"
+		}
+		return n, nil
+	}
+	if e.Code == "REFUNDED_REVERSED" {
+		op, err := tx.OperationByReference(h.cfg.Scope, p.ID, e.PSP)
+		if err != nil {
+			return tender.AdverseNotice{}, err
+		}
+		if op.Kind != tender.OpRefund || op.PaymentID != p.ID || op.AttemptID != p.AttemptID ||
+			op.Status != tender.OperationSucceeded || op.ProviderReference != e.PSP ||
+			op.Amount != n.Amount || p.Funds.Refunded < n.Amount.Minor {
+			return tender.AdverseNotice{}, tender.ErrConflict
+		}
+		n.Kind, n.OperationID = "refunded_reversed", op.ID
 		return n, nil
 	}
 	n.Kind = "refund_failed"
