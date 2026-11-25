@@ -29,7 +29,7 @@ GOPROXY=off go test -race -count=1 -tags=e2e,integration ./test/e2e/...
 
 ## Run a protected sandbox qualification
 
-Configure the test merchant, controlled HTTPS origins, callbacks and shopper described in the consumer README. The first phase exercises the browser and the second reads accounting evidence after the operator captures and refunds. Missing credentials, registered origins, grants or required evidence produce a visible **BLOCKED** failure. Official merchant evidence remains outstanding.
+Configure the test merchant, controlled HTTPS origins, callbacks and shopper described in the consumer README. The first phase exercises the browser and the second reads accounting evidence after the operator captures and refunds. The browser ticket must use a public registered HTTPS merchant origin; loopback and reserved mock domains are rejected. Evidence files older than 30 days are rejected. Each phase now ends with visible **BLOCKED** even if its partial probe succeeds: a complete qualification must correlate the same host-issued order across browser result, signed event and authenticated report. Official merchant evidence remains outstanding.
 
 ```sh
 PAYMENTS_ENV=sandbox go test -count=1 -tags=sandbox ./test/sandbox/... -run '^TestAdyenSandboxBrowser$'
@@ -60,6 +60,6 @@ After a sandbox authorization, use the private merchant route to capture the ord
 PAYMENTS_ENV=sandbox go test -count=1 -tags=sandbox ./test/sandbox/... -run '^TestAdyenSandboxPortal$'
 ```
 
-A combined `-run TestAdyen` run requires three fresh browser grants plus a previously captured and refunded order in the configured evidence schema with its completed report. For a new merchant qualification use the two phases above so the report can be generated after the browser run.
+A combined `-run TestAdyen` run requires three fresh browser grants plus a previously captured and refunded order in the configured evidence schema with its completed report. The current two phases are diagnostic probes and cannot return a qualification PASS. The fingerprint case is an expected block, not a successful authorization.
 
 Automated report download, adjustment import, post-refund reversal, bank payout confirmation and downstream delivery compensation remain separate capabilities. Credentialed verification and a clean independent import against a published version remain release gates. [Adapter coverage](../providers/adyen.md)

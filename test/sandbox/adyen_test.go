@@ -3,6 +3,7 @@
 package sandbox_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/csv"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -59,11 +61,40 @@ func browserTicket(name, env string) (*url.URL, error) {
 	if origin == "" {
 		return nil, fmt.Errorf("BLOCKED: configure the registered %s", originName)
 	}
+	registered, err := url.Parse(origin)
+	if err != nil || registered.Scheme != "https" || registered.User != nil || registered.Hostname() == "" || origin != "https://"+registered.Host || mockHost(registered.Hostname()) {
+		return nil, fmt.Errorf("BLOCKED: %s must be a registered public HTTPS merchant origin", originName)
+	}
 	ticket, err := url.Parse(os.Getenv(env))
 	if err != nil || ticket.User != nil || ticket.Scheme != "https" || ticket.Scheme+"://"+ticket.Host != origin || !ticketPath.MatchString(ticket.EscapedPath()) || ticket.RawQuery != "" || ticket.ForceQuery || ticket.Fragment != "" {
 		return nil, fmt.Errorf("BLOCKED: configure a fresh same-origin %s", env)
 	}
 	return ticket, nil
+}
+
+func mockHost(host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if _, err := netip.ParseAddr(host); err == nil {
+		return true
+	}
+	for _, suffix := range []string{"localhost", ".localhost", ".test", ".invalid", ".example", "example.com", ".example.com", "example.org", ".example.org", "example.net", ".example.net"} {
+		if host == suffix || strings.HasSuffix(host, suffix) {
+			return true
+		}
+	}
+	return !strings.Contains(host, ".")
+}
+
+func freshEvidenceFile(path string) error {
+	stat, err := os.Lstat(path)
+	if err != nil || !stat.Mode().IsRegular() {
+		return errors.New("BLOCKED: supply a regular merchant evidence file")
+	}
+	age := time.Since(stat.ModTime())
+	if age > 30*24*time.Hour || age < -5*time.Minute {
+		return errors.New("BLOCKED: merchant evidence is stale or future-dated")
+	}
+	return nil
 }
 
 func TestAdyenSandboxBrowser(t *testing.T) {
@@ -92,6 +123,7 @@ func TestAdyenSandboxBrowser(t *testing.T) {
 			}
 		})
 	}
+	t.Fatal("BLOCKED: browser probe alone does not correlate this host-issued payment with signed provider events and an authenticated report")
 }
 
 // Run after the operator captured and refunded the qualified order and Adyen
@@ -164,6 +196,9 @@ func TestAdyenSandboxPortal(t *testing.T) {
 	default:
 		t.Fatal("unexpected market")
 	}
+	if err := freshEvidenceFile(os.Getenv("TENDER_ADYEN_ACCOUNTING_CSV")); err != nil {
+		t.Fatal(err)
+	}
 	file, err := os.Open(os.Getenv("TENDER_ADYEN_ACCOUNTING_CSV"))
 	if err != nil {
 		t.Fatal("BLOCKED: cannot open Customer Area accounting export")
@@ -172,6 +207,7 @@ func TestAdyenSandboxPortal(t *testing.T) {
 	if err := compareAccounting(file, merchant, payment.ProviderReference, ref, brand, payment.Amount.Minor, psps); err != nil {
 		t.Fatal(err)
 	}
+	t.Fatal("BLOCKED: read-only accounting comparison alone does not prove a browser checkout on this same order")
 }
 
 func compareAccounting(input io.Reader, merchant, paymentPSP, ref, brand string, minor int64, psps map[string]string) error {
@@ -305,16 +341,58 @@ func TestAccountingRegisterEvidence(t *testing.T) {
 
 func TestSandboxCaseRoutes(t *testing.T) {
 	t.Setenv("TENDER_ADYEN_ORIGIN", "")
-	t.Setenv("TENDER_ADYEN_VISA_ORIGIN", "https://visa.example.test")
-	t.Setenv("TENDER_ADYEN_MC_ORIGIN", "https://mc.example.test")
-	for _, tc := range []struct{ name, env, ticket string }{{"visa_challenge", "TENDER_ADYEN_VISA_CHALLENGE_TICKET", "https://visa.example.test/session/guest"}, {"mc_frictionless", "TENDER_ADYEN_MC_FRICTIONLESS_TICKET", "https://mc.example.test/session/guest"}, {"mc_purchase", "TENDER_ADYEN_MC_PURCHASE_TICKET", "https://mc.example.test/session/account"}} {
+	t.Setenv("TENDER_ADYEN_VISA_ORIGIN", "https://checkout.visa.com")
+	t.Setenv("TENDER_ADYEN_MC_ORIGIN", "https://checkout.mastercard.com")
+	for _, tc := range []struct{ name, env, ticket string }{{"visa_challenge", "TENDER_ADYEN_VISA_CHALLENGE_TICKET", "https://checkout.visa.com/session/guest"}, {"mc_frictionless", "TENDER_ADYEN_MC_FRICTIONLESS_TICKET", "https://checkout.mastercard.com/session/guest"}, {"mc_purchase", "TENDER_ADYEN_MC_PURCHASE_TICKET", "https://checkout.mastercard.com/session/account"}} {
 		t.Setenv(tc.env, tc.ticket)
 		if _, err := browserTicket(tc.name, tc.env); err != nil {
 			t.Errorf("valid independent %s route rejected", tc.name)
 		}
 	}
-	t.Setenv("TENDER_ADYEN_VISA_CHALLENGE_TICKET", "https://mc.example.test/session/guest")
+	t.Setenv("TENDER_ADYEN_VISA_CHALLENGE_TICKET", "https://checkout.mastercard.com/session/guest")
 	if _, err := browserTicket("visa_challenge", "TENDER_ADYEN_VISA_CHALLENGE_TICKET"); err == nil {
 		t.Fatal("accepted a ticket for the other brand host")
+	}
+}
+
+func TestSandboxBrowserRejectsMockOrigin(t *testing.T) {
+	t.Setenv("TENDER_ADYEN_VISA_ORIGIN", "https://127.0.0.1")
+	t.Setenv("TENDER_ADYEN_VISA_CHALLENGE_TICKET", "https://127.0.0.1/session/guest")
+	if _, err := browserTicket("visa_challenge", "TENDER_ADYEN_VISA_CHALLENGE_TICKET"); err == nil {
+		t.Fatal("accepted a loopback browser ticket as official merchant evidence")
+	}
+}
+
+func TestSandboxHarnessRejectsStaleEvidence(t *testing.T) {
+	path := t.TempDir() + "/report.csv"
+	if err := os.WriteFile(path, []byte("report"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().Add(-31 * 24 * time.Hour)
+	if err := os.Chtimes(path, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	if err := freshEvidenceFile(path); err == nil {
+		t.Fatal("accepted a stale sandbox export")
+	}
+}
+
+// Every workflow-selected qualification must fail visibly without protected
+// merchant access. A PASS or Skip here would make a missing secret look green.
+func TestSandboxHarnessOffline(t *testing.T) {
+	for _, name := range []string{"TestAdyenSandboxBrowser", "TestAdyenSandboxPortal", "TestPayPalSandboxTransaction", "TestKlarnaSandboxOrderRecord", "TestACHSandboxSessions", "TestACHSandboxReport"} {
+		t.Run(name, func(t *testing.T) {
+			cmd := exec.CommandContext(t.Context(), "go", "test", "-count=1", "-tags=sandbox", "-run", "^"+name+"$", "-v", ".")
+			for _, pair := range os.Environ() {
+				if !strings.HasPrefix(pair, "TENDER_") && !strings.HasPrefix(pair, "PAYMENTS_ENV=") {
+					cmd.Env = append(cmd.Env, pair)
+				}
+			}
+			cmd.Env = append(cmd.Env, "PAYMENTS_ENV=sandbox", "GOPROXY=off")
+			output, err := cmd.CombinedOutput()
+			if err == nil || !bytes.Contains(output, []byte("BLOCKED:")) || !bytes.Contains(output, []byte("--- FAIL: "+name)) || bytes.Contains(output, []byte("--- SKIP:")) || bytes.Contains(output, []byte("--- PASS:")) {
+				t.Fatalf("no-secret %s was not visibly BLOCKED: %s", name, output)
+			}
+		})
 	}
 }

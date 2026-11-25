@@ -60,8 +60,10 @@ async function run() {
       script.src = sdk; document.head.appendChild(script);
       await loaded;
       const { AdyenCheckout, Ach } = window.AdyenWeb;
+      const recordResult = outcome => { if (typeof outcome?.sessionResult === "string") window.__tenderSessionResult = outcome.sessionResult; };
       const checkout = await AdyenCheckout({environment:"test",countryCode:"US",locale:"en-US",
-        clientKey:key,session,analytics:{enabled:false}});
+        clientKey:key,session,analytics:{enabled:false},
+        onPaymentCompleted:recordResult,onPaymentFailed:recordResult});
       new Ach(checkout, {hasHolderName:true,enableStoreDetails:false}).mount("#ach");
     }, { sdk, key, session });
     await page.getByRole("combobox").click();
@@ -82,6 +84,10 @@ async function run() {
     assert.equal(violation || denied(), false);
     assert.equal(page.url(), location);
     assert.equal(ctx.pages().length, 1);
+    await page.waitForFunction(() => typeof window.__tenderSessionResult === "string" && window.__tenderSessionResult.length > 0, null, {timeout:15000});
+    const sessionResult = await page.evaluate(() => window.__tenderSessionResult);
+    assert.ok(sessionResult.length <= 8192);
+    process.stdout.write(JSON.stringify({sessionResult}) + "\n");
   } finally {await browser.close()}
 }
 run().catch(() => {process.exitCode = 1});

@@ -15,6 +15,17 @@ import (
 	"time"
 )
 
+type klarnaHostEvidence struct {
+	MerchantAccount, OrderID, MerchantReference1, MerchantReference2, CaptureID, RefundID, FinancingMethod string
+	OrderAmount, CapturedAmount, RefundedAmount                                                            int64
+}
+
+var klarnaUUID = regexp.MustCompile(`(?i)^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`)
+
+func validKlarnaHost(host klarnaHostEvidence, merchant string) bool {
+	return merchant != "" && host.MerchantAccount == merchant && klarnaUUID.MatchString(host.OrderID) && klarnaUUID.MatchString(host.CaptureID) && klarnaUUID.MatchString(host.RefundID) && klarna.IsUSFinancing("US", "USD", host.FinancingMethod) && host.MerchantReference1 != "" && host.MerchantReference2 != "" && host.OrderAmount > 0 && host.CapturedAmount > 0 && host.CapturedAmount <= host.OrderAmount && host.RefundedAmount > 0 && host.RefundedAmount < host.CapturedAmount
+}
+
 // TestKlarnaSandboxOrderRecord compares a previously purchased, partially
 // refunded order in the NA playground with independently exported host values.
 // It only reads. A pass establishes order-record agreement for this sample.
@@ -22,25 +33,24 @@ func TestKlarnaSandboxOrderRecord(t *testing.T) {
 	if os.Getenv("PAYMENTS_ENV") != "sandbox" {
 		t.Fatal("BLOCKED: select PAYMENTS_ENV=sandbox and supply the merchant's NA playground order evidence")
 	}
-	key, path := os.Getenv("TENDER_KLARNA_API_KEY"), os.Getenv("TENDER_KLARNA_HOST_EVIDENCE")
-	if !strings.HasPrefix(key, "klarna_test_api_") || path == "" {
-		t.Fatal("BLOCKED: supply a Klarna NA playground API key and the host's exported order evidence")
+	key, path, merchant := os.Getenv("TENDER_KLARNA_API_KEY"), os.Getenv("TENDER_KLARNA_HOST_EVIDENCE"), os.Getenv("TENDER_KLARNA_MERCHANT_ACCOUNT")
+	if !strings.HasPrefix(key, "klarna_test_api_") || path == "" || merchant == "" {
+		t.Fatal("BLOCKED: supply the Klarna NA playground API key, merchant account and host export")
+	}
+	if err := freshEvidenceFile(path); err != nil {
+		t.Fatal(err)
 	}
 	f, err := os.Open(path)
 	if err != nil {
 		t.Fatal("BLOCKED: host evidence is unreadable")
 	}
 	defer f.Close()
-	var host struct {
-		OrderID, MerchantReference1, MerchantReference2, CaptureID, RefundID, FinancingMethod string
-		OrderAmount, CapturedAmount, RefundedAmount                                           int64
-	}
+	var host klarnaHostEvidence
 	raw, err := io.ReadAll(io.LimitReader(f, 8193))
 	if err != nil || len(raw) > 8192 || json.Unmarshal(raw, &host) != nil {
 		t.Fatal("BLOCKED: invalid host evidence")
 	}
-	uuid := regexp.MustCompile(`(?i)^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`)
-	if !uuid.MatchString(host.OrderID) || !uuid.MatchString(host.CaptureID) || !uuid.MatchString(host.RefundID) || !klarna.IsUSFinancing("US", "USD", host.FinancingMethod) || host.MerchantReference1 == "" || host.MerchantReference2 == "" || host.OrderAmount <= 0 || host.CapturedAmount > host.OrderAmount || host.RefundedAmount <= 0 || host.RefundedAmount >= host.CapturedAmount {
+	if !validKlarnaHost(host, merchant) {
 		t.Fatal("BLOCKED: host evidence must identify a captured US/USD order and its partial refund")
 	}
 	req, err := http.NewRequestWithContext(t.Context(), "GET", klarna.PlaygroundURL+"/ordermanagement/v1/orders/"+host.OrderID, nil)
@@ -95,5 +105,20 @@ func TestKlarnaSandboxOrderRecord(t *testing.T) {
 	}
 	if !capture || !refund {
 		t.Fatal("capture or refund reference missing from playground order")
+	}
+	t.Fatal("BLOCKED: read-only order record does not prove host-issued adapter mutation, genuine callback, authenticated payout report, or approved on-page financing path")
+}
+
+func TestKlarnaSandboxEvidenceRejectsWrongMerchantAndProduct(t *testing.T) {
+	host := klarnaHostEvidence{MerchantAccount: "seller-a", FinancingMethod: "FIXED_AMOUNT", OrderID: "11111111-1111-1111-1111-111111111111", CaptureID: "22222222-2222-2222-2222-222222222222", RefundID: "33333333-3333-3333-3333-333333333333", MerchantReference1: "order", MerchantReference2: "payment", OrderAmount: 1000, CapturedAmount: 1000, RefundedAmount: 100}
+	if !validKlarnaHost(host, "seller-a") {
+		t.Fatal("valid host evidence rejected")
+	}
+	if validKlarnaHost(host, "seller-b") {
+		t.Fatal("accepted another merchant's order")
+	}
+	host.FinancingMethod = "pay_now"
+	if validKlarnaHost(host, "seller-a") {
+		t.Fatal("accepted an unrelated payment product")
 	}
 }
