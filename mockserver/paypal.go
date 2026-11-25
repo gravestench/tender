@@ -70,6 +70,8 @@ func PayPalRoutes(c PayPalFixture) func(*Server) http.Handler {
 		mux := http.NewServeMux()
 		mux.HandleFunc("POST /v1/oauth2/token", f.oauth)
 		mux.HandleFunc("POST /fixture/orders/{id}/{decision}", f.buyer)
+		mux.HandleFunc("POST /fixture/capture-next/{status}", f.captureNext)
+		mux.HandleFunc("POST /fixture/orders/{id}/capture-status/{status}", f.captureStatus)
 		for route, path := range map[string]string{"create": "POST /v2/checkout/orders", "order": "GET /v2/checkout/orders/{id}", "capture": "POST /v2/checkout/orders/{id}/capture", "refund": "POST /v2/payments/captures/{id}/refund", "showRefund": "GET /v2/payments/refunds/{id}", "verify": "POST /v1/notifications/verify-webhook-signature"} {
 			mux.Handle(path, s.Route("paypal."+route, func(w http.ResponseWriter, r *http.Request, step Scenario) { f.serve(w, r, route, step) }))
 		}
@@ -137,6 +139,42 @@ func (f *ppFixture) buyer(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(204)
 }
+func (f *ppFixture) captureNext(w http.ResponseWriter, r *http.Request) {
+	status := r.PathValue("status")
+	if status != "PENDING" && status != "DENIED" {
+		w.WriteHeader(400)
+		return
+	}
+	f.mu.Lock()
+	f.records["paypal/capture-next"] = Record{Key: "paypal/capture-next", Data: []byte(status)}
+	f.mu.Unlock()
+	w.WriteHeader(204)
+}
+func (f *ppFixture) captureStatus(w http.ResponseWriter, r *http.Request) {
+	status := r.PathValue("status")
+	if status != "COMPLETED" && status != "PENDING" && status != "DENIED" {
+		w.WriteHeader(400)
+		return
+	}
+	f.mu.Lock()
+	o, ok := f.readOrder(r.PathValue("id"))
+	if !ok || len(o.Units) != 1 || o.Units[0].Payments == nil || len(o.Units[0].Payments.Captures) != 1 {
+		f.mu.Unlock()
+		w.WriteHeader(409)
+		return
+	}
+	c := &o.Units[0].Payments.Captures[0]
+	if status == "DENIED" {
+		c.Status = "FAILED"
+	} else {
+		c.Status = status
+	}
+	fx := PayPalRecord{OrderID: o.ID, ResourceID: c.ID, MerchantAccount: f.cfg.MerchantAccount, Value: c.Amount.Value, Currency: c.Amount.Currency}
+	f.saveOrder(o)
+	f.mu.Unlock()
+	f.notifyStatus(fx, status, Scenario{})
+	w.WriteHeader(204)
+}
 func (f *ppFixture) serve(w http.ResponseWriter, r *http.Request, route string, step Scenario) {
 	auth := r.Header.Get("Authorization")
 	rec, ok := f.Lookup("paypal/bearer/" + strings.TrimPrefix(auth, "Bearer "))
@@ -183,7 +221,17 @@ func (f *ppFixture) serve(w http.ResponseWriter, r *http.Request, route string, 
 		return
 	}
 	if first && route == "capture" && f.cfg.WebhookURL != "" {
-		f.notify(fx, step)
+		status := "COMPLETED"
+		var o ppOrder
+		if json.Unmarshal(fx.Reply, &o) == nil && len(o.Units) == 1 && o.Units[0].Payments != nil && len(o.Units[0].Payments.Captures) == 1 {
+			if o.Units[0].Payments.Captures[0].Status == "PENDING" {
+				status = "PENDING"
+			}
+			if o.Units[0].Payments.Captures[0].Status == "FAILED" {
+				status = "DENIED"
+			}
+		}
+		f.notifyStatus(fx, status, step)
 	}
 	ppJSON(w, fx.Reply)
 }
@@ -249,9 +297,17 @@ func (f *ppFixture) mutate(route, id, key string, raw []byte) (PayPalRecord, boo
 		fx.ResourceID = ppID("C", k)
 		fx.Value, fx.Currency = u.Money.Value, u.Money.Currency
 		o.Status = "COMPLETED"
+		captureStatus := "COMPLETED"
+		if next, found := f.records["paypal/capture-next"]; found {
+			captureStatus = string(next.Data)
+			delete(f.records, "paypal/capture-next")
+		}
+		if captureStatus == "DENIED" {
+			captureStatus = "FAILED"
+		}
 		u.Payments = &struct {
 			Captures []ppCapture `json:"captures"`
-		}{[]ppCapture{{fx.ResourceID, "COMPLETED", u.Money, true}}}
+		}{[]ppCapture{{fx.ResourceID, captureStatus, u.Money, true}}}
 		fx.Reply, _ = json.Marshal(o)
 		f.commitLocked("paypal/capture/"+fx.ResourceID, []byte(o.ID))
 	case "refund":
@@ -311,11 +367,14 @@ func (f *ppFixture) signature(raw []byte, transmission, at string) string {
 	m.Write(raw)
 	return base64.StdEncoding.EncodeToString(m.Sum(nil))
 }
-func (f *ppFixture) notify(fx PayPalRecord, step Scenario) {
+func (f *ppFixture) notifyStatus(fx PayPalRecord, status string, step Scenario) {
 	eid := "WH-" + fx.ResourceID
+	if status != "COMPLETED" {
+		eid = "WH-" + status + "-" + fx.ResourceID
+	}
 	at := f.clock().UTC().Format(time.RFC3339Nano)
-	tid := "TX-" + fx.ResourceID
-	raw, _ := json.Marshal(map[string]any{"id": eid, "resource_type": "capture", "event_type": "PAYMENT.CAPTURE.COMPLETED", "resource": map[string]any{"id": fx.ResourceID, "status": "COMPLETED", "payee": ppPayee{fx.MerchantAccount}, "amount": ppMoney{fx.Value, fx.Currency}, "supplementary_data": map[string]any{"related_ids": map[string]string{"order_id": fx.OrderID}}}})
+	tid := "TX-" + eid
+	raw, _ := json.Marshal(map[string]any{"id": eid, "resource_type": "capture", "event_type": "PAYMENT.CAPTURE." + status, "resource": map[string]any{"id": fx.ResourceID, "status": status, "payee": ppPayee{fx.MerchantAccount}, "amount": ppMoney{fx.Value, fx.Currency}, "supplementary_data": map[string]any{"related_ids": map[string]string{"order_id": fx.OrderID}}}})
 	h := make(http.Header)
 	h.Set("PayPal-Auth-Algo", "SHA256withRSA")
 	h.Set("PayPal-Cert-Url", f.base+"/v1/notifications/certs/CERT-MOCK")
