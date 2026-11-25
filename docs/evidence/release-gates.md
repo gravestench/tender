@@ -1,11 +1,11 @@
 # Release gate ledger
 
-Updated 2026-11-24 on `codex/tender-v1`. **The four-rail v1.0 release is BLOCKED.** Local mock and PGlite results do not count as official provider sandbox proof. This ledger records the verification distinction and the evidence needed to change status.
+Updated 2026-11-25 with CI evidence from `main` at `ef4b55c`. **The four-rail v1.0 release is BLOCKED.** Green offline CI and local mock/PGlite results do not count as official provider sandbox proof. This ledger records the verification distinction and the evidence needed to change status.
 
 | Gate | Status | Evidence and missing work |
 | --- | --- | --- |
 | G1 — independent tagged import | **BLOCKED** | `examples/consumer` builds against the local module through a development `replace`. A published pre-release or v1 tag and clean external import without `replace` have not been run. |
-| G2 — unit, race, contract and offline browser | **PARTIAL** | The combined local candidate passed the commands below. Native multi-connection PostgreSQL conflict tests and remote CI have not run; provider financial/security review must remain clean after packaging. |
+| G2 — unit, race, contract and offline browser | **PASS for the offline candidate** | The [main branch CI run at `ef4b55c`](https://github.com/gravestench/tender/actions/runs/45516976421) completed successfully on 2026-11-25. Go 1.26/1.27 unit, race, build and vet jobs, the full native PostgreSQL 17.11 integration contracts, and the Chromium durable-consumer job all passed. This does not qualify a real provider transaction. |
 | G3 — actual sandbox capability evidence | **BLOCKED** | Adyen card, PayPal, Klarna and ACH lack merchant credentials and genuine transaction/report evidence. [Card](adyen.md) · [PayPal](paypal.md) · [Klarna](klarna.md) · [ACH](ach.md). |
 | G4 — strict on-page and sensitive-data policy | **BLOCKED** | Synthetic Chromium guards run, but supported mobile/desktop provider SDK and issuer flows are unverified. PayPal/Klarna ordinary web paths stay disabled; Adyen ACH still needs approved signed mandate handling. Security responsibilities are in [security.md](../security.md). |
 | Production activation | **BLOCKED** | Merchant contracts, PCI/ACH assessment, pricing, provider approval, approved low-value live pilot, actual payout and bank-deposit comparison remain separate from a library release. |
@@ -23,7 +23,20 @@ On 2026-11-24, the worktree based on `59dfe04` used Go 1.26.7, Node 26.12.1, pin
 | Five one-second fuzz targets | PASS for money JSON validation/addition, PayPal mutation errors, ACH settlement rows and Adyen signed Standard notifications. The webhook 512 KiB body-limit test also passed. |
 | `PAYMENTS_ENV=sandbox go test -tags=sandbox ./test/sandbox/... -run '^TestACHSandboxSessions$'` with no merchant secrets | **BLOCKED as required**, exit code 1 with an explicit missing test merchant/API/client key message. No official provider test was sent. |
 
-PGlite validates the SQL statements, migrations and restart paths but cannot prove independent backend lock/serialization behavior. The native PostgreSQL 17.11 GitHub Actions jobs and the protected sandbox workflow have no remote run yet. Synthetic browser checks include a desktop Chromium viewport and a mobile-emulated Adyen card viewport; physical mobile browsers and real SDK/issuer navigation are still unverified.
+PGlite validates the SQL statements, migrations and restart paths but cannot prove independent backend lock/serialization behavior. The native CI result below supplies that missing multi-backend test evidence. Synthetic browser checks include a desktop Chromium viewport and a mobile-emulated Adyen card viewport; physical mobile browsers and real SDK/issuer navigation are still unverified.
+
+## Remote offline CI
+
+[Offline Go checks run 45516976421](https://github.com/gravestench/tender/actions/runs/45516976421) was triggered by a push to `main` at `ef4b55c9b4562caca6fc7b671bd3ad883ffd774b`. GitHub reports status **completed**, conclusion **success** (updated 2026-11-25 00:19:57 UTC). Its four jobs and required steps were all successful:
+
+| Job | Verified step |
+| --- | --- |
+| `test (1.26.x)` | Build, unit tests, race detection, vet and independent consumer build. |
+| `test (1.27.x)` | The same build, unit, race, vet and consumer checks. |
+| `postgres` | Full `go test -race -tags=integration -count=1 -timeout=4m ./test/contract/...` against a native PostgreSQL 17.11 service, including the multi-backend conflict tests excluded from local PGlite. |
+| `browser` | Pinned Playwright/Chromium installation and full `go test -race -count=1 -timeout=5m -tags=e2e,integration ./test/e2e/...` against the standalone consumer and native PostgreSQL service. |
+
+The protected provider `sandbox` workflow has **not** run. No merchant credentials or genuine provider test transaction were used in this CI run. G3, G4 and merchant production activation remain blocked independently of G2.
 
 ## Offline commands
 
