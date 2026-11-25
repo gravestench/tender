@@ -283,6 +283,7 @@ func (e *Engine) Reconcile(ctx context.Context, report SettlementReport) (Reconc
 	if report.Feed != FeedHostVerified {
 		return ReconciliationRun{}, ErrUnsupported
 	}
+	started := time.Now()
 	digest, err := preparedReport(report)
 	if err != nil {
 		return ReconciliationRun{}, err
@@ -387,7 +388,24 @@ func (e *Engine) Reconcile(ctx context.Context, report SettlementReport) (Reconc
 	if conflicted {
 		return ReconciliationRun{}, fmt.Errorf("%w: report identity was reused with changed contents", ErrConflict)
 	}
+	lines, payouts := operationalDiscrepancyCounts(run)
+	e.observe(ctx, OperationalEvent{Kind: OperationalReconciliation, Duration: time.Since(started), Discrepancies: lines, PayoutDiscrepancies: payouts})
 	return run, nil
+}
+
+func operationalDiscrepancyCounts(run ReconciliationRun) (int, int) {
+	var lines, payouts int
+	for _, result := range run.Results {
+		if result.Outcome != ReconciliationMatched {
+			lines++
+		}
+	}
+	for _, result := range run.PayoutResults {
+		if result.Outcome != PayoutMatched {
+			payouts++
+		}
+	}
+	return lines, payouts
 }
 
 // Each successful modification operation or verified adverse identity can

@@ -176,6 +176,14 @@ func (t *transaction) InsertVerifiedEvent(key tender.VerifiedEventKey, evidence 
 	return dbError(err)
 }
 
+func (t *transaction) VerifiedEventReceivedAt(key tender.VerifiedEventKey) (time.Time, error) {
+	var received time.Time
+	err := t.tx.QueryRowContext(t.ctx, `SELECT received_at FROM tender_provider_events
+        WHERE merchant_id=$1 AND environment=$2 AND provider=$3 AND merchant_account=$4 AND event_id=$5`,
+		key.Scope.MerchantID, key.Scope.Environment, key.Provider, key.MerchantAccount, key.ID).Scan(&received)
+	return received, dbError(err)
+}
+
 func (t *transaction) ProcessVerifiedEvent(key tender.VerifiedEventKey, at time.Time, apply func(json.RawMessage) error) error {
 	if t.processing != nil {
 		return tender.ErrConflict

@@ -106,6 +106,12 @@ type VerifiedEventTx interface {
 	ProcessVerifiedEvent(VerifiedEventKey, time.Time, func(json.RawMessage) error) error
 }
 
+// VerifiedReceiptTimeReader optionally exposes the durable inbox receive time.
+// It is used only for operational lag measurements, never financial authority.
+type VerifiedReceiptTimeReader interface {
+	VerifiedEventReceivedAt(VerifiedEventKey) (time.Time, error)
+}
+
 // CaptureFailureNotice is a host review item for a processor's rejection of
 // a previously submitted capture. Its scope and operation ID deduplicate
 // delivery independently of the full-collection outbox.

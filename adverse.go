@@ -133,7 +133,10 @@ func (e *Engine) ProcessVerifiedAdverseEvent(ctx context.Context, id string, pro
 		return ErrValidation
 	}
 	key := AdverseKey{Scope: e.config.Scope, Provider: e.config.ProviderName, MerchantAccount: e.config.MerchantAccount, ProviderEventID: id}
-	return e.config.Store.Transact(ctx, func(tx Tx) error {
+	started := time.Now()
+	var receivedAt time.Time
+	var applied AdverseNotice
+	err := e.config.Store.Transact(ctx, func(tx Tx) error {
 		inbox, ok := tx.(VerifiedEventTx)
 		if !ok {
 			return ErrUnsupported
@@ -143,14 +146,23 @@ func (e *Engine) ProcessVerifiedAdverseEvent(ctx context.Context, id string, pro
 			return ErrUnsupported
 		}
 		verifiedKey := VerifiedEventKey{Scope: key.Scope, Provider: key.Provider, MerchantAccount: key.MerchantAccount, ID: key.ProviderEventID}
+		receivedAt = verifiedReceiptTime(tx, verifiedKey)
 		return inbox.ProcessVerifiedEvent(verifiedKey, e.config.Now().UTC(), func(evidence json.RawMessage) error {
 			n, err := project(tx, evidence)
 			if err != nil {
 				return err
 			}
-			return e.enqueueVerifiedAdverse(tx, review, key, verifiedKey, n)
+			if err := e.enqueueVerifiedAdverse(tx, review, key, verifiedKey, n); err != nil {
+				return err
+			}
+			applied = n
+			return nil
 		})
 	})
+	if err == nil && applied.PaymentID != "" {
+		e.observeReceipt(ctx, started, receivedAt, applied.PaymentID, applied.OperationID)
+	}
+	return err
 }
 
 // ProcessVerifiedEventWithAdverse applies a verified financial update and its
@@ -161,7 +173,10 @@ func (e *Engine) ProcessVerifiedEventWithAdverse(ctx context.Context, id string,
 	}
 	key := VerifiedEventKey{Scope: e.config.Scope, Provider: e.config.ProviderName, MerchantAccount: e.config.MerchantAccount, ID: id}
 	adverseKey := AdverseKey{Scope: key.Scope, Provider: key.Provider, MerchantAccount: key.MerchantAccount, ProviderEventID: id}
-	return e.config.Store.Transact(ctx, func(tx Tx) error {
+	started := time.Now()
+	var receivedAt time.Time
+	var applied Observation
+	err := e.config.Store.Transact(ctx, func(tx Tx) error {
 		inbox, ok := tx.(VerifiedEventTx)
 		if !ok {
 			return ErrUnsupported
@@ -170,6 +185,7 @@ func (e *Engine) ProcessVerifiedEventWithAdverse(ctx context.Context, id string,
 		if !ok {
 			return ErrUnsupported
 		}
+		receivedAt = verifiedReceiptTime(tx, key)
 		return inbox.ProcessVerifiedEvent(key, e.config.Now().UTC(), func(raw json.RawMessage) error {
 			event, notice, err := project(tx, raw)
 			if err != nil {
@@ -181,9 +197,17 @@ func (e *Engine) ProcessVerifiedEventWithAdverse(ctx context.Context, id string,
 			if _, err := e.applyTx(tx, state{}, event.Observation, "webhook"); err != nil {
 				return err
 			}
-			return e.enqueueVerifiedAdverse(tx, review, adverseKey, key, notice)
+			if err := e.enqueueVerifiedAdverse(tx, review, adverseKey, key, notice); err != nil {
+				return err
+			}
+			applied = event.Observation
+			return nil
 		})
 	})
+	if err == nil && applied.PaymentID != "" {
+		e.observeReceipt(ctx, started, receivedAt, applied.PaymentID, applied.OperationID)
+	}
+	return err
 }
 
 func (e *Engine) enqueueVerifiedAdverse(tx Tx, review AdverseReviewTx, key AdverseKey, verifiedKey VerifiedEventKey, n AdverseNotice) error {

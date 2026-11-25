@@ -18,8 +18,9 @@ type key struct {
 	id    string
 }
 type inboxEvent struct {
-	evidence  json.RawMessage
-	processed bool
+	evidence   json.RawMessage
+	processed  bool
+	receivedAt time.Time
 }
 
 type memoryTx struct {
@@ -252,8 +253,16 @@ func (t *memoryTx) InsertVerifiedEvent(key tender.VerifiedEventKey, evidence jso
 	if _, found := t.events[key]; found {
 		return tender.ErrConflict
 	}
-	t.events[key] = inboxEvent{evidence: slices.Clone(evidence)}
+	t.events[key] = inboxEvent{evidence: slices.Clone(evidence), receivedAt: time.Now().UTC()}
 	return nil
+}
+
+func (t *memoryTx) VerifiedEventReceivedAt(key tender.VerifiedEventKey) (time.Time, error) {
+	event, ok := t.events[key]
+	if !ok {
+		return time.Time{}, tender.ErrNotFound
+	}
+	return event.receivedAt, nil
 }
 
 func (t *memoryTx) ProcessVerifiedEvent(key tender.VerifiedEventKey, _ time.Time, apply func(json.RawMessage) error) error {
