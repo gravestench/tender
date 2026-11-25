@@ -34,7 +34,7 @@ jobs:
         working-directory: examples/consumer
         env:
           GOWORK: 'off'
-        run: go build ./...
+        run: go build -o "$RUNNER_TEMP/tender-consumer" .
 
   postgres:
     runs-on: ubuntu-latest

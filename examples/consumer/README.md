@@ -71,7 +71,7 @@ The offline E2E, sandbox cases and Customer Area comparison instructions are in 
 
 ## Verify the example
 
-Build the separate module from this directory with `GOWORK=off go build ./...`. From the repository root, run the HTTP tests with `go test -tags=e2e ./test/e2e -run 'TestConsumerMountsOnOneListener|TestTrustedOrderAmount|TestConsumerSyntheticAction'`.
+Build the separate module from this directory with `GOWORK=off go build -o /tmp/tender-consumer .` so the executable stays outside the checkout. From the repository root, run the HTTP tests with `go test -tags=e2e ./test/e2e -run 'TestConsumerMountsOnOneListener|TestTrustedOrderAmount|TestConsumerSyntheticAction'`.
 
 The browser test requires Node, Playwright (tested with 1.62.1), and Chromium installed before the offline test run. Set TENDER_PLAYWRIGHT to the absolute installed Playwright module path if it is outside Node's module search path. Set TENDER_CHROMIUM to the installed browser executable when using a separate Chromium installation. An ephemeral loopback proxy permits only the configured destinations, including every HTTPS tunnel and redirect hop. Chromium disables QUIC and HTTP/2 connection coalescing during these checks. The harness blocks service workers and WebSockets. OpenSSL supplies ephemeral test certificates for the local HTTPS policy regression. Set TENDER_TEST_DATABASE_URL to a local disposable PostgreSQL database for the Adyen flow. Run the whole offline consumer slice with `GOPROXY=off go test -count=1 -tags=e2e ./test/e2e` after populating the Go module cache.
 
@@ -87,7 +87,7 @@ go mod edit -dropreplace=github.com/gravestench/tender
 go get "github.com/gravestench/tender@$TENDER_TAG"
 go mod tidy
 go list -m -json github.com/gravestench/tender
-go build ./...
+go build -o /tmp/tender-consumer-tag .
 ```
 
 Check that the selected Version is the published tag and that Replace is absent. This verification needs the published module in the chosen Go proxy or module cache.
