@@ -309,19 +309,17 @@ func (e *Engine) Reconcile(ctx context.Context, report SettlementReport) (Reconc
 			for _, r := range history {
 				latest[r.LineID] = r
 			}
-			results := make([]ReconciliationResult, 0, len(report.Lines))
-			for _, line := range report.Lines {
-				result, err := e.matchSettlementLine(tx, line)
-				if err != nil {
-					return err
-				}
-				if !sameReconciliationResult(result, latest[line.ID]) {
+			results, err := e.matchSettlementLines(tx, report.Lines)
+			if err != nil {
+				return err
+			}
+			for _, result := range results {
+				if !sameReconciliationResult(result, latest[result.LineID]) {
 					if err := tx.AppendReconciliationResult(scope, provider, account, report.ID, result); err != nil {
 						return err
 					}
 				}
 				prior.Results = append(prior.Results, result)
-				results = append(results, result)
 			}
 			payoutResults, err := reconcilePayouts(report, results)
 			if err != nil {
@@ -360,10 +358,12 @@ func (e *Engine) Reconcile(ctx context.Context, report SettlementReport) (Reconc
 			if err := tx.InsertSettlementLine(scope, provider, account, report.ID, line); err != nil {
 				return err
 			}
-			result, err := e.matchSettlementLine(tx, line)
-			if err != nil {
-				return err
-			}
+		}
+		results, err := e.matchSettlementLines(tx, report.Lines)
+		if err != nil {
+			return err
+		}
+		for _, result := range results {
 			if err := tx.AppendReconciliationResult(scope, provider, account, report.ID, result); err != nil {
 				return err
 			}
@@ -388,6 +388,32 @@ func (e *Engine) Reconcile(ctx context.Context, report SettlementReport) (Reconc
 		return ReconciliationRun{}, fmt.Errorf("%w: report identity was reused with changed contents", ErrConflict)
 	}
 	return run, nil
+}
+
+// Each successful modification operation can contribute principal once to a
+// report. Split provider rows need a separate, proven aggregate contract.
+func (e *Engine) matchSettlementLines(tx ReconciliationTx, lines []SettlementLine) ([]ReconciliationResult, error) {
+	type movementKey struct{ paymentID, modification string }
+	seen := make(map[movementKey]int)
+	results := make([]ReconciliationResult, len(lines))
+	for i, line := range lines {
+		result, err := e.matchSettlementLine(tx, line)
+		if err != nil {
+			return nil, err
+		}
+		results[i] = result
+		if line.BatchID == "" || (line.Kind != SettlementCaptured && line.Kind != SettlementRefunded) || result.Outcome != ReconciliationMatched {
+			continue
+		}
+		key := movementKey{result.PaymentID, line.ModificationReference}
+		if prior, duplicate := seen[key]; duplicate {
+			results[prior].Outcome = ReconciliationUnconfirmed
+			results[i].Outcome = ReconciliationUnconfirmed
+		} else {
+			seen[key] = i
+		}
+	}
+	return results, nil
 }
 
 // JSONB stores the instant but not Go's monotonic reading or location.
@@ -426,6 +452,10 @@ func reconcilePayouts(report SettlementReport, lines []ReconciliationResult) ([]
 	sectionUnconfirmed := make(map[string]bool)
 	sectionIncomplete := make(map[string]bool)
 	sectionCurrencyMismatch := make(map[string]bool)
+	payoutReferences := make(map[string]int, len(report.Payouts))
+	for _, payout := range report.Payouts {
+		payoutReferences[payout.PayoutReference]++
+	}
 	for _, part := range report.Parts {
 		if _, exists := parts[part.ID]; exists {
 			return nil, ErrConflict
@@ -570,14 +600,13 @@ func reconcilePayouts(report SettlementReport, lines []ReconciliationResult) ([]
 		expected, reported                                                     int64
 		payouts                                                                []PayoutLine
 		incomplete, unconfirmed, providerMismatch, duplicate, currencyMismatch bool
-		seenReferences                                                         map[string]bool
 	}
 	batches := make(map[batchKey]*batchState)
 	for _, section := range report.Sections {
 		key := batchKey{section.BatchID, section.Currency}
 		state := batches[key]
 		if state == nil {
-			state = &batchState{seenReferences: make(map[string]bool)}
+			state = &batchState{}
 			batches[key] = state
 		}
 		var err error
@@ -601,10 +630,9 @@ func reconcilePayouts(report SettlementReport, lines []ReconciliationResult) ([]
 			if err != nil {
 				return nil, err
 			}
-			if state.seenReferences[payout.PayoutReference] {
+			if payoutReferences[payout.PayoutReference] > 1 {
 				state.duplicate = true
 			}
-			state.seenReferences[payout.PayoutReference] = true
 			state.payouts = append(state.payouts, payout)
 		}
 		if section.DeclaredPayoutMinor != nil && *section.DeclaredPayoutMinor != sectionPayoutTotal {

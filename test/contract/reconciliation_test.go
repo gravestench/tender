@@ -456,6 +456,21 @@ func TestReconcilePayoutBatches(t *testing.T) {
 	if err != nil || missingModificationRun.Results[0].Outcome != tender.ReconciliationUnconfirmed || missingModificationRun.PayoutResults[0].Outcome != tender.PayoutUnconfirmed {
 		t.Fatalf("capture without exact modification matched: %+v, %v", missingModificationRun, err)
 	}
+	doubleCapture := int64(20000)
+	duplicateCapture := tender.SettlementReport{
+		ID: "duplicate-capture-movement", Feed: tender.FeedHostVerified,
+		Lines: []tender.SettlementLine{
+			line("capture-copy-1", "psp-sale", "mod-sale", tender.SettlementCaptured, 10000, 0, 10000),
+			line("capture-copy-2", "psp-sale", "mod-sale", tender.SettlementCaptured, 10000, 0, 10000),
+		},
+		Payouts:  []tender.PayoutLine{{ID: "duplicate-capture-payout", BatchID: "batch-1", SourcePartID: "part-1", SourceSectionID: "section-1", Currency: "USD", PayoutReference: "bank-duplicate-capture", AmountMinor: 20000, ObservedAt: now}},
+		Parts:    []tender.ReportPart{{ID: "part-1", SectionID: "section-1", Digest: "duplicate-capture-artifact", Number: 1, TotalParts: 1, DeclaredRows: 3}},
+		Sections: []tender.ReportSection{{ID: "section-1", BatchID: "batch-1", Currency: "USD", Number: 1, TotalSections: 1, DeclaredRows: 3, DeclaredNetMinor: &doubleCapture, DeclaredPayoutMinor: &doubleCapture}},
+	}
+	duplicateCaptureRun, err := restarted.Reconcile(ctx, duplicateCapture)
+	if err != nil || len(duplicateCaptureRun.PayoutResults) != 1 || duplicateCaptureRun.PayoutResults[0].Outcome == tender.PayoutMatched || duplicateCaptureRun.Results[0].Outcome == tender.ReconciliationMatched || duplicateCaptureRun.Results[1].Outcome == tender.ReconciliationMatched {
+		t.Fatalf("one capture operation counted twice toward payout: %+v, %v", duplicateCaptureRun, err)
+	}
 	unlinked := report
 	unlinked.ID = "unlinked-row"
 	unlinked.Lines = append([]tender.SettlementLine(nil), report.Lines...)
@@ -597,6 +612,31 @@ func TestReconcilePayoutBatches(t *testing.T) {
 	duplicatePayoutID.Payouts = append(append([]tender.PayoutLine(nil), report.Payouts...), report.Payouts[0])
 	if _, err := restarted.Reconcile(ctx, duplicatePayoutID); !errors.Is(err, tender.ErrConflict) {
 		t.Fatalf("duplicate payout row identity: %v", err)
+	}
+	salePayout, refundPayout := int64(10000), int64(-2500)
+	crossBatchReference := tender.SettlementReport{
+		ID: "cross-batch-payout-reference", Feed: tender.FeedHostVerified,
+		Lines: []tender.SettlementLine{
+			line("cross-batch-sale", "psp-sale", "mod-sale", tender.SettlementCaptured, 10000, 0, 10000),
+			line("cross-batch-refund", "psp-refund", "mod-refund", tender.SettlementRefunded, -2500, 0, -2500),
+		},
+		Payouts: []tender.PayoutLine{
+			{ID: "cross-batch-payout-1", BatchID: "batch-1", SourcePartID: "part-1", SourceSectionID: "section-1", Currency: "USD", PayoutReference: "reused-bank-movement", AmountMinor: 10000, ObservedAt: now},
+			{ID: "cross-batch-payout-2", BatchID: "batch-2", SourcePartID: "part-2", SourceSectionID: "section-2", Currency: "USD", PayoutReference: "reused-bank-movement", AmountMinor: -2500, ObservedAt: now},
+		},
+		Parts: []tender.ReportPart{
+			{ID: "part-1", SectionID: "section-1", Digest: "cross-batch-artifact-1", Number: 1, TotalParts: 1, DeclaredRows: 2},
+			{ID: "part-2", SectionID: "section-2", Digest: "cross-batch-artifact-2", Number: 1, TotalParts: 1, DeclaredRows: 2},
+		},
+		Sections: []tender.ReportSection{
+			{ID: "section-1", BatchID: "batch-1", Currency: "USD", Number: 1, TotalSections: 1, DeclaredRows: 2, DeclaredNetMinor: &salePayout, DeclaredPayoutMinor: &salePayout},
+			{ID: "section-2", BatchID: "batch-2", Currency: "USD", Number: 1, TotalSections: 1, DeclaredRows: 2, DeclaredNetMinor: &refundPayout, DeclaredPayoutMinor: &refundPayout},
+		},
+	}
+	crossBatchReference.Lines[1].BatchID, crossBatchReference.Lines[1].SourcePartID, crossBatchReference.Lines[1].SourceSectionID = "batch-2", "part-2", "section-2"
+	crossBatchRun, err := restarted.Reconcile(ctx, crossBatchReference)
+	if err != nil || len(crossBatchRun.PayoutResults) != 2 || crossBatchRun.PayoutResults[0].Outcome != tender.PayoutDuplicate || crossBatchRun.PayoutResults[1].Outcome != tender.PayoutDuplicate {
+		t.Fatalf("bank payout reference reused across batches: %+v, %v", crossBatchRun.PayoutResults, err)
 	}
 	otherScope := tender.Scope{MerchantID: "another-payout-shop", Environment: tender.EnvironmentMock}
 	otherEngine, err := tender.NewEngine(tender.EngineConfig{Store: store, Provider: storageProvider{}, Scope: otherScope, ProviderName: "adyen", MerchantAccount: "acct", Market: market})
