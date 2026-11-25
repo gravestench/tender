@@ -1059,13 +1059,18 @@ func TestAdyenWebhookReplayCaptureFailureSQL(t *testing.T) {
 
 type missingReviewStore struct{ *store.Memory }
 
+type scopedOperationReferenceReader interface {
+	OperationByMerchantReference(tender.Scope, string, string, string) (tender.OperationRecord, error)
+}
+
 func (s missingReviewStore) Transact(ctx context.Context, fn func(tender.Tx) error) error {
 	return s.Memory.Transact(ctx, func(tx tender.Tx) error {
 		return fn(struct {
 			tender.Tx
 			tender.VerifiedEvidenceReader
 			tender.VerifiedEventTx
-		}{tx, tx.(tender.VerifiedEvidenceReader), tx.(tender.VerifiedEventTx)})
+			scopedOperationReferenceReader
+		}{tx, tx.(tender.VerifiedEvidenceReader), tx.(tender.VerifiedEventTx), tx.(scopedOperationReferenceReader)})
 	})
 }
 
