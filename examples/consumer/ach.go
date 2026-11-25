@@ -8,11 +8,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"html/template"
 	"io"
 	"net/http"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/gravestench/tender"
@@ -34,8 +34,7 @@ type achCheckout struct {
 	store       tender.Store
 	client      *http.Client
 	operatorKey string
-	mu          sync.Mutex
-	sessions    map[string]string
+	scenario    string
 }
 
 type achFixtureTransport struct {
@@ -92,7 +91,11 @@ func (a *app) installACH(mux *http.ServeMux, storage tender.Store) (func(), erro
 		return nil, err
 	}
 	target := a.origin + "/webhooks/adyen"
-	sim, err := mockserver.New(mockserver.Config{PublicBaseURL: a.origin + "/simulator", SigningKey: secret[:], AllowedCallbackTargets: []string{target}, Routes: mockserver.ACHRoutes(mockserver.ACHFixture{MerchantAccount: a.account, APIKey: cfg.APIKey, WebhookURL: target, ValidationRefused: mode == "validation-refusal", PendingResult: mode == "pending"})})
+	restored, err := a.restoredACHFixtures(mode)
+	if err != nil {
+		return nil, err
+	}
+	sim, err := mockserver.New(mockserver.Config{PublicBaseURL: a.origin + "/simulator", SigningKey: secret[:], AllowedCallbackTargets: []string{target}, Routes: mockserver.ACHRoutes(mockserver.ACHFixture{MerchantAccount: a.account, APIKey: cfg.APIKey, WebhookURL: target, ValidationRefused: mode == "validation-refusal", PendingResult: mode == "pending", Restored: restored})})
 	if err != nil {
 		return nil, err
 	}
@@ -102,7 +105,7 @@ func (a *app) installACH(mux *http.ServeMux, storage tender.Store) (func(), erro
 			return nil, err
 		}
 	}
-	ac := &achCheckout{app: a, sim: sim, adapter: adapter, hook: hook, store: storage, operatorKey: operatorKey, sessions: map[string]string{}, client: &http.Client{Transport: transport, Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
+	ac := &achCheckout{app: a, sim: sim, adapter: adapter, hook: hook, store: storage, operatorKey: operatorKey, scenario: mode, client: &http.Client{Transport: transport, Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	vendor := http.StripPrefix("/simulator", sim.Handler())
 	mux.HandleFunc("/simulator/", func(w http.ResponseWriter, r *http.Request) {
 		if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Fixture-Access")), []byte(access)) != 1 {
@@ -118,6 +121,64 @@ func (a *app) installACH(mux *http.ServeMux, storage tender.Store) (func(), erro
 	mux.HandleFunc("POST /operator/ach/orders/{order}/{operation}", ac.operate)
 	stop := a.startCheckoutWorker(wake, hook)
 	return func() { stop(); sim.Close(); baseTransport.CloseIdleConnections() }, nil
+}
+
+func (a *app) restoredACHFixtures(mode string) ([]mockserver.ACHFixtureState, error) {
+	rows, err := a.ledger.QueryContext(context.Background(), `SELECT order_id,payment_id,session_id,merchant_reference,amount_minor,expires_at,scenario,decision,returned
+ FROM consumer_ach_fixtures WHERE merchant_id=$1 AND environment=$2 ORDER BY order_id`, a.scope.MerchantID, a.scope.Environment)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []mockserver.ACHFixtureState
+	for rows.Next() {
+		var orderID, paymentID, scenario string
+		var state mockserver.ACHFixtureState
+		if err := rows.Scan(&orderID, &paymentID, &state.SessionID, &state.Reference, &state.Amount, &state.ExpiresAt, &scenario, &state.Decision, &state.Returned); err != nil {
+			return nil, err
+		}
+		matched := false
+		for _, o := range orders {
+			if o.ID == orderID && o.PaymentID == paymentID && o.Total.Minor == state.Amount && o.Total.Currency == "USD" {
+				matched = true
+				break
+			}
+		}
+		if !matched || scenario != mode {
+			return nil, errors.New("consumer: persisted ACH fixture does not match this mock checkout")
+		}
+		out = append(out, state)
+	}
+	return out, rows.Err()
+}
+
+func (ac *achCheckout) rememberSession(ctx context.Context, o order, p tender.Payment) error {
+	if p.Scope != ac.scope || p.Provider != ac.provider || p.MerchantAccount != ac.account || p.Market != ac.market || p.OrderID != o.ID || p.ID != o.PaymentID || p.Amount != o.Total {
+		return tender.ErrConflict
+	}
+	action, err := ac.adapter.CheckoutSession(p)
+	if err != nil {
+		return err
+	}
+	_, err = ac.ledger.ExecContext(ctx, `INSERT INTO consumer_ach_fixtures
+ (merchant_id,environment,order_id,payment_id,session_id,merchant_reference,amount_minor,expires_at,scenario)
+ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING`, ac.scope.MerchantID, ac.scope.Environment, o.ID, o.PaymentID, action.ID, action.Reference, o.Total.Minor, p.Action.ExpiresAt, ac.scenario)
+	if err != nil {
+		return err
+	}
+	var id, ref, scenario, decision string
+	var amount int64
+	var expires time.Time
+	var returned bool
+	err = ac.ledger.QueryRowContext(ctx, `SELECT session_id,merchant_reference,amount_minor,expires_at,scenario,decision,returned FROM consumer_ach_fixtures
+ WHERE merchant_id=$1 AND environment=$2 AND order_id=$3 AND payment_id=$4`, ac.scope.MerchantID, ac.scope.Environment, o.ID, o.PaymentID).Scan(&id, &ref, &amount, &expires, &scenario, &decision, &returned)
+	if err != nil {
+		return err
+	}
+	if id != action.ID || ref != action.Reference || amount != o.Total.Minor || expires.UnixMicro() != p.Action.ExpiresAt.UnixMicro() || scenario != ac.scenario {
+		return fmt.Errorf("%w: synthetic ACH fixture binding changed", tender.ErrConflict)
+	}
+	return ac.sim.RestoreACH(mockserver.ACHFixtureState{SessionID: id, Reference: ref, Amount: amount, ExpiresAt: expires, Decision: decision, Returned: returned})
 }
 
 func (ac *achCheckout) page(w http.ResponseWriter, r *http.Request, o order, s session) {
@@ -147,10 +208,16 @@ func (ac *achCheckout) start(w http.ResponseWriter, r *http.Request, o order, s 
 	if _, ok := ac.form(w, r, s, false); !ok {
 		return
 	}
-	_, err := ac.engine.Create(r.Context(), tender.Request{PaymentID: o.PaymentID, OrderID: o.ID, Key: "ach/start/" + o.ID, Amount: o.Total})
+	result, err := ac.engine.Create(r.Context(), tender.Request{PaymentID: o.PaymentID, OrderID: o.ID, Key: "ach/start/" + o.ID, Amount: o.Total})
 	if err != nil {
 		http.Error(w, "bank debit unavailable", 409)
 		return
+	}
+	if result.Payment.Status == tender.PaymentRequiresAction {
+		if err := ac.rememberSession(r.Context(), o, result.Payment); err != nil {
+			http.Error(w, "synthetic session persistence unavailable", 503)
+			return
+		}
 	}
 	ac.page(w, r, o, s)
 }
@@ -174,6 +241,10 @@ func (ac *achCheckout) consent(w http.ResponseWriter, r *http.Request, o order, 
 		http.Error(w, "bank consent unavailable", 409)
 		return
 	}
+	if err := ac.rememberSession(r.Context(), o, p); err != nil {
+		http.Error(w, "synthetic session persistence unavailable", 503)
+		return
+	}
 	res, err := ac.fixture(r.Context(), http.MethodPost, "/mock/consent/"+action.ID+"/"+decision)
 	if err != nil || res.StatusCode != http.StatusOK {
 		if res != nil {
@@ -189,9 +260,17 @@ func (ac *achCheckout) consent(w http.ResponseWriter, r *http.Request, o order, 
 		http.Error(w, "fixture consent unavailable", 503)
 		return
 	}
-	ac.mu.Lock()
-	ac.sessions[o.ID] = action.ID
-	ac.mu.Unlock()
+	changed, err := ac.ledger.ExecContext(r.Context(), `UPDATE consumer_ach_fixtures SET decision=$5
+ WHERE merchant_id=$1 AND environment=$2 AND order_id=$3 AND session_id=$4
+ AND (decision='' OR decision=$5)`, ac.scope.MerchantID, ac.scope.Environment, o.ID, action.ID, decision)
+	if err != nil {
+		http.Error(w, "synthetic consent persistence unavailable", 503)
+		return
+	}
+	if n, _ := changed.RowsAffected(); n != 1 {
+		http.Error(w, "synthetic consent changed", 409)
+		return
+	}
 	_, err = ac.engine.Confirm(r.Context(), tender.Request{PaymentID: o.PaymentID, Key: "ach/result/" + o.ID, Amount: o.Total, Token: receipt.SessionResult})
 	if err != nil && !errors.Is(err, tender.ErrDeclined) {
 		http.Error(w, "bank result unavailable", 409)
@@ -234,13 +313,39 @@ func (ac *achCheckout) operate(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	ac.mu.Lock()
-	id := ac.sessions[o.ID]
-	ac.mu.Unlock()
-	if id == "" {
+	var id, decision string
+	if err := ac.ledger.QueryRowContext(r.Context(), `SELECT session_id,decision FROM consumer_ach_fixtures
+ WHERE merchant_id=$1 AND environment=$2 AND order_id=$3 AND payment_id=$4`, ac.scope.MerchantID, ac.scope.Environment, o.ID, o.PaymentID).Scan(&id, &decision); err != nil || decision != "approve" {
 		http.Error(w, "fixture session unavailable", 409)
 		return
 	}
+	if op == "return" {
+		// Persist the operator's MOCK return intent before contacting the
+		// process-local simulator. A crash can delay proof, but cannot let a
+		// pending outbox notice be fulfilled in the meantime.
+		changed, err := ac.ledger.ExecContext(r.Context(), `UPDATE consumer_ach_fixtures SET returned=true
+ WHERE merchant_id=$1 AND environment=$2 AND order_id=$3 AND session_id=$4 AND decision='approve'`, ac.scope.MerchantID, ac.scope.Environment, o.ID, id)
+		if err != nil {
+			http.Error(w, "synthetic return persistence unavailable", 503)
+			return
+		}
+		if n, _ := changed.RowsAffected(); n != 1 {
+			http.Error(w, "synthetic return binding changed", 409)
+			return
+		}
+	}
+	// A new simulator process has no callback queue. Replaying its persisted
+	// synthetic consent reissues the same signed authorization, which Tender's
+	// verified inbox deduplicates before report projection.
+	auth, err := ac.fixture(r.Context(), http.MethodPost, "/mock/consent/"+id+"/approve")
+	if err != nil || auth.StatusCode != http.StatusOK {
+		if auth != nil {
+			auth.Body.Close()
+		}
+		http.Error(w, "fixture authorization unavailable", 503)
+		return
+	}
+	auth.Body.Close()
 	if op == "return" {
 		res, err := ac.fixture(r.Context(), http.MethodPost, "/mock/return/"+id)
 		if err != nil || res.StatusCode != http.StatusAccepted {

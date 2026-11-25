@@ -88,6 +88,21 @@ FOR UPDATE OF n,p`, a.scope.MerchantID, a.scope.Environment, o.PaymentID, o.ID).
 		p.Funds.Refunded != 0 || p.Funds.Returned != 0 || p.Funds.Disputed != 0 {
 		return nil // Hold the notice for host review after any conflicting facts.
 	}
+	if p.Market.Method == tender.MethodACH {
+		// A synthetic return request may be durable before its queued signed
+		// callback. It can only hold delivery, never establish returned funds.
+		// Lock its row so this decision orders against the operator update.
+		var returned bool
+		err = tx.QueryRowContext(ctx, `SELECT returned FROM consumer_ach_fixtures
+ WHERE merchant_id=$1 AND environment=$2 AND order_id=$3 AND payment_id=$4 FOR SHARE`,
+			a.scope.MerchantID, a.scope.Environment, o.ID, o.PaymentID).Scan(&returned)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil || returned {
+			return err
+		}
+	}
 	if p.Provider == "adyen" {
 		// In this two-order example the inbox table lock orders the final
 		// delivery decision against receipt INSERTs, including on restart.

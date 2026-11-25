@@ -55,6 +55,8 @@ func (a *ACH) CheckStore(_ tender.OperationKind, tx tender.Tx) error {
 		tender.VerifiedEventTx
 		tender.VerifiedEvidenceReader
 		tender.CaptureFailureTx
+		tender.AdverseReviewTx
+		tender.AdverseEvidenceReader
 	}); !ok {
 		return tender.ErrUnsupported
 	}

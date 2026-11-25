@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,6 +21,16 @@ import (
 type ACHFixture struct {
 	MerchantAccount, APIKey, WebhookURL string
 	ValidationRefused, PendingResult    bool
+	Restored                            []ACHFixtureState
+}
+
+// ACHFixtureState restores synthetic session facts supplied by a local host.
+// It contains no bank identity or account fields and is never provider proof.
+type ACHFixtureState struct {
+	SessionID, Reference, Decision string
+	Amount                         int64
+	ExpiresAt                      time.Time
+	Returned                       bool
 }
 type achFixtureServer struct {
 	*Server
@@ -38,6 +49,13 @@ func ACHRoutes(c ACHFixture) func(*Server) http.Handler {
 			return nil
 		}
 		f := &achFixtureServer{Server: s, cfg: c}
+		seen := make(map[string]bool, len(c.Restored))
+		for _, state := range c.Restored {
+			if seen[state.SessionID] || s.RestoreACH(state) != nil {
+				return nil
+			}
+			seen[state.SessionID] = true
+		}
 		mux := http.NewServeMux()
 		mux.Handle("POST /v72/sessions", s.Route("ach.sessions", f.create))
 		mux.Handle("GET /v72/sessions/{id}", s.Route("ach.result", f.result))
@@ -48,6 +66,51 @@ func ACHRoutes(c ACHFixture) func(*Server) http.Handler {
 	}
 }
 func achHash(s string) string { sum := sha256.Sum256([]byte(s)); return hex.EncodeToString(sum[:]) }
+
+// RestoreACH reconstructs only MOCK fixture state. Payment funds still require
+// Tender's signed callback and authenticated report paths. It is safe to call
+// after Create committed but before the host recorded the session row.
+func (s *Server) RestoreACH(state ACHFixtureState) error {
+	if len(state.SessionID) != 34 || !strings.HasPrefix(state.SessionID, "CS") ||
+		state.Reference == "" || len(state.Reference) > 80 || strings.ContainsAny(state.Reference, ":\\") ||
+		state.Amount <= 0 || state.ExpiresAt.IsZero() ||
+		state.Decision != "" && state.Decision != "approve" && state.Decision != "deny" ||
+		state.Returned && state.Decision != "approve" {
+		return errors.New("mockserver: invalid ACH fixture restoration")
+	}
+	p := achOrder{ID: state.SessionID, PSP: strings.ToUpper(achHash(state.SessionID + "payment")[:16]), Reference: state.Reference, Amount: adyenFixtureAmount{Value: state.Amount, Currency: "USD"}, Expires: state.ExpiresAt}
+	raw, _ := json.Marshal(p)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errors.New("mockserver: closed ACH fixture")
+	}
+	key := "ach/session/" + state.SessionID
+	if previous, exists := s.records[key]; exists {
+		var old achOrder
+		if json.Unmarshal(previous.Data, &old) != nil || old.ID != p.ID || old.PSP != p.PSP || old.Reference != p.Reference || old.Amount != p.Amount || old.Expires.UnixMicro() != p.Expires.UnixMicro() {
+			return errors.New("mockserver: conflicting ACH fixture session")
+		}
+	} else {
+		s.commitLocked(key, raw)
+	}
+	if state.Decision != "" {
+		key = "ach/consent/" + state.SessionID
+		if previous, exists := s.records[key]; exists && string(previous.Data) != state.Decision {
+			return errors.New("mockserver: conflicting ACH fixture consent")
+		}
+		s.commitLocked(key, []byte(state.Decision))
+	}
+	if state.Returned {
+		key = "ach/return/" + state.SessionID
+		returnPSP := strings.ToUpper(achHash(state.SessionID + "chargeback")[:16])
+		if previous, exists := s.records[key]; exists && string(previous.Data) != returnPSP {
+			return errors.New("mockserver: conflicting ACH fixture return")
+		}
+		s.commitLocked(key, []byte(returnPSP))
+	}
+	return nil
+}
 
 func (f *achFixtureServer) create(w http.ResponseWriter, r *http.Request, _ Scenario) {
 	if r.Header.Get("X-API-Key") != f.cfg.APIKey {
