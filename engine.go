@@ -12,6 +12,8 @@ import (
 	"math/rand/v2"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -33,8 +35,12 @@ type EngineConfig struct {
 }
 
 type Engine struct {
-	config EngineConfig
-	caps   Capabilities
+	config          EngineConfig
+	caps            Capabilities
+	observerMu      sync.Mutex
+	observerQueue   chan OperationalEvent
+	observerRunning bool
+	observerDropped atomic.Uint64
 }
 
 func NewEngine(c EngineConfig) (*Engine, error) {

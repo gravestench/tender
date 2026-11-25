@@ -16,6 +16,17 @@ type observerFunc func(context.Context, tender.OperationalEvent) error
 
 func (f observerFunc) Observe(ctx context.Context, e tender.OperationalEvent) error { return f(ctx, e) }
 
+func waitOperationalEvent(t *testing.T, events <-chan tender.OperationalEvent) tender.OperationalEvent {
+	t.Helper()
+	select {
+	case event := <-events:
+		return event
+	case <-time.After(2 * time.Second):
+		t.Fatal("observer event was not delivered")
+		return tender.OperationalEvent{}
+	}
+}
+
 func observedEngine(t *testing.T, db tender.Store, p tender.Provider, observer tender.Observer) *tender.Engine {
 	t.Helper()
 	e, err := tender.NewEngine(tender.EngineConfig{Store: db, Provider: p, Scope: shop, ProviderName: "acquirer", MerchantAccount: "merchant-account", Market: usVisa, Observer: observer})
@@ -23,6 +34,32 @@ func observedEngine(t *testing.T, db tender.Store, p tender.Provider, observer t
 		t.Fatal(err)
 	}
 	return e
+}
+
+func TestOperationalObserverBlockedSinkCannotHoldPayment(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	entered := make(chan struct{}, 1)
+	e := observedEngine(t, store.NewMemory(), &processor{execute: authorized}, observerFunc(func(context.Context, tender.OperationalEvent) error {
+		entered <- struct{}{}
+		<-release
+		return nil
+	}))
+	done := make(chan response, 1)
+	go func() { result, err := e.Create(t.Context(), purchase()); done <- response{result, err} }()
+	select {
+	case got := <-done:
+		if got.err != nil || got.result.Payment.Status != tender.PaymentAuthorized {
+			t.Fatalf("payment changed: %+v", got)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("observer blocked payment result after commit")
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("observer did not receive event")
+	}
 }
 
 func TestOperationalObserverProviderResult(t *testing.T) {
@@ -40,15 +77,12 @@ func TestOperationalObserverProviderResult(t *testing.T) {
 		}, tender.ErrUnknownOutcome},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			var events []tender.OperationalEvent
-			observer := observerFunc(func(_ context.Context, e tender.OperationalEvent) error { events = append(events, e); return nil })
+			events := make(chan tender.OperationalEvent, 1)
+			observer := observerFunc(func(_ context.Context, e tender.OperationalEvent) error { events <- e; return nil })
 			db := store.NewMemory()
 			e := observedEngine(t, db, &processor{execute: tc.provider}, observer)
 			result, _ := e.Create(t.Context(), purchase())
-			if len(events) != 1 {
-				t.Fatalf("got %d provider events, want 1", len(events))
-			}
-			got := events[0]
+			got := waitOperationalEvent(t, events)
 			if got.Kind != tender.OperationalProviderCall || got.ErrorKind != tc.want || got.Scope != shop || got.PaymentID != "payment" || got.OperationID != result.Operation.ID || got.Provider != "acquirer" || got.MerchantAccount != "merchant-account" || got.At.IsZero() || got.At.Location() != time.UTC || got.Duration < 0 {
 				t.Fatalf("event = %+v; result = %+v", got, result)
 			}
@@ -73,38 +107,38 @@ func TestOperationalObserverCanceledCaller(t *testing.T) {
 	db := store.NewMemory()
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	var events []tender.OperationalEvent
+	events := make(chan tender.OperationalEvent, 1)
 	e := observedEngine(t, db, &processor{execute: func(call context.Context, _ tender.ProviderRequest) (tender.Observation, error) {
 		cancel()
 		return tender.Observation{}, call.Err()
 	}}, observerFunc(func(observerCtx context.Context, event tender.OperationalEvent) error {
 		if observerCtx.Err() != nil {
-			t.Fatal("observer received canceled context")
+			t.Error("observer received canceled context")
 		}
-		events = append(events, event)
+		events <- event
 		return nil
 	}))
 	result, err := e.Create(ctx, purchase())
 	if result.Operation.Status != tender.OperationUnknown || !errors.Is(err, tender.ErrUnknownOutcome) {
 		t.Fatalf("canceled dispatched create = %+v, %v", result, err)
 	}
-	if len(events) != 1 || events[0].ErrorKind != tender.ErrUnknownOutcome {
-		t.Fatalf("events = %+v", events)
+	if got := waitOperationalEvent(t, events); got.ErrorKind != tender.ErrUnknownOutcome {
+		t.Fatalf("event = %+v", got)
 	}
 }
 
 func TestOperationalObserverWebhookLagAndReplay(t *testing.T) {
 	db := store.NewMemory()
 	var req tender.ProviderRequest
-	var events []tender.OperationalEvent
+	events := make(chan tender.OperationalEvent, 2)
 	var e *tender.Engine
 	observer := observerFunc(func(ctx context.Context, event tender.OperationalEvent) error {
 		if event.Kind == tender.OperationalWebhookReceipt {
 			if _, err := e.Get(ctx, "payment"); err != nil {
-				t.Fatalf("observer ran under store lock: %v", err)
+				t.Errorf("observer ran under store lock: %v", err)
 			}
 		}
-		events = append(events, event)
+		events <- event
 		return errors.New("observer is best effort")
 	})
 	e = observedEngine(t, db, &processor{execute: func(_ context.Context, r tender.ProviderRequest) (tender.Observation, error) {
@@ -114,6 +148,7 @@ func TestOperationalObserverWebhookLagAndReplay(t *testing.T) {
 	if _, err := e.Create(t.Context(), purchase()); err != nil {
 		t.Fatal(err)
 	}
+	_ = waitOperationalEvent(t, events)
 	key := tender.VerifiedEventKey{Scope: shop, Provider: "acquirer", MerchantAccount: "merchant-account", ID: "receipt"}
 	if err := db.Transact(t.Context(), func(tx tender.Tx) error {
 		return tx.(tender.VerifiedEventTx).InsertVerifiedEvent(key, json.RawMessage(`{"buyer":"secret-buyer","token":"secret-token"}`))
@@ -130,26 +165,36 @@ func TestOperationalObserverWebhookLagAndReplay(t *testing.T) {
 	if err := e.ProcessVerifiedEvent(t.Context(), "receipt", project); err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 2 || events[1].Kind != tender.OperationalWebhookReceipt || events[1].ReceiptLag <= 0 || events[1].PaymentID != "payment" || events[1].OperationID != req.Operation.ID {
-		t.Fatalf("events = %+v", events)
+	gotEvent := waitOperationalEvent(t, events)
+	if gotEvent.Kind != tender.OperationalWebhookReceipt || gotEvent.ReceiptLag <= 0 || gotEvent.PaymentID != "payment" || gotEvent.OperationID != req.Operation.ID {
+		t.Fatalf("event = %+v", gotEvent)
 	}
 	out, err := db.Outbox(t.Context(), shop)
 	if err != nil || len(out) != 1 {
 		t.Fatalf("outbox after observer error = %+v, %v", out, err)
 	}
-	b, _ := json.Marshal(events[1])
+	b, _ := json.Marshal(gotEvent)
 	if strings.Contains(string(b), "secret-buyer") || strings.Contains(string(b), "secret-token") || strings.Contains(string(b), `"receipt"`) {
 		t.Fatalf("event leaked raw receipt: %s", b)
 	}
 }
 
-type reconciliationStore struct{ tender.Store }
-type reconciliationTx struct{ tender.Tx }
+type reconciliationStore struct {
+	tender.Store
+	conflict bool
+}
+type reconciliationTx struct {
+	tender.Tx
+	conflict bool
+}
 
 func (s reconciliationStore) Transact(ctx context.Context, fn func(tender.Tx) error) error {
-	return s.Store.Transact(ctx, func(tx tender.Tx) error { return fn(reconciliationTx{tx}) })
+	return s.Store.Transact(ctx, func(tx tender.Tx) error { return fn(reconciliationTx{tx, s.conflict}) })
 }
-func (reconciliationTx) ReconciliationRun(tender.Scope, string, string, string) (tender.ReconciliationRun, error) {
+func (tx reconciliationTx) ReconciliationRun(tender.Scope, string, string, string) (tender.ReconciliationRun, error) {
+	if tx.conflict {
+		return tender.ReconciliationRun{ID: "sensitive-report-id", Digest: "different-digest"}, nil
+	}
 	return tender.ReconciliationRun{}, tender.ErrNotFound
 }
 func (reconciliationTx) InsertReconciliationRun(tender.Scope, string, string, tender.ReconciliationRun) error {
@@ -181,27 +226,28 @@ func (reconciliationTx) PayoutReconciliationResults(tender.Scope, string, string
 }
 
 func TestOperationalObserverReconciliationDiscrepancy(t *testing.T) {
-	var events []tender.OperationalEvent
+	events := make(chan tender.OperationalEvent, 1)
 	var e *tender.Engine
 	observer := observerFunc(func(ctx context.Context, event tender.OperationalEvent) error {
 		if event.Kind == tender.OperationalReconciliation {
 			if _, err := e.Get(ctx, "payment"); !errors.Is(err, tender.ErrNotFound) {
-				t.Fatalf("observer ran within store transaction: %v", err)
+				t.Errorf("observer ran within store transaction: %v", err)
 			}
 		}
-		events = append(events, event)
+		events <- event
 		return nil
 	})
-	e = observedEngine(t, reconciliationStore{store.NewMemory()}, &processor{execute: authorized}, observer)
+	e = observedEngine(t, reconciliationStore{Store: store.NewMemory()}, &processor{execute: authorized}, observer)
 	report := tender.SettlementReport{ID: "sensitive-report-id", Feed: tender.FeedHostVerified, Lines: []tender.SettlementLine{{ID: "sensitive-row-id", ProviderReference: "unmatched", Currency: "USD", Kind: tender.SettlementCaptured, GrossMinor: 100, FeeMinor: 0, NetMinor: 100, ObservedAt: time.Now().UTC()}}}
 	run, err := e.Reconcile(t.Context(), report)
 	if err != nil || len(run.Results) != 1 || run.Results[0].Outcome != tender.ReconciliationUnmatched {
 		t.Fatalf("reconcile = %+v, %v", run, err)
 	}
-	if len(events) != 1 || events[0].Kind != tender.OperationalReconciliation || events[0].Discrepancies != 1 || events[0].PayoutDiscrepancies != 0 {
-		t.Fatalf("events = %+v", events)
+	gotEvent := waitOperationalEvent(t, events)
+	if gotEvent.Kind != tender.OperationalReconciliation || gotEvent.Discrepancies != 1 || gotEvent.PayoutDiscrepancies != 0 {
+		t.Fatalf("event = %+v", gotEvent)
 	}
-	b, _ := json.Marshal(events[0])
+	b, _ := json.Marshal(gotEvent)
 	if strings.Contains(string(b), "sensitive-report-id") || strings.Contains(string(b), "sensitive-row-id") {
 		t.Fatalf("event leaked report evidence: %s", b)
 	}
@@ -220,9 +266,9 @@ func TestOperationalObserverNoticeOnlyReceipt(t *testing.T) {
 	if err := db.Transact(t.Context(), func(tx tender.Tx) error { return tx.InsertPayment(p) }); err != nil {
 		t.Fatal(err)
 	}
-	var events []tender.OperationalEvent
+	events := make(chan tender.OperationalEvent, 1)
 	e := observedEngine(t, db, &processor{execute: authorized}, observerFunc(func(_ context.Context, event tender.OperationalEvent) error {
-		events = append(events, event)
+		events <- event
 		return errors.New("host sink down")
 	}))
 	key := tender.VerifiedEventKey{Scope: shop, Provider: "acquirer", MerchantAccount: "merchant-account", ID: "dispute"}
@@ -241,8 +287,9 @@ func TestOperationalObserverNoticeOnlyReceipt(t *testing.T) {
 	if err := e.ProcessVerifiedAdverseEvent(t.Context(), "dispute", project); err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 1 || events[0].Kind != tender.OperationalWebhookReceipt || events[0].PaymentID != "payment" || events[0].ReceiptLag <= 0 {
-		t.Fatalf("events = %+v", events)
+	gotEvent := waitOperationalEvent(t, events)
+	if gotEvent.Kind != tender.OperationalWebhookReceipt || gotEvent.PaymentID != "payment" || gotEvent.ReceiptLag <= 0 {
+		t.Fatalf("event = %+v", gotEvent)
 	}
 	out, err := db.Outbox(t.Context(), shop)
 	if err != nil || len(out) != 0 {

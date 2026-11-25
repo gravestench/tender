@@ -157,6 +157,7 @@ func (a *Adapter) receipt(ctx context.Context, payment, id string) (authorizatio
 // ProcessAuthorization is a worker operation, invoked after callback
 // acknowledgment. Engine.Confirm and the inbox marker can each be retried.
 func (a *Adapter) ProcessAuthorization(ctx context.Context, e *tender.Engine, payment, id string) (tender.Result, error) {
+	started := time.Now()
 	p, err := e.Get(ctx, payment)
 	if err != nil {
 		return tender.Result{}, err
@@ -175,6 +176,8 @@ func (a *Adapter) ProcessAuthorization(ctx context.Context, e *tender.Engine, pa
 	if !superseded && res.Operation.Status != tender.OperationFailed && res.Operation.Status != tender.OperationPending && res.Operation.Status != tender.OperationSucceeded {
 		return res, err
 	}
+	var receivedAt time.Time
+	var processed bool
 	mark := a.cfg.Store.Transact(ctx, func(tx tender.Tx) error {
 		if superseded {
 			current, readErr := tx.Payment(a.cfg.Scope, p.ID)
@@ -195,8 +198,16 @@ func (a *Adapter) ProcessAuthorization(ctx context.Context, e *tender.Engine, pa
 		if !ok {
 			return tender.ErrUnsupported
 		}
-		return w.ProcessVerifiedEvent(a.key(id), a.cfg.Now(), func(json.RawMessage) error { return nil })
+		if reader, ok := tx.(tender.VerifiedReceiptTimeReader); ok {
+			if at, readErr := reader.VerifiedEventReceivedAt(a.key(id)); readErr == nil {
+				receivedAt = at
+			}
+		}
+		return w.ProcessVerifiedEvent(a.key(id), a.cfg.Now(), func(json.RawMessage) error { processed = true; return nil })
 	})
+	if mark == nil && processed {
+		e.ObserveVerifiedReceipt(ctx, started, receivedAt, p.ID, res.Operation.ID)
+	}
 	if superseded {
 		return res, mark
 	}

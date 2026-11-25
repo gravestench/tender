@@ -30,10 +30,21 @@ type OperationalEvent struct {
 	Discrepancies, PayoutDiscrepancies int
 }
 
-// Observer is optional. Implementations should return promptly and avoid
-// network calls. An error or panic is ignored by the financial operation.
+// Observer is optional. An error or panic is ignored by the financial operation.
 type Observer interface {
 	Observe(context.Context, OperationalEvent) error
+}
+
+const operationalObserverQueueSize = 64
+
+// DroppedOperationalEvents counts newest events discarded when the bounded
+// observer queue is full. It can be scraped by the host without invoking the
+// observer itself.
+func (e *Engine) DroppedOperationalEvents() uint64 {
+	if e == nil {
+		return 0
+	}
+	return e.observerDropped.Load()
 }
 
 func observedErrorKind(err error) ErrorKind {
@@ -65,8 +76,37 @@ func (e *Engine) observe(ctx context.Context, event OperationalEvent) {
 	event.Scope = e.config.Scope
 	event.Provider = e.config.ProviderName
 	event.MerchantAccount = e.config.MerchantAccount
-	defer func() { _ = recover() }()
-	_ = e.config.Observer.Observe(context.WithoutCancel(ctx), event)
+	e.observerMu.Lock()
+	if e.observerQueue == nil {
+		e.observerQueue = make(chan OperationalEvent, operationalObserverQueueSize)
+	}
+	select {
+	case e.observerQueue <- event:
+		if !e.observerRunning {
+			e.observerRunning = true
+			go e.drainObserver()
+		}
+	default:
+		e.observerDropped.Add(1)
+	}
+	e.observerMu.Unlock()
+}
+
+func (e *Engine) drainObserver() {
+	for {
+		event := <-e.observerQueue
+		func() {
+			defer func() { _ = recover() }()
+			_ = e.config.Observer.Observe(context.Background(), event)
+		}()
+		e.observerMu.Lock()
+		if len(e.observerQueue) == 0 {
+			e.observerRunning = false
+			e.observerMu.Unlock()
+			return
+		}
+		e.observerMu.Unlock()
+	}
 }
 
 func verifiedReceiptTime(tx Tx, key VerifiedEventKey) time.Time {
@@ -79,6 +119,16 @@ func verifiedReceiptTime(tx Tx, key VerifiedEventKey) time.Time {
 		return time.Time{}
 	}
 	return at
+}
+
+// ObserveVerifiedReceipt is an adapter-worker bridge for an inbox marker that
+// has just committed outside the Engine's own receipt methods. It accepts only
+// scoped opaque IDs and a persisted receive timestamp, never receipt evidence.
+func (e *Engine) ObserveVerifiedReceipt(ctx context.Context, started, receivedAt time.Time, paymentID, operationID string) {
+	if e == nil || !boundedOpaque(paymentID, 200) || operationID != "" && !boundedOpaque(operationID, 200) {
+		return
+	}
+	e.observeReceipt(ctx, started, receivedAt, paymentID, operationID)
 }
 
 func (e *Engine) observeReceipt(ctx context.Context, started time.Time, receivedAt time.Time, paymentID, operationID string) {
