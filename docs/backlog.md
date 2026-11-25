@@ -14,7 +14,7 @@ The milestone numbers follow the Tender v1.0 implementation handoff. Exit criter
 
 ## Early Blacktop integration
 
-1. Publish and independently verify the `v0.1.0-alpha.2` MOCK tag with a clean external import. The [release ledger](evidence/release-gates.md) records alpha.1 evidence and tracks the new tag's verification.
+1. The published `v0.1.0-alpha.2` MOCK tag passed a clean external import and durable loopback capture. [Release evidence](evidence/release-gates.md)
 2. Use the verified MOCK tag and the independent consumer to map Blacktop's order totals, merchant scope, callback verification, durable store, fulfillment outbox and refund workflow. A direct Blacktop code integration and production pilot have yet to run. Follow the [Blacktop integration guide](blacktop-integration.md).
 3. Obtain each merchant entitlement and run genuine sandbox browser, mutation, signed delivery and complete report checks. For ACH, approve and retain the one-time WEB debit mandate before real checkout. PayPal payout movement and refund/reversal report correlation remain v1 gaps.
 4. Complete an approved, low-value live pilot with actual fee and bank-deposit comparisons before claiming a Blacktop cost reduction. Continue G3/G4 for the four-rail v1.0 release.
