@@ -121,12 +121,13 @@ func (a *app) installKlarna(mux *http.ServeMux, db tender.Store) (func(), error)
 			case "recover-capture-all":
 				res, err := a.engine.Capture(r.Context(), tender.Request{PaymentID: o.PaymentID, Key: "klarna-fixture/capture-all/" + o.ID, Amount: o.Total})
 				if errors.Is(err, tender.ErrUnknownOutcome) && res.Operation.ID != "" {
-					_, err = a.engine.Recover(r.Context(), res.Operation.ID)
+					res, err = a.engine.Recover(r.Context(), res.Operation.ID)
 				}
 				if err != nil || a.project(r.Context(), o) != nil {
 					http.Error(w, "capture recovery unavailable", http.StatusConflict)
 					return
 				}
+				w.Header().Set("X-Tender-Mock-Provider-Order", res.Payment.ProviderReference)
 				w.WriteHeader(http.StatusNoContent)
 				return
 			}

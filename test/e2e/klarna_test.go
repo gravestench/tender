@@ -217,8 +217,15 @@ func TestKlarnaDurableLifecycle(t *testing.T) {
 						klarnaOperator(t, c, base, key, "capture-all", 409)
 						return
 					}
-					klarnaOperator(t, c, base, key, tc.recover, 204)
-					klarnaOperator(t, c, base, key, tc.recover, 204)
+					reference := klarnaOperator(t, c, base, key, tc.recover, 204)
+					if replay := klarnaOperator(t, c, base, key, tc.recover, 204); replay != reference {
+						t.Fatalf("capture recovery changed provider order: %q to %q", reference, replay)
+					}
+					captures := klarnaProviderState(t, c, d.Origin, reference, 2599, 0, "CAPTURED")
+					if len(captures) != 1 || captures[0].CaptureID == "" || captures[0].Captured != 2599 {
+						t.Fatalf("provider created %d captures after recovery: %+v", len(captures), captures)
+					}
+					klarnaProviderCapture(t, c, d.Origin, reference, captures[0])
 					if st := klarnaStatus(t, c, base); st.Status != "captured" || !st.Fulfilled || st.Funds == nil || st.Funds.Captured != 2599 {
 						t.Fatalf("recovered checkout: %+v", st)
 					}
@@ -378,7 +385,13 @@ func klarnaOperator(t *testing.T, c *http.Client, target, key, action string, wa
 	return res.Header.Get("X-Tender-Mock-Provider-Order")
 }
 
-func klarnaProviderState(t *testing.T, c *http.Client, origin, reference string, captured, refunded int64, state string) {
+type klarnaCapture struct {
+	CaptureID string `json:"capture_id"`
+	Reference string `json:"reference"`
+	Captured  int64  `json:"captured_amount"`
+}
+
+func klarnaProviderState(t *testing.T, c *http.Client, origin, reference string, captured, refunded int64, state string) []klarnaCapture {
 	t.Helper()
 	if reference == "" {
 		t.Fatal("operator did not identify provider order")
@@ -394,13 +407,33 @@ func klarnaProviderState(t *testing.T, c *http.Client, origin, reference string,
 	}
 	defer res.Body.Close()
 	var provider struct {
-		OrderID  string `json:"order_id"`
-		Captured int64  `json:"captured_amount"`
-		Refunded int64  `json:"refunded_amount"`
-		Status   string `json:"status"`
+		OrderID  string          `json:"order_id"`
+		Captured int64           `json:"captured_amount"`
+		Refunded int64           `json:"refunded_amount"`
+		Status   string          `json:"status"`
+		Captures []klarnaCapture `json:"captures"`
 	}
 	if res.StatusCode != 200 || json.NewDecoder(res.Body).Decode(&provider) != nil || provider.OrderID != reference || provider.Captured != captured || provider.Refunded != refunded || provider.Status != state {
 		t.Fatalf("provider state: HTTP %d %+v", res.StatusCode, provider)
+	}
+	return provider.Captures
+}
+
+func klarnaProviderCapture(t *testing.T, c *http.Client, origin, order string, want klarnaCapture) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), "GET", origin+"/simulator/ordermanagement/v1/orders/"+order+"/captures/"+want.CaptureID, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Basic mock-only-klarna")
+	res, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var detail klarnaCapture
+	if res.StatusCode != 200 || json.NewDecoder(res.Body).Decode(&detail) != nil || detail != want || detail.Reference == "" {
+		t.Fatalf("provider capture detail: HTTP %d %+v, want %+v", res.StatusCode, detail, want)
 	}
 }
 
