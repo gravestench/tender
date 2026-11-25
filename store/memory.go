@@ -29,6 +29,7 @@ type memoryTx struct {
 	history         []tender.AuditEntry
 	outbox          []tender.OutboxEntry
 	captureFailures []tender.CaptureFailureNotice
+	adverse         map[tender.AdverseKey]tender.AdverseNotice
 }
 
 // Memory serializes transactions and publishes a new snapshot only on commit.
@@ -38,7 +39,7 @@ type Memory struct {
 }
 
 func NewMemory() *Memory {
-	return &Memory{lock: make(chan struct{}, 1), state: memoryTx{events: make(map[tender.VerifiedEventKey]inboxEvent), payments: make(map[key]tender.Payment), operations: make(map[key]tender.OperationRecord)}}
+	return &Memory{lock: make(chan struct{}, 1), state: memoryTx{events: make(map[tender.VerifiedEventKey]inboxEvent), payments: make(map[key]tender.Payment), operations: make(map[key]tender.OperationRecord), adverse: make(map[tender.AdverseKey]tender.AdverseNotice)}}
 }
 
 func (m *Memory) acquire(ctx context.Context) error {
@@ -62,6 +63,7 @@ func (m *Memory) Transact(ctx context.Context, fn func(tender.Tx) error) error {
 		events:   maps.Clone(m.state.events),
 		payments: maps.Clone(m.state.payments), operations: maps.Clone(m.state.operations),
 		history: slices.Clone(m.state.history), outbox: slices.Clone(m.state.outbox), captureFailures: slices.Clone(m.state.captureFailures),
+		adverse: maps.Clone(m.state.adverse),
 	}
 	if err := fn(&tx); err != nil {
 		return err
@@ -291,6 +293,85 @@ func (m *Memory) CaptureFailures(ctx context.Context, scope tender.Scope) ([]ten
 		}
 	}
 	return notices, nil
+}
+
+func (t *memoryTx) EnqueueAdverse(n tender.AdverseNotice) error {
+	if err := n.Validate(); err != nil {
+		return err
+	}
+	n.ObservedAt = n.ObservedAt.Round(0).UTC()
+	k := n.Key()
+	if _, found := t.events[tender.VerifiedEventKey{Scope: k.Scope, Provider: k.Provider, MerchantAccount: k.MerchantAccount, ID: k.ProviderEventID}]; !found {
+		return tender.ErrNotFound
+	}
+	if old, found := t.adverse[k]; found {
+		old.Decision = nil
+		if old != n {
+			return tender.ErrConflict
+		}
+		return nil
+	}
+	t.adverse[k] = n
+	return nil
+}
+
+func (t *memoryTx) ReviewAdverse(k tender.AdverseKey, d tender.AdverseDecision) error {
+	if err := k.Validate(); err != nil {
+		return err
+	}
+	var err error
+	d, err = d.Normalize()
+	if err != nil {
+		return err
+	}
+	n, found := t.adverse[k]
+	if !found {
+		return tender.ErrNotFound
+	}
+	if n.Decision != nil {
+		if *n.Decision == d {
+			return nil
+		}
+		return tender.ErrConflict
+	}
+	n.Decision = &d
+	t.adverse[k] = n
+	return nil
+}
+
+// AdverseReviews lists durable notices, including reviewed decisions, for one
+// merchant/environment. The host filters Decision == nil for its work queue.
+func (m *Memory) AdverseReviews(ctx context.Context, scope tender.Scope) ([]tender.AdverseNotice, error) {
+	if err := m.acquire(ctx); err != nil {
+		return nil, err
+	}
+	defer func() { <-m.lock }()
+	var out []tender.AdverseNotice
+	for _, n := range m.state.adverse {
+		if n.Scope == scope {
+			if n.Decision != nil {
+				d := *n.Decision
+				n.Decision = &d
+			}
+			out = append(out, n)
+		}
+	}
+	return out, nil
+}
+
+func (m *Memory) ReviewAdverse(ctx context.Context, k tender.AdverseKey, d tender.AdverseDecision) error {
+	return m.Transact(ctx, func(tx tender.Tx) error { return tx.(tender.AdverseReviewTx).ReviewAdverse(k, d) })
+}
+
+func (t *memoryTx) AdverseEvidence(scope tender.Scope, provider, account, paymentID string) ([]tender.AdverseNotice, error) {
+	var out []tender.AdverseNotice
+	for k, n := range t.adverse {
+		if k.Scope == scope && k.Provider == provider && k.MerchantAccount == account && n.PaymentID == paymentID &&
+			t.events[tender.VerifiedEventKey{Scope: k.Scope, Provider: k.Provider, MerchantAccount: k.MerchantAccount, ID: k.ProviderEventID}].processed {
+			out = append(out, n)
+		}
+	}
+	return out, nil
 }
 
 func (t *memoryTx) MatchingVerifiedEvidence(scope tender.Scope, provider, account string, fields map[string]string) ([]json.RawMessage, error) {
