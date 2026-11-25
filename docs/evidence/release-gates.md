@@ -16,7 +16,7 @@ On 2026-11-25 UTC, a clean worktree at `a370861fa5d11f77ed0a513b078d488bf54d7460
 | `go test -count=1 ./...` | 0 | All offline unit packages pass. |
 | `go test -race -count=1 ./...` | 0 | All offline unit packages pass without a race report. |
 | `go vet ./...` | 0 | No vet finding. |
-| `go test -race -count=1 -timeout=8m -tags=integration -skip '^TestPostgresConflictingOperations' ./test/contract/...` | 0 | Full local SQL/provider contract suite except the two native multi-backend conflict cases; the new concurrent return-claim case self-skips under `TENDER_TEST_PGLITE=1`. PGlite package time: 7.047s. |
+| `go test -race -count=1 -timeout=8m -tags=integration -skip '^TestPostgresConflictingOperations' ./test/contract/...` | 0 | Full local SQL/provider contract suite except the two native multi-backend conflict cases; the new concurrent return-claim case self-skips when PostgreSQL `version()` has PGlite's `emcc` marker. PGlite package time: 7.047s. |
 | `go test -race -count=1 -timeout=8m -tags=e2e,integration ./test/e2e/...` | 0 | Full durable consumer, loopback provider and Chromium suite; package time: 83.208s. |
 | `(cd examples/consumer && GOWORK=off go build -o /private/tmp/tender-task23-consumer .)` | 0 | Local replacement build; this is not G1's external tagged import. |
 | `go test -run '^$' -fuzz '^FuzzMoneyJSON$' -fuzztime=1s -parallel=1 .` | 0 | Money JSON fuzz target passes. |
