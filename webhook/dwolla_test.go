@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gravestench/tender"
+	"github.com/gravestench/tender/providers/dwolla"
 	"github.com/gravestench/tender/store"
 	"github.com/gravestench/tender/webhook"
 )
@@ -98,5 +99,89 @@ func TestDwollaWebhookVerifiesAndDurablyDeduplicates(t *testing.T) {
 		return tx.(tender.VerifiedEventTx).ProcessVerifiedEvent(key, time.Now(), func(json.RawMessage) error { processed++; return nil })
 	}); err != nil || processed != 1 {
 		t.Fatalf("replay processed %d times: %v", processed, err)
+	}
+}
+
+func TestDwollaSignedFailureCreatesReviewWithoutCollectingFunds(t *testing.T) {
+	storage := store.NewMemory()
+	scope := tender.Scope{MerchantID: "shop", Environment: tender.EnvironmentMock}
+	market := tender.Market{Country: "US", Currency: "USD", Method: tender.MethodACH}
+	amount := tender.Money{Currency: "USD", Minor: 1234}
+	const operationID = "safe_operation_01"
+	base := "http://127.0.0.1:8080"
+	adapter, err := dwolla.New(dwolla.Config{Environment: tender.EnvironmentMock, BaseURL: base, MerchantAccount: dwollaAccount, DestinationFundingSourceID: "22222222-2222-4222-8222-222222222222",
+		BearerToken: func(context.Context) (string, error) { return "token", nil }, AuthorizeSource: func(context.Context, tender.Payment, dwolla.Source) error { return nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine, err := tender.NewEngine(tender.EngineConfig{Store: storage, Provider: adapter, Scope: scope, ProviderName: "dwolla", MerchantAccount: dwollaAccount, Market: market})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payment := tender.Payment{Scope: scope, ID: "payment", OrderID: "order", AttemptID: "attempt", Provider: "dwolla", MerchantAccount: dwollaAccount, ProviderReference: dwollaTransfer, Market: market, Amount: amount, Snapshot: tender.Snapshot{Status: tender.PaymentPending}}
+	op := tender.OperationRecord{Operation: tender.Operation{Scope: scope, ID: operationID, PaymentID: payment.ID, AttemptID: payment.AttemptID, Key: "host-key", ProviderKey: "provider-key", ProviderReference: dwollaTransfer, Kind: tender.OpCreate, Status: tender.OperationSucceeded, Amount: amount}}
+	if err := storage.Transact(t.Context(), func(tx tender.Tx) error {
+		if err := tx.InsertPayment(payment); err != nil {
+			return err
+		}
+		return tx.InsertOperation(op)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	h, err := webhook.NewDwolla(webhook.DwollaConfig{Store: storage, Engine: engine, Scope: scope, BaseURL: base, MerchantAccount: dwollaAccount, HMACSecrets: []string{dwollaSecret}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(map[string]any{"id": dwollaEvent, "resourceId": dwollaTransfer, "correlationId": operationID, "topic": "customer_transfer_failed", "created": "2026-11-25T10:00:00Z", "_links": map[string]any{"account": map[string]string{"href": base + "/accounts/" + dwollaAccount}, "resource": map[string]string{"href": base + "/transfers/" + dwollaTransfer}}})
+	mac := hmac.New(sha256.New, []byte(dwollaSecret))
+	mac.Write(body)
+	r := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(body))
+	r.Header.Set("X-Request-Signature-SHA-256", hex.EncodeToString(mac.Sum(nil)))
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("official created field rejected: %d", w.Code)
+	}
+	if err := h.Process(t.Context(), "wrong-payment", dwollaEvent); err == nil {
+		t.Fatal("wrong payment consumed failure")
+	}
+	if err := h.Process(t.Context(), payment.ID, dwollaEvent); err != nil {
+		t.Fatalf("signed failure not projected: %v", err)
+	}
+	if err := h.Process(t.Context(), payment.ID, dwollaEvent); err != nil {
+		t.Fatalf("duplicate failure not idempotent: %v", err)
+	}
+	badID := "99999999-9999-4999-8999-999999999999"
+	badBody, _ := json.Marshal(map[string]any{"id": badID, "resourceId": dwollaTransfer, "correlationId": "other_operation", "topic": "customer_transfer_failed", "created": "2026-11-25T10:01:00Z", "_links": map[string]any{"account": map[string]string{"href": base + "/accounts/" + dwollaAccount}, "resource": map[string]string{"href": base + "/transfers/" + dwollaTransfer}}})
+	mac = hmac.New(sha256.New, []byte(dwollaSecret))
+	mac.Write(badBody)
+	r = httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(badBody))
+	r.Header.Set("X-Request-Signature-SHA-256", hex.EncodeToString(mac.Sum(nil)))
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("mismatched signed event not retained for review: %d", w.Code)
+	}
+	if err := h.Process(t.Context(), payment.ID, badID); err == nil {
+		t.Fatal("mismatched signed correlation created a return review")
+	}
+	if err := storage.Transact(t.Context(), func(tx tender.Tx) error {
+		notices, err := tx.(tender.AdverseEvidenceReader).AdverseEvidence(scope, "dwolla", dwollaAccount, payment.ID)
+		if err != nil {
+			return err
+		}
+		if len(notices) != 1 || notices[0].Kind != "ach_return" || notices[0].OriginalReference != dwollaTransfer || notices[0].Amount != amount {
+			t.Fatalf("unexpected review evidence: %+v", notices)
+		}
+		got, err := tx.Payment(scope, payment.ID)
+		if err != nil {
+			return err
+		}
+		if got.Status != tender.PaymentPending || got.Funds != (tender.Funds{}) {
+			t.Fatalf("failure changed money state: %+v", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }

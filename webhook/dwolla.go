@@ -26,6 +26,7 @@ var dwollaTopic = regexp.MustCompile(`^[a-z][a-z0-9_]{0,79}$`)
 // Separate keys are required for MOCK, SANDBOX and LIVE.
 type DwollaConfig struct {
 	Store           tender.Store
+	Engine          *tender.Engine
 	Scope           tender.Scope
 	BaseURL         string
 	MerchantAccount string
@@ -33,9 +34,8 @@ type DwollaConfig struct {
 	OnStored        func(string)
 }
 
-// Dwolla receives signed events into the durable inbox. It does not process
-// transfers or change funds: status, return and payout evidence need separate
-// authenticated correlation.
+// Dwolla receives signed events into the durable inbox. Matched failed
+// transfer events create review notices but never change funds.
 type Dwolla struct {
 	cfg  DwollaConfig
 	keys [][]byte
@@ -75,11 +75,13 @@ func NewDwolla(c DwollaConfig) (*Dwolla, error) {
 }
 
 type dwollaReceipt struct {
-	ID         string `json:"id"`
-	ResourceID string `json:"resourceId"`
-	Topic      string `json:"topic"`
-	Timestamp  string `json:"timestamp"`
-	Links      struct {
+	ID            string `json:"id"`
+	ResourceID    string `json:"resourceId"`
+	CorrelationID string `json:"correlationId"`
+	Topic         string `json:"topic"`
+	Timestamp     string `json:"timestamp"`
+	Created       string `json:"created"`
+	Links         struct {
 		Account struct {
 			Href string `json:"href"`
 		} `json:"account"`
@@ -110,10 +112,14 @@ func (h *Dwolla) verified(raw []byte, header http.Header) (dwollaReceipt, bool, 
 	if !valid {
 		return event, false, tender.ErrAuthentication
 	}
-	if json.Unmarshal(raw, &event) != nil || !dwollaUUID.MatchString(event.ID) || !dwollaUUID.MatchString(event.ResourceID) || !dwollaTopic.MatchString(event.Topic) || event.Timestamp == "" {
+	if json.Unmarshal(raw, &event) != nil || !dwollaUUID.MatchString(event.ID) || !dwollaUUID.MatchString(event.ResourceID) || !dwollaTopic.MatchString(event.Topic) || event.Timestamp == "" && event.Created == "" || event.Timestamp != "" && event.Created != "" && event.Timestamp != event.Created {
 		return event, false, tender.ErrValidation
 	}
-	if _, err := time.Parse(time.RFC3339Nano, event.Timestamp); err != nil {
+	stamp := event.Created
+	if stamp == "" {
+		stamp = event.Timestamp
+	}
+	if _, err := time.Parse(time.RFC3339Nano, stamp); err != nil {
 		return event, false, tender.ErrValidation
 	}
 	if event.Links.Account.Href != h.cfg.BaseURL+"/accounts/"+h.cfg.MerchantAccount {
@@ -143,6 +149,50 @@ func (h *Dwolla) verified(raw []byte, header http.Header) (dwollaReceipt, bool, 
 		return event, false, tender.ErrAuthentication
 	}
 	return event, true, nil
+}
+
+// Process consumes a signed failure for an exact, previously bound transfer.
+// The caller supplies the payment ID after resolving the transfer reference in
+// its own index. Failed legs without that exact binding remain pending review.
+func (h *Dwolla) Process(ctx context.Context, paymentID, eventID string) error {
+	if h.cfg.Engine == nil || paymentID == "" || !dwollaUUID.MatchString(eventID) {
+		return tender.ErrValidation
+	}
+	return h.cfg.Engine.ProcessVerifiedAdverseEvent(ctx, eventID, func(tx tender.EventRecords, raw json.RawMessage) (tender.AdverseNotice, error) {
+		var e dwollaReceipt
+		if json.Unmarshal(raw, &e) != nil || e.ID != eventID || e.Links.Account.Href != h.cfg.BaseURL+"/accounts/"+h.cfg.MerchantAccount || e.Links.Resource.Href != h.cfg.BaseURL+"/transfers/"+e.ResourceID || !dwollaUUID.MatchString(e.ResourceID) || e.CorrelationID == "" {
+			return tender.AdverseNotice{}, tender.ErrConflict
+		}
+		if e.Topic != "transfer_failed" && e.Topic != "customer_transfer_failed" && e.Topic != "customer_bank_transfer_failed" {
+			return tender.AdverseNotice{}, tender.ErrUnsupported
+		}
+		stamp := e.Created
+		if stamp == "" {
+			stamp = e.Timestamp
+		}
+		observed, err := time.Parse(time.RFC3339Nano, stamp)
+		if err != nil || e.Created != "" && e.Timestamp != "" && e.Created != e.Timestamp {
+			return tender.AdverseNotice{}, tender.ErrConflict
+		}
+		p, err := tx.Payment(h.cfg.Scope, paymentID)
+		if err != nil {
+			return tender.AdverseNotice{}, err
+		}
+		if p.Provider != "dwolla" || p.MerchantAccount != h.cfg.MerchantAccount || p.Market != (tender.Market{Country: "US", Currency: "USD", Method: tender.MethodACH}) || p.ProviderReference != e.ResourceID || p.Status != tender.PaymentPending && p.Status != tender.PaymentFailed || p.Funds != (tender.Funds{}) {
+			return tender.AdverseNotice{}, tender.ErrConflict
+		}
+		op, err := tx.OperationByReference(p.Scope, p.ID, e.ResourceID)
+		if err != nil {
+			return tender.AdverseNotice{}, err
+		}
+		if op.ID != e.CorrelationID || op.Kind != tender.OpCreate || op.Status != tender.OperationSucceeded || op.AttemptID != p.AttemptID || op.Amount != p.Amount {
+			return tender.AdverseNotice{}, tender.ErrConflict
+		}
+		return tender.AdverseNotice{Scope: p.Scope, Provider: "dwolla", MerchantAccount: p.MerchantAccount,
+			PaymentID: p.ID, OperationID: op.ID, ProviderEventID: e.ID, Kind: "ach_return",
+			ProviderReference: e.ResourceID, OriginalReference: p.ProviderReference, ModificationReference: op.ProviderReference,
+			Amount: p.Amount, ObservedAt: observed.UTC()}, nil
+	})
 }
 
 func (h *Dwolla) store(ctx context.Context, event dwollaReceipt) (bool, error) {

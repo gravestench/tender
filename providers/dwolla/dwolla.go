@@ -6,6 +6,7 @@ package dwolla
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -82,7 +83,11 @@ func (a *Adapter) Capabilities() tender.Capabilities {
 	if a.cfg.Environment != tender.EnvironmentMock {
 		return tender.Capabilities{}
 	}
-	return tender.Capabilities{Create: true, Markets: []tender.MarketCapability{{Market: tender.Market{Country: "US", Currency: "USD", Method: tender.MethodACH}}}}
+	return tender.Capabilities{Create: true, Query: true, BindBeforeDispatch: []tender.OperationKind{tender.OpCreate}, Markets: []tender.MarketCapability{{Market: tender.Market{Country: "US", Currency: "USD", Method: tender.MethodACH}}}}
+}
+
+func transferBinding(sourceID, destinationID, operationID, value string) [32]byte {
+	return sha256.Sum256([]byte(sourceID + "\x00" + destinationID + "\x00" + operationID + "\x00USD\x00" + value))
 }
 
 // CheckStore prevents a bank transfer if the host cannot durably receive and
@@ -174,6 +179,9 @@ func (a *Adapter) Execute(ctx context.Context, r tender.ProviderRequest) (tender
 	request.Links.Destination.Href = destURL
 	request.Amount.Currency = "USD"
 	request.Amount.Value = fmt.Sprintf("%d.%02d", p.Amount.Minor/100, p.Amount.Minor%100)
+	if err := r.BindEvidence(transferBinding(source.FundingSourceID, a.cfg.DestinationFundingSourceID, op.ID, request.Amount.Value)); err != nil {
+		return o, tender.ErrNotDispatched
+	}
 	body, _ := json.Marshal(request)
 	call, err := http.NewRequestWithContext(ctx, http.MethodPost, a.cfg.BaseURL+"/transfers", bytes.NewReader(body))
 	if err != nil {
@@ -232,11 +240,61 @@ func (a *Adapter) Execute(ctx context.Context, r tender.ProviderRequest) (tender
 	return o, nil
 }
 
-// Query cannot resolve an abandoned Create without its host-authenticated
-// source binding. A future merchant-qualified recovery path must prove that
-// binding before it can conclude an unknown transfer.
-func (a *Adapter) Query(context.Context, tender.ProviderRequest) (tender.Observation, error) {
-	return tender.Observation{}, tender.ErrUnsupported
+// Query reads only a previously bound transfer reference. A lost POST reply
+// with no stored reference remains unknown: correlation search needs the
+// customer ID, which the durable Tender reservation does not contain.
+func (a *Adapter) Query(ctx context.Context, r tender.ProviderRequest) (tender.Observation, error) {
+	p, op := r.Payment, r.Operation
+	o := tender.Observation{Scope: p.Scope, MerchantAccount: p.MerchantAccount, PaymentID: p.ID, AttemptID: p.AttemptID, OperationID: op.ID, Amount: op.Amount, Status: tender.OperationSucceeded}
+	if !a.Capabilities().Query {
+		return o, tender.ErrUnsupported
+	}
+	if p.Scope.Validate() != nil || p.Scope.Environment != a.cfg.Environment || p.Provider != "dwolla" || p.MerchantAccount != a.cfg.MerchantAccount || p.Market != (tender.Market{Country: "US", Currency: "USD", Method: tender.MethodACH}) || p.Amount.ValidatePurchase() != nil || op.Scope != p.Scope || op.Kind != tender.OpCreate || op.PaymentID != p.ID || op.AttemptID != p.AttemptID || op.Amount != p.Amount || !requestID.MatchString(op.ID) {
+		return o, tender.ErrValidation
+	}
+	if !uuid.MatchString(p.ProviderReference) || p.ProviderReference != op.ProviderReference || op.ProviderEvidenceDigest == ([32]byte{}) {
+		return o, tender.ErrUnknownOutcome
+	}
+	token, err := a.cfg.BearerToken(ctx)
+	if err != nil || token == "" || len(token) > 2048 || strings.ContainsAny(token, " \t\r\n") {
+		return o, tender.ErrAuthentication
+	}
+	read, err := http.NewRequestWithContext(ctx, http.MethodGet, a.cfg.BaseURL+"/transfers/"+p.ProviderReference, nil)
+	if err != nil {
+		return o, tender.ErrUnknownOutcome
+	}
+	read.Header.Set("Accept", mediaType)
+	read.Header.Set("Authorization", "Bearer "+token)
+	verified, err := a.client.Do(read)
+	if err != nil {
+		return o, tender.ErrUnknownOutcome
+	}
+	defer verified.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(verified.Body, (64<<10)+1))
+	if err != nil || verified.StatusCode != http.StatusOK || len(raw) > 64<<10 {
+		return o, tender.ErrUnknownOutcome
+	}
+	var detail struct {
+		ID, Status, CorrelationID string
+		Amount                    struct{ Currency, Value string }
+		Links                     struct {
+			Source, Destination struct{ Href string }
+		} `json:"_links"`
+	}
+	value := fmt.Sprintf("%d.%02d", p.Amount.Minor/100, p.Amount.Minor%100)
+	sourcePrefix := a.cfg.BaseURL + "/funding-sources/"
+	if json.Unmarshal(raw, &detail) != nil || detail.ID != p.ProviderReference || detail.CorrelationID != op.ID || detail.Amount.Currency != "USD" || detail.Amount.Value != value || detail.Links.Destination.Href != a.cfg.BaseURL+"/funding-sources/"+a.cfg.DestinationFundingSourceID || !strings.HasPrefix(detail.Links.Source.Href, sourcePrefix) || !uuid.MatchString(strings.TrimPrefix(detail.Links.Source.Href, sourcePrefix)) || detail.Status != "pending" && detail.Status != "processed" && detail.Status != "failed" && detail.Status != "cancelled" {
+		return o, tender.ErrUnknownOutcome
+	}
+	if transferBinding(strings.TrimPrefix(detail.Links.Source.Href, sourcePrefix), a.cfg.DestinationFundingSourceID, op.ID, value) != op.ProviderEvidenceDigest {
+		return o, tender.ErrUnknownOutcome
+	}
+	o.ProviderReference, o.OperationReference = p.ProviderReference, op.ProviderReference
+	o.Snapshot = tender.Snapshot{Status: tender.PaymentPending, ProviderStatus: detail.Status}
+	if detail.Status == "failed" || detail.Status == "cancelled" {
+		o.Snapshot.Status = tender.PaymentFailed
+	}
+	return o, nil
 }
 
 var _ tender.Provider = (*Adapter)(nil)

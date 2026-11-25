@@ -2,11 +2,13 @@ package dwolla_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/gravestench/tender"
@@ -52,9 +54,10 @@ func request(source dwolla.Source) tender.ProviderRequest {
 	scope := tender.Scope{MerchantID: "shop", Environment: tender.EnvironmentMock}
 	amount := tender.Money{Currency: "USD", Minor: 1234}
 	return tender.ProviderRequest{
-		Payment:   tender.Payment{Scope: scope, ID: "payment", OrderID: "order", Provider: "dwolla", MerchantAccount: accountID, AttemptID: "attempt", Market: tender.Market{Country: "US", Currency: "USD", Method: tender.MethodACH}, Amount: amount, Snapshot: tender.Snapshot{Status: tender.PaymentCreated}},
-		Operation: tender.Operation{Scope: scope, ID: opID, PaymentID: "payment", AttemptID: "attempt", Kind: tender.OpCreate, Status: tender.OperationReserved, ProviderKey: "safe_key_01", Amount: amount},
-		Token:     string(token),
+		Payment: tender.Payment{Scope: scope, ID: "payment", OrderID: "order", Provider: "dwolla", MerchantAccount: accountID, AttemptID: "attempt", Market: tender.Market{Country: "US", Currency: "USD", Method: tender.MethodACH}, Amount: amount, Snapshot: tender.Snapshot{Status: tender.PaymentCreated}},
+		Operation: tender.Operation{Scope: scope, ID: opID, PaymentID: "payment", AttemptID: "attempt", Kind: tender.OpCreate, Status: tender.OperationReserved, ProviderKey: "safe_key_01", Amount: amount,
+			ProviderEvidenceDigest: sha256.Sum256([]byte(source.FundingSourceID + "\x00" + merchantBankID + "\x00" + opID + "\x00USD\x0012.34"))},
+		Token: string(token),
 	}
 }
 
@@ -166,5 +169,150 @@ func TestCreateRefusesUnverifiedSourceBeforeTransfer(t *testing.T) {
 	_, err = a.Execute(t.Context(), request(dwolla.Source{CustomerID: customerID, FundingSourceID: bankID, ProofDigest: proof}))
 	if !errors.Is(err, tender.ErrNotDispatched) || posts != 0 {
 		t.Fatalf("unverified bank dispatched transfer: posts=%d err=%v", posts, err)
+	}
+}
+
+func TestQueryRequiresDurablyBoundTransferIdentity(t *testing.T) {
+	var baseURL string
+	var gets, posts int
+	var missingLinks, wrongSource atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/transfers/"+transferID || r.Header.Get("Authorization") != "Bearer local-token" {
+			posts++
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		gets++
+		if missingLinks.Load() {
+			_, _ = w.Write([]byte(`{"id":"` + transferID + `","status":"processed","correlationId":"` + opID + `","amount":{"currency":"USD","value":"12.34"},"_links":{}}`))
+			return
+		}
+		if wrongSource.Load() {
+			_, _ = w.Write([]byte(`{"id":"` + transferID + `","status":"processed","correlationId":"` + opID + `","amount":{"currency":"USD","value":"12.34"},"_links":{"source":{"href":"` + baseURL + `/funding-sources/99999999-9999-4999-8999-999999999999"},"destination":{"href":"` + baseURL + `/funding-sources/` + merchantBankID + `"}}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"` + transferID + `","status":"processed","correlationId":"` + opID + `","amount":{"currency":"USD","value":"12.34"},"_links":{"source":{"href":"` + baseURL + `/funding-sources/` + bankID + `"},"destination":{"href":"` + baseURL + `/funding-sources/` + merchantBankID + `"}}}`))
+	}))
+	defer srv.Close()
+	baseURL = srv.URL
+	a, err := dwolla.New(dwolla.Config{Environment: tender.EnvironmentMock, BaseURL: baseURL, MerchantAccount: accountID, DestinationFundingSourceID: merchantBankID,
+		BearerToken: func(context.Context) (string, error) { return "local-token", nil }, AuthorizeSource: func(context.Context, tender.Payment, dwolla.Source) error { return nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := request(dwolla.Source{CustomerID: customerID, FundingSourceID: bankID, ProofDigest: strings.Repeat("a", 64)})
+	r.Token = "" // recovery never receives the transient bank source token
+	r.Payment.ProviderReference = transferID
+	r.Payment.Snapshot = tender.Snapshot{Status: tender.PaymentPending}
+	r.Operation.ProviderReference = transferID
+	r.Operation.Status = tender.OperationSucceeded
+	obs, err := a.Query(t.Context(), r)
+	if err != nil || obs.ProviderReference != transferID || obs.Snapshot.Status != tender.PaymentPending || obs.Snapshot.ProviderStatus != "processed" || obs.Snapshot.Funds != (tender.Funds{}) || posts != 0 || gets != 1 {
+		t.Fatalf("known transfer was not safely read: obs=%+v err=%v gets=%d posts=%d", obs, err, gets, posts)
+	}
+	missingLinks.Store(true)
+	if _, err := a.Query(t.Context(), r); !errors.Is(err, tender.ErrUnknownOutcome) {
+		t.Fatalf("query accepted documented empty links: %v", err)
+	}
+	missingLinks.Store(false)
+	wrongSource.Store(true)
+	if _, err := a.Query(t.Context(), r); !errors.Is(err, tender.ErrUnknownOutcome) {
+		t.Fatalf("query accepted wrong source: %v", err)
+	}
+	wrongSource.Store(false)
+	r.Operation.ProviderEvidenceDigest = [32]byte{}
+	if _, err := a.Query(t.Context(), r); !errors.Is(err, tender.ErrUnknownOutcome) || gets != 3 {
+		t.Fatalf("unbound reference resolved: %v gets=%d", err, gets)
+	}
+	r.Operation.ProviderEvidenceDigest = request(dwolla.Source{FundingSourceID: bankID}).Operation.ProviderEvidenceDigest
+	r.Payment.ProviderReference = ""
+	if _, err := a.Query(t.Context(), r); !errors.Is(err, tender.ErrUnknownOutcome) || gets != 3 {
+		t.Fatalf("unknown create reference resolved: %v gets=%d", err, gets)
+	}
+}
+
+func TestCreateHoldsTransferWhenProviderOmitsFundingLinks(t *testing.T) {
+	var posts, gets int
+	var baseURL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /funding-sources/" + bankID:
+			_, _ = w.Write([]byte(`{"id":"` + bankID + `","status":"verified","type":"bank","bankAccountType":"checking","removed":false,"channels":["ach"],"_links":{"self":{"href":"` + baseURL + `/funding-sources/` + bankID + `"}}}`))
+		case "POST /transfers":
+			posts++
+			w.Header().Set("Location", baseURL+"/transfers/"+transferID)
+			w.WriteHeader(http.StatusCreated)
+		case "GET /transfers/" + transferID:
+			gets++
+			_, _ = w.Write([]byte(`{"id":"` + transferID + `","status":"pending","correlationId":"` + opID + `","amount":{"currency":"USD","value":"12.34"},"_links":{}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	baseURL = srv.URL
+	a, err := dwolla.New(dwolla.Config{Environment: tender.EnvironmentMock, BaseURL: baseURL, MerchantAccount: accountID, DestinationFundingSourceID: merchantBankID,
+		BearerToken: func(context.Context) (string, error) { return "local-token", nil }, AuthorizeSource: func(context.Context, tender.Payment, dwolla.Source) error { return nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = a.Execute(t.Context(), request(dwolla.Source{CustomerID: customerID, FundingSourceID: bankID, ProofDigest: strings.Repeat("a", 64)}))
+	if !errors.Is(err, tender.ErrUnknownOutcome) || posts != 1 || gets != 1 {
+		t.Fatalf("missing funding links created certainty: err=%v posts=%d gets=%d", err, posts, gets)
+	}
+}
+
+func TestEngineHoldsMissingLinkReplyAndRecoveryDoesNotReplayPost(t *testing.T) {
+	var baseURL string
+	var posts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /funding-sources/" + bankID:
+			_, _ = w.Write([]byte(`{"id":"` + bankID + `","status":"verified","type":"bank","bankAccountType":"checking","removed":false,"channels":["ach"],"_links":{"self":{"href":"` + baseURL + `/funding-sources/` + bankID + `"}}}`))
+		case "POST /transfers":
+			posts.Add(1)
+			w.Header().Set("Location", baseURL+"/transfers/"+transferID)
+			w.WriteHeader(http.StatusCreated)
+		case "GET /transfers/" + transferID:
+			_, _ = w.Write([]byte(`{"id":"` + transferID + `","status":"pending","correlationId":"` + opID + `","amount":{"currency":"USD","value":"12.34"},"_links":{}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	baseURL = srv.URL
+	a, err := dwolla.New(dwolla.Config{Environment: tender.EnvironmentMock, BaseURL: baseURL, MerchantAccount: accountID, DestinationFundingSourceID: merchantBankID,
+		BearerToken: func(context.Context) (string, error) { return "local-token", nil }, AuthorizeSource: func(context.Context, tender.Payment, dwolla.Source) error { return nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	storage := store.NewMemory()
+	scope := tender.Scope{MerchantID: "shop", Environment: tender.EnvironmentMock}
+	market := tender.Market{Country: "US", Currency: "USD", Method: tender.MethodACH}
+	ids := []string{"attempt", opID, "provider-key"}
+	engine, err := tender.NewEngine(tender.EngineConfig{Store: storage, Provider: a, Scope: scope, ProviderName: "dwolla", MerchantAccount: accountID, Market: market, NewID: func() string { id := ids[0]; ids = ids[1:]; return id }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	source := dwolla.Source{CustomerID: customerID, FundingSourceID: bankID, ProofDigest: strings.Repeat("a", 64)}
+	token, _ := json.Marshal(source)
+	result, err := engine.Create(t.Context(), tender.Request{PaymentID: "payment", OrderID: "order", Key: "host-key", Amount: tender.Money{Currency: "USD", Minor: 1234}, Token: string(token)})
+	if !errors.Is(err, tender.ErrUnknownOutcome) || result.Operation.Status != tender.OperationUnknown || result.Payment.Funds != (tender.Funds{}) || posts.Load() != 1 {
+		t.Fatalf("unknown reply was not held: result=%+v err=%v posts=%d", result, err, posts.Load())
+	}
+	if err := storage.Transact(t.Context(), func(tx tender.Tx) error {
+		op, err := tx.Operation(scope, result.Operation.ID)
+		if err != nil {
+			return err
+		}
+		if op.ProviderEvidenceDigest == ([32]byte{}) {
+			t.Fatal("source binding was not durable before POST")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.Recover(t.Context(), result.Operation.ID); !errors.Is(err, tender.ErrUnknownOutcome) || posts.Load() != 1 {
+		t.Fatalf("recovery replayed POST or resolved missing reference: %v posts=%d", err, posts.Load())
 	}
 }
