@@ -1,11 +1,11 @@
 # Release gate ledger
 
-Updated 2026-11-25 with CI evidence from `main` at `ef4b55c`. **The four-rail v1.0 release is BLOCKED.** Green offline CI and local mock/PGlite results do not count as official provider sandbox proof. This ledger records the verification distinction and the evidence needed to change status.
+Updated 2026-11-25 with the tagged `v0.1.0-alpha.1` MOCK import and CI evidence from `main` at `0667258`. **The four-rail v1.0 release is BLOCKED.** Green offline CI and local mock/PGlite results do not count as official provider sandbox proof. This ledger records the verification distinction and the evidence needed to change status.
 
 | Gate | Status | Evidence and missing work |
 | --- | --- | --- |
-| G1 — independent tagged import | **BLOCKED** | `examples/consumer` builds against the local module through a development `replace`. A published pre-release or v1 tag and clean external import without `replace` have not been run. |
-| G2 — unit, race, contract and offline browser | **PASS for the offline candidate** | The [main branch CI run at `ef4b55c`](https://github.com/gravestench/tender/actions/runs/45516976421) completed successfully on 2026-11-25. Go 1.26/1.27 unit, race, build and vet jobs, the full native PostgreSQL 17.11 integration contracts, and the Chromium durable-consumer job all passed. This does not qualify a real provider transaction. |
+| G1 — independent tagged import | **PASS for the MOCK alpha** | The published annotated [`v0.1.0-alpha.1` tag](https://github.com/gravestench/tender/tree/v0.1.0-alpha.1) points to `0667258`. A clean external consumer resolved it through the Go proxy with no `go.work` or `replace`, built, and completed a USD 25.99 MOCK capture smoke. This does not qualify provider sandbox or live checkout. |
+| G2 — unit, race, contract and offline browser | **PASS for the offline alpha** | The [main branch CI run at `0667258`](https://github.com/gravestench/tender/actions/runs/45517581386) completed successfully on 2026-11-25. Go 1.26/1.27 unit, race, build and vet jobs, the full native PostgreSQL 17.11 integration contracts, and the Chromium durable-consumer job all passed. This does not qualify a real provider transaction. |
 | G3 — actual sandbox capability evidence | **BLOCKED** | Adyen card, PayPal, Klarna and ACH lack merchant credentials and genuine transaction/report evidence. [Card](adyen.md) · [PayPal](paypal.md) · [Klarna](klarna.md) · [ACH](ach.md). |
 | G4 — strict on-page and sensitive-data policy | **BLOCKED** | Synthetic Chromium guards run, but supported mobile/desktop provider SDK and issuer flows are unverified. PayPal/Klarna ordinary web paths stay disabled; Adyen ACH still needs approved signed mandate handling. Security responsibilities are in [security.md](../security.md). |
 | Production activation | **BLOCKED** | Merchant contracts, PCI/ACH assessment, pricing, provider approval, approved low-value live pilot, actual payout and bank-deposit comparison remain separate from a library release. |
@@ -37,6 +37,12 @@ PGlite validates the SQL statements, migrations and restart paths but cannot pro
 | `browser` | Pinned Playwright/Chromium installation and full `go test -race -count=1 -timeout=5m -tags=e2e,integration ./test/e2e/...` against the standalone consumer and native PostgreSQL service. |
 
 The protected provider `sandbox` workflow has **not** run. No merchant credentials or genuine provider test transaction were used in this CI run. G3, G4 and merchant production activation remain blocked independently of G2.
+
+[A second all-success CI run](https://github.com/gravestench/tender/actions/runs/45517581386) completed on `main` at the tagged commit `066725867a1fa5fe6c2b049134c77727a1e05e84` (updated 2026-11-25 00:24:09 UTC). GitHub reports success for all four jobs: Go 1.26, Go 1.27, native PostgreSQL contracts and Chromium durable consumer. The tagged source therefore has the same offline CI coverage as the earlier run.
+
+## Tagged MOCK import
+
+The annotated `v0.1.0-alpha.1` tag peels to `066725867a1fa5fe6c2b049134c77727a1e05e84` and is explicitly labeled for offline development. An independent copy of `examples/consumer` outside this checkout removed its local `replace` and had no `go.work`. `go get github.com/gravestench/tender@v0.1.0-alpha.1` through `proxy.golang.org`, `go mod tidy`, `go list -m -json` and a clean executable build all exited 0. Module metadata reported the exact tag and no `Replace`. A loopback MOCK guest order kept its server-owned USD 25.99 total and reached `captured` once; `Fulfilled=false` was expected because that memory-store smoke had no host fulfillment ledger. This verifies an importable alpha, not real card, wallet, financing or ACH processing.
 
 ## Offline commands
 

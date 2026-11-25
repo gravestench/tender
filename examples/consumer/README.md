@@ -77,12 +77,13 @@ The browser test requires Node, Playwright (tested with 1.62.1), and Chromium in
 
 The restart test creates a separate schema in a disposable database, injects a failing host ledger constraint, starts two independent processes and checks the final ledger and outbox. Use `TENDER_TEST_DATABASE_URL` for the test database. Run `go test -count=1 -tags=e2e,integration ./test/e2e -run TestConsumerDurableFulfillment`. The SQL test drops its own schema on completion.
 
-## Build against a future release
+## Verify the tagged offline alpha
 
-The development go.mod requires the placeholder version v0.0.0 and replaces github.com/gravestench/tender with the local checkout. To verify a published tag, copy this directory into a clean temporary directory outside the repository. Set TENDER_TAG to the actual published version and run the following commands inside the copy.
+The development go.mod requires the placeholder version v0.0.0 and replaces github.com/gravestench/tender with the local checkout. To verify the published **MOCK-only** alpha, copy this directory into a clean temporary directory outside the repository. Run the following commands inside the copy.
 
 ```sh
 export GOWORK=off
+export TENDER_TAG=v0.1.0-alpha.1
 go mod edit -dropreplace=github.com/gravestench/tender
 go get "github.com/gravestench/tender@$TENDER_TAG"
 go mod tidy
@@ -90,4 +91,4 @@ go list -m -json github.com/gravestench/tender
 go build -o /tmp/tender-consumer-tag .
 ```
 
-Check that the selected Version is the published tag and that Replace is absent. This verification needs the published module in the chosen Go proxy or module cache.
+Check that the selected Version is `v0.1.0-alpha.1` and that Replace is absent. A clean copy completed this import, build and a USD 25.99 loopback MOCK capture. The alpha is suitable for offline integration tests only; the card, PayPal, Klarna and ACH provider paths still need genuine sandbox evidence and merchant activation before real use.

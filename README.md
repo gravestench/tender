@@ -4,6 +4,8 @@ Tender is an independent Go payment library for applications that own their chec
 
 **Development status:** the four adapter protocols, embeddable HTTP simulator, durable PostgreSQL store, independent consumer and offline checks are under review. No provider is qualified for production, and full-scope `v1.0.0` is **not tagged**. Official sandbox access, genuine transaction and settlement proof, and mobile/desktop on-page checks are missing. See the [capability matrix](docs/capabilities.md) and [release ledger](docs/evidence/release-gates.md) before exposing a method.
 
+The published `v0.1.0-alpha.1` tag is an **offline/MOCK integration preview** for Blacktop and other Go hosts. In a separate consumer module, run `go get github.com/gravestench/tender@v0.1.0-alpha.1`, then build without a local `replace`. The [independent consumer](examples/consumer/README.md#verify-the-tagged-offline-alpha) demonstrates that check. Keep real payment methods disabled: this alpha has no official provider sandbox or production qualification.
+
 ## Use in a host
 
 A host imports `github.com/gravestench/tender`, chooses a scoped provider adapter and a durable `Store`, then creates an `Engine` for that merchant and environment. Keep provider API keys server-side. The host passes its authenticated order ID, server-calculated amount and stable idempotency key; a browser cannot choose the amount. Mount verified callback handlers and run inbox, recovery, fulfillment and reconciliation workers. The [standalone consumer](examples/consumer/README.md) is an executable example using MOCK and local PostgreSQL. The [Blacktop integration seam](docs/blacktop-integration.md) maps these boundaries to its existing order flow without changing Blacktop.
