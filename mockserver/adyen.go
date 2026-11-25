@@ -310,3 +310,13 @@ func (f *Server) standardNotification(account, reference string, value int64, cu
 	body, _ := json.Marshal(map[string]any{"live": "false", "notificationItems": []any{map[string]any{"NotificationRequestItem": item}}})
 	return body
 }
+
+// AdyenAdverseNotification builds synthetic signed Standard evidence for a
+// recorded card payment or modification. It is a local simulator fixture,
+// never evidence that a merchant account received this event from Adyen.
+func (f *Server) AdyenAdverseNotification(record AdyenRecord, code, modificationPSP string, amount int64) []byte {
+	if code != "CHARGEBACK" && code != "REFUND_FAILED" || record.PaymentPSP == "" || record.Reference == "" || modificationPSP == "" || amount <= 0 {
+		return nil
+	}
+	return f.standardNotification(record.MerchantAccount, record.Reference, amount, record.Currency, modificationPSP, record.PaymentPSP, code, "true")
+}

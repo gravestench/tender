@@ -197,6 +197,30 @@ func (h *Adyen) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // Process applies one already authenticated inbox row atomically. Unresolved
 // rows remain pending for host retry or investigation.
 func (h *Adyen) Process(ctx context.Context, id string) error {
+	if strings.HasPrefix(id, "REFUND_FAILED.") {
+		return h.processAdverse(ctx, id)
+	}
+	err := h.processObservation(ctx, id)
+	// ACH CHARGEBACK changes ACH funds through its own signed-event path.
+	// A card CHARGEBACK is unsupported there and instead queues a review-only
+	// notice. The first transaction rolls back before the adverse path runs.
+	if strings.HasPrefix(id, "CHARGEBACK.") && errors.Is(err, tender.ErrUnsupported) {
+		return h.processAdverse(ctx, id)
+	}
+	return err
+}
+
+func (h *Adyen) processAdverse(ctx context.Context, id string) error {
+	return h.cfg.Engine.ProcessVerifiedAdverseEvent(ctx, id, func(tx tender.EventRecords, raw json.RawMessage) (tender.AdverseNotice, error) {
+		var e evidence
+		if json.Unmarshal(raw, &e) != nil {
+			return tender.AdverseNotice{}, tender.ErrValidation
+		}
+		return h.adverse(tx, id, e)
+	})
+}
+
+func (h *Adyen) processObservation(ctx context.Context, id string) error {
 	return h.cfg.Engine.ProcessVerifiedEventWithRecords(ctx, id, func(tx tender.EventRecords, raw json.RawMessage) (tender.VerifiedEvent, error) {
 		var e evidence
 		if json.Unmarshal(raw, &e) != nil {
@@ -208,6 +232,58 @@ func (h *Adyen) Process(ctx context.Context, id string) error {
 		o, err := h.observation(tx, e)
 		return tender.VerifiedEvent{ID: e.id(), Provider: "adyen", Observation: o}, err
 	})
+}
+
+// adverse projects only independently HMAC-signed financial exceptions. The
+// notice records host review work; neither a dispute nor refund failure erases
+// previously collected, refunded or fulfilled history.
+func (h *Adyen) adverse(tx tender.EventRecords, id string, e evidence) (tender.AdverseNotice, error) {
+	var n tender.AdverseNotice
+	if _, ok := e.canonical(); !ok || e.id() != id || e.Account != h.cfg.MerchantAccount || e.Success != "true" || e.Code != "CHARGEBACK" && e.Code != "REFUND_FAILED" {
+		return n, tender.ErrConflict
+	}
+	p, refOp, err := adyen.ResolveReference(tx, h.cfg.Scope, e.Ref)
+	if err != nil {
+		return n, err
+	}
+	if p.Provider != "adyen" || p.MerchantAccount != e.Account || refOp.PaymentID != p.ID || refOp.AttemptID != p.AttemptID ||
+		(p.Market.Method != tender.MethodVisa && p.Market.Method != tender.MethodMastercard) ||
+		p.ProviderReference == "" || e.Original != p.ProviderReference || e.PSP == e.Original ||
+		e.Amount.Value == nil || *e.Amount.Value <= 0 || e.Amount.Currency != p.Amount.Currency ||
+		*e.Amount.Value > p.Amount.Minor || *e.Amount.Value > p.Funds.Captured {
+		return n, tender.ErrConflict
+	}
+	n = tender.AdverseNotice{
+		Scope: h.cfg.Scope, Provider: "adyen", MerchantAccount: e.Account,
+		PaymentID: p.ID, ProviderEventID: id, ProviderReference: e.PSP,
+		OriginalReference: e.Original, ModificationReference: e.PSP,
+		Amount:     tender.Money{Minor: *e.Amount.Value, Currency: e.Amount.Currency},
+		ObservedAt: time.Now().UTC(),
+	}
+	if e.Code == "CHARGEBACK" {
+		n.Kind = "chargeback"
+		// A modification PSP belonging to an operation is not an independent
+		// dispute identity. Do not let such a collision authorize a return.
+		if _, err := tx.OperationByReference(h.cfg.Scope, p.ID, e.PSP); err == nil {
+			return tender.AdverseNotice{}, tender.ErrConflict
+		} else if !errors.Is(err, tender.ErrNotFound) {
+			return tender.AdverseNotice{}, err
+		}
+		return n, nil
+	}
+	n.Kind = "refund_failed"
+	op := refOp
+	if op.Kind != tender.OpRefund {
+		op, err = tx.OperationByReference(h.cfg.Scope, p.ID, e.PSP)
+		if err != nil {
+			return tender.AdverseNotice{}, err
+		}
+	}
+	if op.Kind != tender.OpRefund || op.PaymentID != p.ID || op.AttemptID != p.AttemptID || op.ProviderReference != e.PSP || op.Amount.Minor != *e.Amount.Value || op.Amount.Currency != e.Amount.Currency || op.Status == tender.OperationFailed {
+		return tender.AdverseNotice{}, tender.ErrConflict
+	}
+	n.OperationID = op.ID
+	return n, nil
 }
 func (h *Adyen) observation(tx tender.EventRecords, e evidence) (tender.Observation, error) {
 	var o tender.Observation
@@ -326,6 +402,15 @@ func (h *Adyen) observation(tx tender.EventRecords, e evidence) (tender.Observat
 			return o, nil
 		}
 	}
+	if kind == tender.OpRefund && e.Success == "true" {
+		failed, err := h.refundFailure(tx, p, op, e)
+		if err != nil {
+			return o, err
+		}
+		if failed {
+			return o, tender.ErrConflict
+		}
+	}
 	if e.Success == "false" {
 		o.Status = tender.OperationFailed
 		return o, nil
@@ -354,6 +439,40 @@ func (h *Adyen) observation(tx tender.EventRecords, e evidence) (tender.Observat
 		o.Snapshot.ProviderStatus = e.Code
 	}
 	return o, nil
+}
+
+// A received, independently signed scheme rejection fences a reordered
+// positive REFUND event until an operator resolves the contradictory facts.
+// A failure arriving after a completed refund remains review-only history.
+func (h *Adyen) refundFailure(tx tender.EventRecords, p tender.Payment, op tender.OperationRecord, event evidence) (bool, error) {
+	reader, ok := tx.(tender.VerifiedEvidenceReader)
+	if !ok {
+		return false, tender.ErrUnsupported
+	}
+	rows, err := reader.MatchingVerifiedEvidence(p.Scope, "adyen", p.MerchantAccount, map[string]string{"eventCode": "REFUND_FAILED", "originalReference": p.ProviderReference, "pspReference": event.PSP})
+	if err != nil {
+		return false, err
+	}
+	for _, raw := range rows {
+		var failure evidence
+		if json.Unmarshal(raw, &failure) != nil {
+			return false, tender.ErrValidation
+		}
+		if _, valid := failure.canonical(); !valid || failure.Account != p.MerchantAccount || failure.Code != "REFUND_FAILED" || failure.Success != "true" || failure.Original != p.ProviderReference || failure.PSP != event.PSP || failure.Amount.Value == nil || *failure.Amount.Value != op.Amount.Minor || failure.Amount.Currency != op.Amount.Currency {
+			continue
+		}
+		boundPayment, bound, err := adyen.ResolveReference(tx, p.Scope, failure.Ref)
+		if errors.Is(err, tender.ErrNotFound) || errors.Is(err, tender.ErrConflict) {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		if boundPayment.ID == p.ID && boundPayment.AttemptID == p.AttemptID && (bound.ID == op.ID || bound.Kind == tender.OpConfirm) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // A success worker can run before the worker for a failure that is already
