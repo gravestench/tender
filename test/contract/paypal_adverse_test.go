@@ -46,9 +46,13 @@ func paypalFixturePost(t *testing.T, h *walletRig, path string) {
 
 func paypalSignedCapture(t *testing.T, h *walletRig, id, kind, order, capture, merchant, value string) int {
 	t.Helper()
+	status := strings.TrimPrefix(kind, "PAYMENT.CAPTURE.")
+	if kind == "PAYMENT.CAPTURE.DENIED" {
+		status = "DECLINED"
+	}
 	raw, err := json.Marshal(map[string]any{
 		"id": id, "event_type": kind, "resource_type": "capture",
-		"resource": map[string]any{"id": capture, "status": strings.TrimPrefix(kind, "PAYMENT.CAPTURE."),
+		"resource": map[string]any{"id": capture, "status": status,
 			"amount":             map[string]string{"currency_code": "USD", "value": value},
 			"payee":              map[string]string{"merchant_id": merchant},
 			"supplementary_data": map[string]any{"related_ids": map[string]string{"order_id": order}}},
@@ -213,5 +217,42 @@ func TestPayPalAdversePendingCannotReopenDeniedCapture(t *testing.T) {
 	}
 	if p, _ := h.engine.Get(t.Context(), "wallet-payment"); p.Status != tender.PaymentDeclined || p.Funds.Captured != 0 {
 		t.Fatalf("denial changed: %+v", p.Snapshot)
+	}
+}
+
+func TestPayPalAdverseDocumentedDeclinedResource(t *testing.T) {
+	h := newAdverseWallet(t)
+	created := h.create(t)
+	h.decide(t, created.Payment.ProviderReference, "approve")
+	paypalFixturePost(t, h, "/fixture/capture-next/DENIED")
+	_, _ = h.engine.Confirm(t.Context(), walletReq("confirm-declined", 1000))
+	var d walletDelivery
+	select {
+	case d = <-h.deliveries:
+	case <-time.After(4 * time.Second):
+		t.Fatal("denied fixture delivery missing")
+	}
+	var event struct {
+		ID       string
+		Resource struct{ Status string }
+	}
+	if err := json.Unmarshal(d.body, &event); err != nil {
+		t.Fatal(err)
+	}
+	if event.Resource.Status != "DECLINED" {
+		t.Fatalf("fixture resource status = %q", event.Resource.Status)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/hooks", bytes.NewReader(d.body))
+	req.Header = d.header.Clone()
+	w := httptest.NewRecorder()
+	h.hook.ServeHTTP(w, req)
+	if w.Code != 202 {
+		t.Fatalf("documented denial receipt status %d", w.Code)
+	}
+	if err := h.hook.Process(t.Context(), event.ID); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := h.engine.Get(t.Context(), "wallet-payment"); p.Funds.Captured != 0 {
+		t.Fatal("declined capture collected")
 	}
 }

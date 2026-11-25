@@ -48,8 +48,8 @@ func paypalRowID(f map[string]string) string {
 	return "paypal-" + hex.EncodeToString(h[:])
 }
 
-// ProjectSettlement maps only a merchant-credit Express Checkout capture or
-// merchant-debit refund whose SB row directly relates to the original order.
+// ProjectSettlement maps only a merchant-credit Express Checkout capture
+// whose SB row directly relates to the original order.
 // PayPal's money fields are unsigned integer minor units, not decimal dollars.
 // A related TXN capture, unknown T-code, or report variant needs a separately
 // corroborated reference mapping and is deliberately left for review.
@@ -80,10 +80,11 @@ func ProjectSettlement(f map[string]string, observedAt time.Time) (tender.Settle
 			return empty, tender.ErrUnsupported
 		}
 	case "T1107":
-		kind, sign = tender.SettlementRefunded, -1
-		if f["transaction_debit_or_credit"] != "DR" {
-			return empty, tender.ErrUnsupported
-		}
+		// PayPal references the originating settlement, commonly a capture
+		// transaction, for full and partial refunds. This row alone cannot
+		// bind that capture to Tender's original order, so it cannot safely
+		// populate OriginalReference or match a refund operation.
+		return empty, tender.ErrUnsupported
 	default:
 		return empty, tender.ErrUnsupported
 	}

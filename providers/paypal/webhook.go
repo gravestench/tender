@@ -147,7 +147,7 @@ func captureEventKind(kind, status string) bool {
 	case "PAYMENT.CAPTURE.PENDING":
 		return status == "PENDING"
 	case "PAYMENT.CAPTURE.DENIED":
-		return status == "DENIED"
+		return status == "DECLINED"
 	default:
 		return false
 	}
@@ -182,7 +182,7 @@ func (h *Webhook) Process(ctx context.Context, id string) error {
 	if err != nil || done {
 		return err
 	}
-	if event.ID != id || !captureEventKind(event.Kind, strings.TrimPrefix(event.Kind, "PAYMENT.CAPTURE.")) || event.Merchant != h.api.cfg.MerchantAccount {
+	if event.ID != id || !allowedCaptureEvent(event.Kind) || event.Merchant != h.api.cfg.MerchantAccount {
 		return tender.ErrConflict
 	}
 	o, err := h.api.getOrder(ctx, event.OrderID)
@@ -246,6 +246,15 @@ func (h *Webhook) Process(ctx context.Context, id string) error {
 		}
 		return tender.VerifiedEvent{ID: id, Provider: "paypal", Observation: obs}, nil
 	})
+}
+
+func allowedCaptureEvent(kind string) bool {
+	switch kind {
+	case "PAYMENT.CAPTURE.COMPLETED", "PAYMENT.CAPTURE.PENDING", "PAYMENT.CAPTURE.DENIED":
+		return true
+	default:
+		return false
+	}
 }
 
 // processUnsettled joins the signed event to a fresh authenticated order. A

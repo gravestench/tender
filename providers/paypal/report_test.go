@@ -19,7 +19,7 @@ func paypalReportRow() map[string]string {
 	}
 }
 
-func TestProjectSettlementCaptureAndRefund(t *testing.T) {
+func TestProjectSettlementCapture(t *testing.T) {
 	at := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
 	f := paypalReportRow()
 	l, err := ProjectSettlement(f, at)
@@ -29,18 +29,27 @@ func TestProjectSettlementCaptureAndRefund(t *testing.T) {
 	if l.Kind != tender.SettlementCaptured || l.GrossMinor != 1000 || l.FeeMinor != 59 || l.NetMinor != 941 || l.ProviderReference != "O123" || l.OriginalReference != "O123" || l.ModificationReference != "C123" || l.SourcePartID != f["Tender Source Part ID"] || l.SourceSectionID != f["Tender Source Section ID"] {
 		t.Fatalf("capture projection: %+v", l)
 	}
-	f["transaction_id"] = "R123"
-	f["transaction_event_code"] = "T1107"
-	f["transaction_debit_or_credit"] = "DR"
-	f["gross_transaction_amount"] = "400"
-	f["fee_debit_or_credit"] = "CR"
-	f["fee_amount"] = "10"
-	r, err := ProjectSettlement(f, at)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r.Kind != tender.SettlementRefunded || r.GrossMinor != -400 || r.FeeMinor != -10 || r.NetMinor != -390 || r.OriginalReference != "O123" || r.ModificationReference != "R123" || r.ID == l.ID {
-		t.Fatalf("refund projection: %+v", r)
+}
+
+func TestProjectSettlementRefundNeedsAuthenticatedCaptureOrderJoin(t *testing.T) {
+	at := time.Now().UTC()
+	for _, amount := range []string{"400", "1000"} { // partial and full refunds
+		for _, relatedType := range []string{"ODR", "TXN"} {
+			f := paypalReportRow()
+			f["transaction_id"] = "R123"
+			f["transaction_event_code"] = "T1107"
+			f["transaction_debit_or_credit"] = "DR"
+			f["gross_transaction_amount"] = amount
+			f["fee_debit_or_credit"] = "CR"
+			f["fee_amount"] = "10"
+			f["paypal_reference_id_type"] = relatedType
+			if relatedType == "TXN" {
+				f["paypal_reference_id"] = "C123"
+			}
+			if _, err := ProjectSettlement(f, at); !errors.Is(err, tender.ErrUnsupported) {
+				t.Fatalf("%s refund of %s without capture to order join = %v", relatedType, amount, err)
+			}
+		}
 	}
 }
 

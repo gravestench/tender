@@ -165,14 +165,14 @@ func (f *ppFixture) captureStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	c := &o.Units[0].Payments.Captures[0]
 	if status == "DENIED" {
-		c.Status = "FAILED"
+		c.Status = "DECLINED"
 	} else {
 		c.Status = status
 	}
 	fx := PayPalRecord{OrderID: o.ID, ResourceID: c.ID, MerchantAccount: f.cfg.MerchantAccount, Value: c.Amount.Value, Currency: c.Amount.Currency}
 	f.saveOrder(o)
 	f.mu.Unlock()
-	f.notifyStatus(fx, status, Scenario{})
+	f.notifyStatus(fx, c.Status, Scenario{})
 	w.WriteHeader(204)
 }
 func (f *ppFixture) serve(w http.ResponseWriter, r *http.Request, route string, step Scenario) {
@@ -227,8 +227,8 @@ func (f *ppFixture) serve(w http.ResponseWriter, r *http.Request, route string, 
 			if o.Units[0].Payments.Captures[0].Status == "PENDING" {
 				status = "PENDING"
 			}
-			if o.Units[0].Payments.Captures[0].Status == "FAILED" {
-				status = "DENIED"
+			if o.Units[0].Payments.Captures[0].Status == "DECLINED" {
+				status = "DECLINED"
 			}
 		}
 		f.notifyStatus(fx, status, step)
@@ -303,7 +303,7 @@ func (f *ppFixture) mutate(route, id, key string, raw []byte) (PayPalRecord, boo
 			delete(f.records, "paypal/capture-next")
 		}
 		if captureStatus == "DENIED" {
-			captureStatus = "FAILED"
+			captureStatus = "DECLINED"
 		}
 		u.Payments = &struct {
 			Captures []ppCapture `json:"captures"`
@@ -370,11 +370,19 @@ func (f *ppFixture) signature(raw []byte, transmission, at string) string {
 func (f *ppFixture) notifyStatus(fx PayPalRecord, status string, step Scenario) {
 	eid := "WH-" + fx.ResourceID
 	if status != "COMPLETED" {
-		eid = "WH-" + status + "-" + fx.ResourceID
+		label := status
+		if status == "DECLINED" {
+			label = "DENIED"
+		}
+		eid = "WH-" + label + "-" + fx.ResourceID
 	}
 	at := f.clock().UTC().Format(time.RFC3339Nano)
 	tid := "TX-" + eid
-	raw, _ := json.Marshal(map[string]any{"id": eid, "resource_type": "capture", "event_type": "PAYMENT.CAPTURE." + status, "resource": map[string]any{"id": fx.ResourceID, "status": status, "payee": ppPayee{fx.MerchantAccount}, "amount": ppMoney{fx.Value, fx.Currency}, "supplementary_data": map[string]any{"related_ids": map[string]string{"order_id": fx.OrderID}}}})
+	eventStatus := status
+	if status == "DECLINED" {
+		eventStatus = "DENIED"
+	}
+	raw, _ := json.Marshal(map[string]any{"id": eid, "resource_type": "capture", "event_type": "PAYMENT.CAPTURE." + eventStatus, "resource": map[string]any{"id": fx.ResourceID, "status": status, "payee": ppPayee{fx.MerchantAccount}, "amount": ppMoney{fx.Value, fx.Currency}, "supplementary_data": map[string]any{"related_ids": map[string]string{"order_id": fx.OrderID}}}})
 	h := make(http.Header)
 	h.Set("PayPal-Auth-Algo", "SHA256withRSA")
 	h.Set("PayPal-Cert-Url", f.base+"/v1/notifications/certs/CERT-MOCK")
