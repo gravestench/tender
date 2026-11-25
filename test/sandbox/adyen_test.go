@@ -280,9 +280,10 @@ func compareAccounting(input io.Reader, merchant, paymentPSP, ref, brand string,
 		want, ok := expected[kind]
 		switch kind {
 		case "Received", "AuthenticationRequested":
-			if !registerEquals(get("Authorised (PC)"), 0) || !registerEquals(get("Captured (PC)"), 0) {
+			if seen[kind] || !registerEquals(get("Authorised (PC)"), 0) || !registerEquals(get("Captured (PC)"), 0) {
 				return fmt.Errorf("unexpected register movement on %s", kind)
 			}
+			seen[kind] = true
 			continue
 		}
 		if !ok {
@@ -406,6 +407,31 @@ func TestAccountingRequiresFreshProviderBookingOnEveryMatchedRow(t *testing.T) {
 		"merchant,payment,order,visa,SentForRefund,USD,0,-25.99,ref\n"
 	if err := compareAccounting(strings.NewReader(noDate), "merchant", "payment", "order", "visa", 2599, psps); err == nil {
 		t.Fatal("accepted accounting rows without a provider booking date")
+	}
+}
+
+func TestAccountingRejectsDuplicatePreAuthorizationRows(t *testing.T) {
+	ams, err := time.LoadLocation("Europe/Amsterdam")
+	if err != nil {
+		t.Fatal(err)
+	}
+	date := time.Now().In(ams).Format("2006-01-02 15:04:05")
+	const header = "Merchant Account,Psp Reference,Merchant Reference,Payment Method,Record Type,Payment Currency,Authorised (PC),Captured (PC),Modification Psp Reference,Booking Date (AMS)\n"
+	base := header +
+		"merchant,payment,order,visa,Authorised,USD,25.99,0.00,," + date + "\n" +
+		"merchant,payment,order,visa,SentForSettle,USD,-25.99,25.99,cap," + date + "\n" +
+		"merchant,payment,order,visa,SentForRefund,USD,0,-25.99,ref," + date + "\n"
+	psps := map[string]string{"CAPTURE": "cap", "REFUND": "ref"}
+	for _, kind := range []string{"Received", "AuthenticationRequested"} {
+		t.Run(kind, func(t *testing.T) {
+			row := "merchant,payment,order,visa," + kind + ",USD,0,0,," + date + "\n"
+			if err := compareAccounting(strings.NewReader(base+row), "merchant", "payment", "order", "visa", 2599, psps); err != nil {
+				t.Fatalf("one %s row rejected: %v", kind, err)
+			}
+			if err := compareAccounting(strings.NewReader(base+row+row), "merchant", "payment", "order", "visa", 2599, psps); err == nil {
+				t.Fatalf("accepted duplicate %s rows", kind)
+			}
+		})
 	}
 }
 
