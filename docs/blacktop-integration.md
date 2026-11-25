@@ -28,8 +28,8 @@ Keep the initial route restricted to a single merchant-owned direct account. Bla
 
 ## Qualification sequence
 
-1. Import the published **MOCK-only** `v0.1.0-alpha.1` tag into a clean Blacktop branch and build without a local `replace`. Keep the provider switch off. Follow the [tagged import instructions](../examples/consumer/README.md#verify-the-tagged-offline-alpha).
-2. Wire the order claim, trusted total, callback inbox and fulfillment outbox in MOCK. Run Blacktop's purchase, cancellation, refund, timeout, restart and duplicate-submit tests against the embedded simulator. Compare Blacktop's payment row and fulfillment ledger to Tender's records.
+1. After the **MOCK-only** `v0.1.0-alpha.2` tag is published, run `go get github.com/gravestench/tender@v0.1.0-alpha.2` in a clean Blacktop development branch and build without a local `replace`. Keep Tender disabled for real customer payments. Follow the [tagged import instructions](../examples/consumer/README.md#verify-the-tagged-offline-alpha) and use the [tag-matched storage migrations](storage.md).
+2. Wire the order claim, trusted total, callback inbox and fulfillment outbox in an isolated MOCK environment with a disposable database. Run Blacktop's purchase, cancellation, refund, timeout, restart and duplicate-submit tests against the embedded simulator. Compare Blacktop's payment row and fulfillment ledger to Tender's records.
 3. Obtain a merchant-owned Adyen test account, registered origin and HMAC keys. Run the protected [card qualification](evidence/adyen.md), including genuine provider portal and browser evidence. Resolve any navigation or issuer path that violates checkout policy before exposing the method.
 4. Obtain the acquirer's commercial terms, assessment decision and live approval. Run an approved low-value pilot, then compare actual captured amount, processor fee, net payout, refund cost and bank deposit to equivalent Blacktop transactions on the existing stack. Expand only if effective cost and reliability meet the business target.
 

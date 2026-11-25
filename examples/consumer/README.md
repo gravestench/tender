@@ -79,16 +79,19 @@ The restart test creates a separate schema in a disposable database, injects a f
 
 ## Verify the tagged offline alpha
 
-The development go.mod requires the placeholder version v0.0.0 and replaces github.com/gravestench/tender with the local checkout. To verify the published **MOCK-only** alpha, copy this directory into a clean temporary directory outside the repository. Run the following commands inside the copy.
+The development `go.mod` uses a local replacement for Tender. After the **MOCK-only** `v0.1.0-alpha.2` tag is published, run the following from the repository root with the tag available locally. The commands export the example into a temporary directory outside this checkout and resolve Tender from the public Go module proxy.
 
 ```sh
-export GOWORK=off
-export TENDER_TAG=v0.1.0-alpha.1
+TENDER_ALPHA_DIR=$(mktemp -d)
+git archive v0.1.0-alpha.2 -- examples/consumer store/postgres/migrations | tar -x -C "$TENDER_ALPHA_DIR"
+cd "$TENDER_ALPHA_DIR/examples/consumer"
+export GOWORK=off GOPROXY=https://proxy.golang.org
+export GOMODCACHE="$TENDER_ALPHA_DIR/go-mod-cache" GOCACHE="$TENDER_ALPHA_DIR/go-build-cache"
 go mod edit -dropreplace=github.com/gravestench/tender
-go get "github.com/gravestench/tender@$TENDER_TAG"
+go get github.com/gravestench/tender@v0.1.0-alpha.2
 go mod tidy
 go list -m -json github.com/gravestench/tender
-go build -o /tmp/tender-consumer-tag .
+go build -o "$TENDER_ALPHA_DIR/tender-consumer" .
 ```
 
-Check that the selected Version is `v0.1.0-alpha.1` and that Replace is absent. A clean copy completed this import, build and a USD 25.99 loopback MOCK capture. The alpha is suitable for offline integration tests only; the card, PayPal, Klarna and ACH provider paths still need genuine sandbox evidence and merchant activation before real use.
+Check that `Version` is `v0.1.0-alpha.2` and that `Replace` is absent. Run the resulting binary on loopback in MOCK to exercise a synthetic checkout. For durable tests, use the [tag-matched PostgreSQL migrations](../../docs/storage.md) and the example's host ledger migration. The alpha.1 import, build and USD 25.99 loopback capture remain recorded separately. For alpha.2 results and qualification status, see the [release ledger](../../docs/evidence/release-gates.md).
