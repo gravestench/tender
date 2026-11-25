@@ -5,13 +5,320 @@ package e2e_test
 import (
 	"context"
 	"encoding/json"
-	"github.com/jackc/pgx/v5"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
+
+const walletOperatorFixture = "local-paypal-operator-credential-only"
+
+// Exercise the host checkout, the provider fixture and the durable store.
+func TestPayPalDurableLifecycle(t *testing.T) {
+	t.Run("cancel reload and abandoned approval never collect funds", func(t *testing.T) {
+		dsn, schema, cfg := demoSchema(t)
+		var paymentID string
+		t.Run("host", func(t *testing.T) {
+			d := launch(t, "TENDER_CONSUMER_PROVIDER=paypal", "TENDER_PAYPAL_MOCK_PRESENTATION=component", "TENDER_PAYPAL_OPERATOR_KEY="+walletOperatorFixture, "TENDER_CONSUMER_DATABASE_URL="+dsn, "TENDER_CONSUMER_SCHEMA="+schema)
+			c := client(t, d.Origin)
+			p := request(t, c, "GET", d.Guest, "", nil)
+			base := d.Origin + p.path
+			fields := url.Values{"csrf": {token(t, p)}}
+			if got := request(t, c, "POST", base+"/wallet/start", d.Origin, fields); got.status != 200 {
+				t.Fatalf("start: %d", got.status)
+			}
+			if got := request(t, c, "POST", base+"/wallet/cancel", d.Origin, fields); got.status != 200 || !strings.Contains(got.body, "cancelled") {
+				t.Fatalf("cancel: %d %s", got.status, got.body)
+			}
+			for range 2 {
+				if got := status(t, c, base); got.Status != "requires_action" || got.Fulfilled {
+					t.Fatalf("cancel moved funds: %+v", got)
+				} else {
+					paymentID = got.PaymentID
+				}
+				if page := request(t, c, "GET", base, "", nil); page.status != 200 || !strings.Contains(page.body, "Synthetic PayPal approval") {
+					t.Fatalf("refresh lost resumable action: %d", page.status)
+				}
+			}
+			if got := request(t, c, "POST", base+"/wallet/approve", d.Origin, fields); got.status != 200 {
+				t.Fatalf("approve: %d", got.status)
+			}
+			if got := status(t, c, base); got.Status == "captured" || got.Fulfilled {
+				t.Fatalf("abandoned approval collected: %+v", got)
+			}
+		})
+		if t.Failed() {
+			return
+		}
+		t.Run("restart after abandonment", func(t *testing.T) {
+			d := launch(t, "TENDER_CONSUMER_PROVIDER=paypal", "TENDER_PAYPAL_MOCK_PRESENTATION=component", "TENDER_CONSUMER_DATABASE_URL="+dsn, "TENDER_CONSUMER_SCHEMA="+schema)
+			c := client(t, d.Origin)
+			p := request(t, c, "GET", d.Guest, "", nil)
+			if p.status != 200 || !strings.Contains(p.body, "PayPal is unavailable for this checkout") || strings.Contains(p.body, "Approve synthetic payment") {
+				t.Fatalf("restart exposed vanished fixture action: %d %s", p.status, p.body)
+			}
+			base := d.Origin + p.path
+			if got := request(t, c, "POST", base+"/wallet/approve", d.Origin, url.Values{"csrf": {token(t, p)}}); got.status != 409 {
+				t.Fatalf("restart accepted vanished approval: %d", got.status)
+			}
+			if got := status(t, c, base); got.PaymentID != paymentID || got.Fulfilled {
+				t.Fatalf("restart changed abandoned payment: %+v", got)
+			}
+		})
+		if t.Failed() {
+			return
+		}
+		conn := paypalInspect(t, cfg, schema)
+		var captures, deliveries, outbox int
+		if err := conn.QueryRow(t.Context(), `SELECT (SELECT count(*) FROM tender_operations WHERE payment_id=$1 AND record->>'Kind'='confirm'), (SELECT count(*) FROM consumer_fulfillments WHERE payment_id=$1), (SELECT count(*) FROM tender_outbox WHERE payment_id=$1)`, paymentID).Scan(&captures, &deliveries, &outbox); err != nil {
+			t.Fatal(err)
+		}
+		if captures+deliveries+outbox != 0 {
+			t.Fatalf("abandoned approval persisted collection: %d %d %d", captures, deliveries, outbox)
+		}
+	})
+	t.Run("duplicate confirmation captures and fulfills once after restart", func(t *testing.T) {
+		dsn, schema, cfg := demoSchema(t)
+		var paymentID string
+		t.Run("capture", func(t *testing.T) {
+			d := launch(t, "TENDER_CONSUMER_PROVIDER=paypal", "TENDER_PAYPAL_MOCK_PRESENTATION=component", "TENDER_PAYPAL_OPERATOR_KEY="+walletOperatorFixture, "TENDER_CONSUMER_DATABASE_URL="+dsn, "TENDER_CONSUMER_SCHEMA="+schema)
+			c := client(t, d.Origin)
+			p := request(t, c, "GET", d.Guest, "", nil)
+			base := d.Origin + p.path
+			fields := url.Values{"csrf": {token(t, p)}}
+			for _, step := range []string{"start", "approve"} {
+				if got := request(t, c, "POST", base+"/wallet/"+step, d.Origin, fields); got.status != 200 {
+					t.Fatalf("%s: %d", step, got.status)
+				}
+			}
+			var wg sync.WaitGroup
+			codes := make(chan int, 2)
+			for range 2 {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					req, err := http.NewRequestWithContext(t.Context(), "POST", base+"/wallet/confirm", strings.NewReader(fields.Encode()))
+					if err != nil {
+						codes <- 0
+						return
+					}
+					req.Header.Set("Origin", d.Origin)
+					req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+					res, err := c.Do(req)
+					if err != nil {
+						codes <- 0
+						return
+					}
+					res.Body.Close()
+					codes <- res.StatusCode
+				}()
+			}
+			wg.Wait()
+			close(codes)
+			accepted := 0
+			for code := range codes {
+				if code == 200 {
+					accepted++
+				} else if code != 409 {
+					t.Fatalf("duplicate confirm: %d", code)
+				}
+			}
+			if accepted == 0 {
+				t.Fatal("neither confirmation captured")
+			}
+			got := status(t, c, base)
+			if got.Status != "captured" || !got.Fulfilled {
+				t.Fatalf("duplicate capture: %+v", got)
+			}
+			paymentID = got.PaymentID
+			provider := walletProviderState(t, c, d.Origin, got.OrderID)
+			if provider.Status != "COMPLETED" || len(provider.Units) != 1 || len(provider.Units[0].Payments.Captures) != 1 || provider.Units[0].Payments.Captures[0].Status != "COMPLETED" {
+				t.Fatalf("provider captured more than once: %+v", provider)
+			}
+		})
+		if t.Failed() {
+			return
+		}
+		t.Run("restart", func(t *testing.T) {
+			d := launch(t, "TENDER_CONSUMER_PROVIDER=paypal", "TENDER_PAYPAL_MOCK_PRESENTATION=component", "TENDER_CONSUMER_DATABASE_URL="+dsn, "TENDER_CONSUMER_SCHEMA="+schema)
+			c := client(t, d.Origin)
+			p := request(t, c, "GET", d.Guest, "", nil)
+			got := status(t, c, d.Origin+p.path)
+			if got.PaymentID != paymentID || got.Status != "captured" || !got.Fulfilled {
+				t.Fatalf("restart: %+v", got)
+			}
+		})
+		if t.Failed() {
+			return
+		}
+		conn := paypalInspect(t, cfg, schema)
+		var captures, deliveries, consumed int
+		if err := conn.QueryRow(t.Context(), `SELECT (SELECT count(*) FROM tender_operations WHERE payment_id=$1 AND record->>'Kind'='confirm' AND status='succeeded'), (SELECT count(*) FROM consumer_fulfillments WHERE payment_id=$1), (SELECT count(*) FROM tender_outbox WHERE payment_id=$1 AND consumed_at IS NOT NULL)`, paymentID).Scan(&captures, &deliveries, &consumed); err != nil {
+			t.Fatal(err)
+		}
+		if captures != 1 || deliveries != 1 || consumed != 1 {
+			t.Fatalf("duplicate durable counts: %d %d %d", captures, deliveries, consumed)
+		}
+	})
+	t.Run("lost capture reply recovers from verified receipt", func(t *testing.T) {
+		dsn, schema, cfg := demoSchema(t)
+		var paymentID string
+		t.Run("host", func(t *testing.T) {
+			d := launch(t, "TENDER_CONSUMER_PROVIDER=paypal", "TENDER_PAYPAL_MOCK_PRESENTATION=component", "TENDER_PAYPAL_MOCK_LOST_RESPONSE=capture", "TENDER_CONSUMER_DATABASE_URL="+dsn, "TENDER_CONSUMER_SCHEMA="+schema)
+			c := client(t, d.Origin)
+			p := request(t, c, "GET", d.Guest, "", nil)
+			base := d.Origin + p.path
+			fields := url.Values{"csrf": {token(t, p)}}
+			for _, step := range []string{"start", "approve"} {
+				if got := request(t, c, "POST", base+"/wallet/"+step, d.Origin, fields); got.status != 200 {
+					t.Fatalf("%s: %d", step, got.status)
+				}
+			}
+			if got := request(t, c, "POST", base+"/wallet/confirm", d.Origin, fields); got.status != 409 {
+				t.Fatalf("lost reply: %d %s", got.status, got.body)
+			}
+			paymentID = status(t, c, base).PaymentID
+			deadline := time.Now().Add(12 * time.Second)
+			for {
+				got := status(t, c, base)
+				if got.Status == "captured" && got.Fulfilled {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("lost capture did not recover: %+v", got)
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+		})
+		if t.Failed() {
+			return
+		}
+		conn := paypalInspect(t, cfg, schema)
+		var captures, events, deliveries int
+		if err := conn.QueryRow(t.Context(), `SELECT (SELECT count(*) FROM tender_operations WHERE payment_id=$1 AND record->>'Kind'='confirm' AND status='succeeded'), (SELECT count(*) FROM tender_provider_events WHERE processed_at IS NOT NULL), (SELECT count(*) FROM consumer_fulfillments WHERE payment_id=$1)`, paymentID).Scan(&captures, &events, &deliveries); err != nil {
+			t.Fatal(err)
+		}
+		if captures != 1 || events != 1 || deliveries != 1 {
+			t.Fatalf("lost reply counts: %d %d %d", captures, events, deliveries)
+		}
+	})
+	t.Run("partial refund is host controlled and durable", func(t *testing.T) {
+		dsn, schema, cfg := demoSchema(t)
+		var paymentID string
+		t.Run("host", func(t *testing.T) {
+			d := launch(t, "TENDER_CONSUMER_PROVIDER=paypal", "TENDER_PAYPAL_MOCK_PRESENTATION=component", "TENDER_PAYPAL_OPERATOR_KEY="+walletOperatorFixture, "TENDER_CONSUMER_DATABASE_URL="+dsn, "TENDER_CONSUMER_SCHEMA="+schema)
+			c := client(t, d.Origin)
+			p := request(t, c, "GET", d.Guest, "", nil)
+			base := d.Origin + p.path
+			fields := url.Values{"csrf": {token(t, p)}}
+			for _, step := range []string{"start", "approve", "confirm"} {
+				got := request(t, c, "POST", base+"/wallet/"+step, d.Origin, fields)
+				if got.status != 200 {
+					t.Fatalf("%s: %d %s", step, got.status, got.body)
+				}
+			}
+			before := status(t, c, base)
+			if before.Status != "captured" || !before.Fulfilled {
+				t.Fatalf("capture: %+v", before)
+			}
+			paymentID = before.PaymentID
+			endpoint := d.Origin + "/operator/wallet/orders/" + before.OrderID + "/refund"
+			if got := request(t, c, "POST", endpoint, d.Origin, nil); got.status != 404 {
+				t.Fatalf("buyer refund access: %d", got.status)
+			}
+			for range 2 {
+				req, err := http.NewRequestWithContext(t.Context(), "POST", endpoint, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				req.Header.Set("Authorization", "Bearer "+walletOperatorFixture)
+				res, err := c.Do(req)
+				if err != nil {
+					t.Fatal(err)
+				}
+				res.Body.Close()
+				if res.StatusCode != 202 {
+					t.Fatalf("host refund: %d", res.StatusCode)
+				}
+			}
+			after := request(t, c, "GET", base+"/status", "", nil)
+			if after.status != 200 || !json.Valid([]byte(after.body)) || !containsRefund(after.body, 1000) {
+				t.Fatalf("partial refund: %d %s", after.status, after.body)
+			}
+			if !status(t, c, base).Fulfilled {
+				t.Fatal("refund erased prior fulfillment")
+			}
+			provider := walletProviderState(t, c, d.Origin, before.OrderID)
+			if provider.Status != "COMPLETED" || len(provider.Units) != 1 || len(provider.Units[0].Payments.Captures) != 1 || provider.Units[0].Payments.Captures[0].Status != "PARTIALLY_REFUNDED" {
+				t.Fatalf("provider partial refund: %+v", provider)
+			}
+		})
+		if t.Failed() {
+			return
+		}
+		conn := paypalInspect(t, cfg, schema)
+		var refunds, fulfillment, consumed int
+		err := conn.QueryRow(t.Context(), `SELECT (SELECT count(*) FROM tender_operations WHERE payment_id=$1 AND record->>'Kind'='refund' AND status='succeeded'), (SELECT count(*) FROM consumer_fulfillments WHERE payment_id=$1), (SELECT count(*) FROM tender_outbox WHERE payment_id=$1 AND consumed_at IS NOT NULL)`, paymentID).Scan(&refunds, &fulfillment, &consumed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if refunds != 1 || fulfillment != 1 || consumed != 1 {
+			t.Fatalf("durable refund counts: %d %d %d", refunds, fulfillment, consumed)
+		}
+	})
+}
+
+func paypalInspect(t *testing.T, cfg *pgx.ConnConfig, schema string) *pgx.Conn {
+	t.Helper()
+	conn, err := connectDemo(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close(context.Background()) })
+	if _, err := conn.Exec(t.Context(), "SET search_path TO "+pgx.Identifier{schema}.Sanitize()); err != nil {
+		t.Fatal(err)
+	}
+	return conn
+}
+
+type walletFixtureOrder struct {
+	Status string `json:"status"`
+	Units  []struct {
+		Payments struct {
+			Captures []struct{ ID, Status string } `json:"captures"`
+		} `json:"payments"`
+	} `json:"purchase_units"`
+}
+
+func walletProviderState(t *testing.T, c *http.Client, origin, orderID string) walletFixtureOrder {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), "GET", origin+"/operator/wallet/orders/"+orderID+"/fixture", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+walletOperatorFixture)
+	res, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var state walletFixtureOrder
+	if res.StatusCode != 200 || json.NewDecoder(res.Body).Decode(&state) != nil {
+		t.Fatalf("provider fixture: %d", res.StatusCode)
+	}
+	return state
+}
+
+func containsRefund(raw string, want int64) bool {
+	var state struct{ Funds struct{ Refunded int64 } }
+	return json.Unmarshal([]byte(raw), &state) == nil && state.Funds.Refunded == want
+}
 
 func TestPayPalCheckout(t *testing.T) {
 	for _, scenario := range []string{"component", "popup", "redirect"} {
