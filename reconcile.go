@@ -391,6 +391,7 @@ func (e *Engine) Reconcile(ctx context.Context, report SettlementReport) (Reconc
 		return ReconciliationRun{}, err
 	}
 	if conflicted {
+		e.observe(ctx, OperationalEvent{Kind: OperationalReconciliation, Duration: time.Since(started), ErrorKind: ErrConflict, Discrepancies: 1})
 		return ReconciliationRun{}, fmt.Errorf("%w: report identity was reused with changed contents", ErrConflict)
 	}
 	lines, payouts := operationalDiscrepancyCounts(run)

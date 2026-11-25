@@ -2,6 +2,7 @@ package tender
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -43,5 +44,27 @@ func TestOperationalObserverQueueIsBounded(t *testing.T) {
 	}
 	if got := e.DroppedOperationalEvents(); got != 191 {
 		t.Fatalf("dropped %d, want 191 with one in flight and 64 queued", got)
+	}
+}
+
+func TestOperationalObserverWorkerContinuesAfterPanic(t *testing.T) {
+	var calls atomic.Int32
+	delivered := make(chan OperationalEvent, 1)
+	e := &Engine{config: EngineConfig{Observer: internalObserverFunc(func(_ context.Context, event OperationalEvent) error {
+		if calls.Add(1) == 1 {
+			panic("host sink failed")
+		}
+		delivered <- event
+		return nil
+	}), Now: time.Now}}
+	e.observe(t.Context(), OperationalEvent{Kind: OperationalProviderCall})
+	e.observe(t.Context(), OperationalEvent{Kind: OperationalWebhookReceipt})
+	select {
+	case got := <-delivered:
+		if got.Kind != OperationalWebhookReceipt {
+			t.Fatalf("delivered = %+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("panic stopped observer worker")
 	}
 }
