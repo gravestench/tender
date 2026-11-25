@@ -315,7 +315,9 @@ func (f *Server) standardNotification(account, reference string, value int64, cu
 // recorded card payment or modification. It is a local simulator fixture,
 // never evidence that a merchant account received this event from Adyen.
 func (f *Server) AdyenAdverseNotification(record AdyenRecord, code, modificationPSP string, amount int64) []byte {
-	if code != "CHARGEBACK" && code != "REFUND_FAILED" || record.PaymentPSP == "" || record.Reference == "" || modificationPSP == "" || amount <= 0 {
+	if code != "CHARGEBACK" && code != "REFUND_FAILED" && code != "CHARGEBACK_REVERSED" && code != "SECOND_CHARGEBACK" && code != "REFUNDED_REVERSED" ||
+		(record.PaymentPSP == "" && code != "CHARGEBACK_REVERSED" && code != "SECOND_CHARGEBACK" && code != "REFUNDED_REVERSED") ||
+		record.Reference == "" || modificationPSP == "" || amount <= 0 {
 		return nil
 	}
 	return f.standardNotification(record.MerchantAccount, record.Reference, amount, record.Currency, modificationPSP, record.PaymentPSP, code, "true")

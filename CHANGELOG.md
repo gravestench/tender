@@ -2,6 +2,7 @@
 
 ## Unreleased — v1.0 development
 
+- Added MOCK-only review notices for exactly correlated Adyen chargeback reversals, second chargebacks and refund reversals. No webhook-derived money movement, report-reversal projection or provider qualification is claimed.
 - Official provider sandbox and production qualification remain BLOCKED. The four-rail `v1.0.0` release awaits G3 and G4 evidence.
 
 ## v0.1.0-alpha.2 — MOCK preview (2026-11-25 UTC)
