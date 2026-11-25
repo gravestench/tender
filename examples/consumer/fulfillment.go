@@ -80,9 +80,28 @@ FOR UPDATE OF n,p`, a.scope.MerchantID, a.scope.Environment, o.PaymentID, o.ID).
 	if err = json.Unmarshal(raw, &p); err != nil {
 		return err
 	}
-	if p.Market != a.market || p.Provider != a.provider || p.MerchantAccount != a.account || p.Amount != o.Total || p.Status != tender.PaymentCaptured ||
-		p.Funds.Captured != o.Total.Minor || p.Funds.Refunded != 0 || p.Funds.Returned != 0 || p.Funds.Disputed != 0 {
+	collected := p.Status == tender.PaymentCaptured && p.Funds.Captured == o.Total.Minor
+	if a.market.Method == tender.MethodACH {
+		collected = p.Status == tender.PaymentSettled && p.VerifiedMethod == tender.MethodACH && p.Funds.Settled == o.Total.Minor
+	}
+	if p.Market != a.market || p.Provider != a.provider || p.MerchantAccount != a.account || p.Amount != o.Total || !collected ||
+		p.Funds.Refunded != 0 || p.Funds.Returned != 0 || p.Funds.Disputed != 0 {
 		return nil // Hold the notice for host review after any conflicting facts.
+	}
+	if p.Market.Method == tender.MethodACH {
+		// A synthetic return request may be durable before its queued signed
+		// callback. It can only hold delivery, never establish returned funds.
+		// Lock its row so this decision orders against the operator update.
+		var returned bool
+		err = tx.QueryRowContext(ctx, `SELECT returned FROM consumer_ach_fixtures
+ WHERE merchant_id=$1 AND environment=$2 AND order_id=$3 AND payment_id=$4 FOR SHARE`,
+			a.scope.MerchantID, a.scope.Environment, o.ID, o.PaymentID).Scan(&returned)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil || returned {
+			return err
+		}
 	}
 	if p.Provider == "adyen" {
 		// In this two-order example the inbox table lock orders the final
@@ -100,7 +119,7 @@ FOR UPDATE OF n,p`, a.scope.MerchantID, a.scope.Environment, o.PaymentID, o.ID).
 		err = tx.QueryRowContext(ctx, `SELECT EXISTS (
  SELECT FROM tender_provider_events
  WHERE merchant_id=$1 AND environment=$2 AND provider='adyen' AND merchant_account=$3
- AND evidence->>'eventCode'='CAPTURE_FAILED' AND evidence->>'originalReference'=$4
+ AND evidence->>'eventCode' IN ('CAPTURE_FAILED','CHARGEBACK') AND evidence->>'originalReference'=$4
  AND evidence#>>'{amount,currency}'=$5)`, p.Scope.MerchantID, p.Scope.Environment, p.MerchantAccount, p.ProviderReference, p.Amount.Currency).Scan(&adverse)
 		if err != nil || adverse {
 			return err

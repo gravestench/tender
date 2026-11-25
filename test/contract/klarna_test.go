@@ -26,15 +26,16 @@ import (
 type capturedKlarnaCallback struct{ target, token string }
 
 type klarnaRig struct {
-	seen chan capturedKlarnaCallback
-	t    *testing.T
-	e    *tender.Engine
-	a    *klarna.Adapter
-	db   adyenStore
-	cfg  klarna.Config
-	sim  *mockserver.Server
-	url  string
-	now  time.Time
+	seen     chan capturedKlarnaCallback
+	t        *testing.T
+	e        *tender.Engine
+	a        *klarna.Adapter
+	db       adyenStore
+	cfg      klarna.Config
+	sim      *mockserver.Server
+	url      string
+	now      time.Time
+	observer tender.Observer
 }
 
 func newKlarna(t *testing.T, db adyenStore, fx mockserver.KlarnaFixture) *klarnaRig {
@@ -79,9 +80,52 @@ func (h *klarnaRig) restart() {
 	if err != nil {
 		h.t.Fatal(err)
 	}
-	h.e, err = tender.NewEngine(tender.EngineConfig{Scope: dbScope, Store: h.db, Provider: h.a, ProviderName: "klarna", MerchantAccount: "mid", Market: tender.Market{Country: "US", Currency: "USD", Method: tender.MethodKlarna}, Now: h.cfg.Now})
+	h.e, err = tender.NewEngine(tender.EngineConfig{Scope: dbScope, Store: h.db, Provider: h.a, ProviderName: "klarna", MerchantAccount: "mid", Market: tender.Market{Country: "US", Currency: "USD", Method: tender.MethodKlarna}, Now: h.cfg.Now, Observer: h.observer})
 	if err != nil {
 		h.t.Fatal(err)
+	}
+}
+
+type klarnaOperationalObserver func(context.Context, tender.OperationalEvent) error
+
+func (f klarnaOperationalObserver) Observe(ctx context.Context, e tender.OperationalEvent) error {
+	return f(ctx, e)
+}
+
+func TestKlarnaOperationalReceiptLag(t *testing.T) {
+	h := newKlarna(t, store.NewMemory(), mockserver.KlarnaFixture{})
+	h.cfg.Now = time.Now
+	events := make(chan tender.OperationalEvent, 4)
+	h.observer = klarnaOperationalObserver(func(_ context.Context, event tender.OperationalEvent) error { events <- event; return nil })
+	h.restart()
+	session := h.session()
+	id := h.callback(session.Operation.ProviderReference)
+	time.Sleep(5 * time.Millisecond)
+	result, err := h.a.ProcessAuthorization(t.Context(), h.e, "pay", id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipt tender.OperationalEvent
+	deadline := time.After(2 * time.Second)
+	for receipt.Kind != tender.OperationalWebhookReceipt {
+		select {
+		case receipt = <-events:
+		case <-deadline:
+			t.Fatal("missing Klarna receipt observation")
+		}
+	}
+	if receipt.PaymentID != "pay" || receipt.OperationID != result.Operation.ID || receipt.ReceiptLag <= 0 || receipt.Provider != "klarna" {
+		t.Fatalf("receipt = %+v", receipt)
+	}
+	if _, err := h.a.ProcessAuthorization(t.Context(), h.e, "pay", id); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-events:
+		if event.Kind == tender.OperationalWebhookReceipt {
+			t.Fatalf("replayed receipt emitted again: %+v", event)
+		}
+	case <-time.After(25 * time.Millisecond):
 	}
 }
 func kreq(key string, amount int64) tender.Request {

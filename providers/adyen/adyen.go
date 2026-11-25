@@ -188,9 +188,19 @@ func (a *Adapter) Query(context.Context, tender.ProviderRequest) (tender.Observa
 	return tender.Observation{}, tender.ErrUnsupported
 }
 
-// CheckStore verifies that this host can durably receive both capture success
-// and subsequent failure before submitting a capture to Adyen.
+// A modification PSP must be checked against every operation on this merchant
+// route before a signed dispute or ACH return can be accepted.
+type merchantOperationReferenceReader interface {
+	OperationByMerchantReference(tender.Scope, string, string, string) (tender.OperationRecord, error)
+}
+
+// CheckStore verifies that the host can distinguish a signed dispute PSP from
+// an existing operation before dispatch. Captures also require durable success
+// and failure callback processing.
 func (a *Adapter) CheckStore(kind tender.OperationKind, tx tender.Tx) error {
+	if _, ok := tx.(merchantOperationReferenceReader); !ok {
+		return tender.ErrUnsupported
+	}
 	if kind == tender.OpCapture {
 		_, ok := tx.(interface {
 			tender.VerifiedEventTx

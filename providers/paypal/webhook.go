@@ -12,8 +12,8 @@ import (
 	"time"
 )
 
-// Webhook is the receiver and asynchronous processor for an app's registered
-// PAYMENT.CAPTURE.COMPLETED events. OnStored may wake a host worker.
+// Webhook receives postback-verified capture status events. OnStored may wake
+// a host worker; serving a request never changes funds or fulfills an order.
 type Webhook struct {
 	api      *Adapter
 	store    tender.Store
@@ -110,7 +110,7 @@ func (h *Webhook) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			} `json:"supplementary_data"`
 		}
 	}
-	if json.Unmarshal(raw, &event) != nil || !idPattern.MatchString(event.ID) || event.Type != "PAYMENT.CAPTURE.COMPLETED" || event.ResourceType != "capture" || event.Resource.Status != "COMPLETED" || event.Resource.Payee.Merchant != h.api.cfg.MerchantAccount || !idPattern.MatchString(event.Resource.ID) || !idPattern.MatchString(event.Resource.Related.IDs.Order) || event.Resource.Amount.Currency != "USD" {
+	if json.Unmarshal(raw, &event) != nil || !idPattern.MatchString(event.ID) || !captureEventKind(event.Type, event.Resource.Status) || event.ResourceType != "capture" || event.Resource.Payee.Merchant != h.api.cfg.MerchantAccount || !idPattern.MatchString(event.Resource.ID) || !idPattern.MatchString(event.Resource.Related.IDs.Order) || event.Resource.Amount.Currency != "USD" {
 		w.WriteHeader(400)
 		return
 	}
@@ -124,11 +124,27 @@ func (h *Webhook) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return inbox.InsertVerifiedEvent(h.key(e.ID), body)
 	})
 	if errors.Is(err, tender.ErrConflict) {
-		saved, _, readErr := h.load(r.Context(), e.ID)
-		err = readErr
-		if err == nil && saved.ID != "" && saved != e {
-			err = tender.ErrConflict
-		}
+		// ProcessVerifiedEvent skips callbacks for processed rows. Read the
+		// allowlisted receipt regardless of processing state before accepting a
+		// replay with the same provider event ID.
+		err = h.store.Transact(r.Context(), func(tx tender.Tx) error {
+			reader, ok := tx.(tender.VerifiedEvidenceReader)
+			if !ok {
+				return tender.ErrUnsupported
+			}
+			matches, err := reader.MatchingVerifiedEvidence(h.api.cfg.Scope, "paypal", h.api.cfg.MerchantAccount, map[string]string{"ID": e.ID})
+			if err != nil {
+				return err
+			}
+			if len(matches) != 1 {
+				return tender.ErrConflict
+			}
+			var saved receipt
+			if json.Unmarshal(matches[0], &saved) != nil || saved != e {
+				return tender.ErrConflict
+			}
+			return nil
+		})
 	}
 	if err != nil {
 		w.WriteHeader(503)
@@ -138,6 +154,19 @@ func (h *Webhook) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.onStored(e.ID)
 	}
 	w.WriteHeader(202)
+}
+
+func captureEventKind(kind, status string) bool {
+	switch kind {
+	case "PAYMENT.CAPTURE.COMPLETED":
+		return status == "COMPLETED"
+	case "PAYMENT.CAPTURE.PENDING":
+		return status == "PENDING"
+	case "PAYMENT.CAPTURE.DENIED":
+		return status == "DECLINED"
+	default:
+		return false
+	}
 }
 
 // load reads unprocessed evidence before external I/O. Returning the sentinel
@@ -169,7 +198,7 @@ func (h *Webhook) Process(ctx context.Context, id string) error {
 	if err != nil || done {
 		return err
 	}
-	if event.ID != id || event.Kind != "PAYMENT.CAPTURE.COMPLETED" || event.Merchant != h.api.cfg.MerchantAccount {
+	if event.ID != id || !allowedCaptureEvent(event.Kind) || event.Merchant != h.api.cfg.MerchantAccount {
 		return tender.ErrConflict
 	}
 	o, err := h.api.getOrder(ctx, event.OrderID)
@@ -178,6 +207,9 @@ func (h *Webhook) Process(ctx context.Context, id string) error {
 	}
 	if len(o.Units) != 1 || !idPattern.MatchString(o.Units[0].Custom) {
 		return tender.ErrConflict
+	}
+	if event.Kind == "PAYMENT.CAPTURE.PENDING" || event.Kind == "PAYMENT.CAPTURE.DENIED" {
+		return h.processUnsettled(ctx, id, event, o)
 	}
 	return h.engine.ProcessVerifiedEventWithRecords(ctx, id, func(tx tender.EventRecords, raw json.RawMessage) (tender.VerifiedEvent, error) {
 		var stored receipt
@@ -227,6 +259,101 @@ func (h *Webhook) Process(ctx context.Context, id string) error {
 			if err != nil {
 				return empty, err
 			}
+		}
+		return tender.VerifiedEvent{ID: id, Provider: "paypal", Observation: obs}, nil
+	})
+}
+
+func allowedCaptureEvent(kind string) bool {
+	switch kind {
+	case "PAYMENT.CAPTURE.COMPLETED", "PAYMENT.CAPTURE.PENDING", "PAYMENT.CAPTURE.DENIED":
+		return true
+	default:
+		return false
+	}
+}
+
+// processUnsettled joins the signed event to a fresh authenticated order. A
+// late denial is review work: a previous capture and fulfillment stay intact.
+func (h *Webhook) processUnsettled(ctx context.Context, id string, event receipt, o order) error {
+	if o.Status != "COMPLETED" || o.buyerID() == "" || o.Units[0].Payments == nil || len(o.Units[0].Payments.Captures) != 1 {
+		return tender.ErrConflict
+	}
+	c := o.Units[0].Payments.Captures[0]
+	if !c.Final || c.ID != event.CaptureID || c.Amount != event.Amount ||
+		event.Kind == "PAYMENT.CAPTURE.PENDING" && c.Status != "PENDING" ||
+		event.Kind == "PAYMENT.CAPTURE.DENIED" && c.Status != "FAILED" && c.Status != "DECLINED" && c.Status != "DENIED" {
+		return tender.ErrConflict
+	}
+	correlate := func(tx tender.EventRecords, raw json.RawMessage) (tender.Payment, tender.OperationRecord, error) {
+		var stored receipt
+		if json.Unmarshal(raw, &stored) != nil || stored != event {
+			return tender.Payment{}, tender.OperationRecord{}, tender.ErrConflict
+		}
+		p, err := tx.Payment(h.api.cfg.Scope, o.Units[0].Custom)
+		if err != nil {
+			return p, tender.OperationRecord{}, err
+		}
+		if !o.matches(p) || p.Provider != "paypal" || p.MerchantAccount != event.Merchant || p.Market != market || p.ProviderReference != event.OrderID ||
+			p.ProviderEvidenceDigest != ([32]byte{}) && p.ProviderEvidenceDigest != buyerDigest(p, o.buyerID()) {
+			return p, tender.OperationRecord{}, tender.ErrConflict
+		}
+		op, err := tx.OperationByReference(p.Scope, p.ID, c.ID)
+		if errors.Is(err, tender.ErrNotFound) {
+			op, err = tx.ActiveOperation(p.Scope, p.ID)
+		}
+		if err != nil {
+			return p, op, err
+		}
+		if op.ProviderEvidenceDigest != ([32]byte{}) && op.ProviderEvidenceDigest != buyerDigest(p, o.buyerID()) ||
+			op.Kind != tender.OpConfirm || op.AttemptID != p.AttemptID || op.PaymentID != p.ID || op.Amount != p.Amount ||
+			op.ProviderReference != "" && op.ProviderReference != c.ID {
+			return p, op, tender.ErrConflict
+		}
+		return p, op, nil
+	}
+	if event.Kind == "PAYMENT.CAPTURE.DENIED" {
+		// Read the scoped payment before selecting the atomic review path. The
+		// projector repeats all checks inside the receipt transaction.
+		p, err := h.engine.Get(ctx, o.Units[0].Custom)
+		if err != nil {
+			return err
+		}
+		if p.Funds.Captured > 0 {
+			return h.engine.ProcessVerifiedAdverseEvent(ctx, id, func(tx tender.EventRecords, raw json.RawMessage) (tender.AdverseNotice, error) {
+				p, _, err := correlate(tx, raw)
+				if err != nil {
+					return tender.AdverseNotice{}, err
+				}
+				if p.Funds.Captured == 0 {
+					return tender.AdverseNotice{}, tender.ErrConflict
+				}
+				return tender.AdverseNotice{Scope: p.Scope, Provider: "paypal", MerchantAccount: event.Merchant, PaymentID: p.ID,
+					ProviderEventID: id, Kind: event.Kind, ProviderReference: c.ID, OriginalReference: event.OrderID,
+					ModificationReference: c.ID, Amount: p.Amount, ObservedAt: h.api.cfg.Now()}, nil
+			})
+		}
+	}
+	return h.engine.ProcessVerifiedEventWithRecords(ctx, id, func(tx tender.EventRecords, raw json.RawMessage) (tender.VerifiedEvent, error) {
+		p, op, err := correlate(tx, raw)
+		if err != nil {
+			return tender.VerifiedEvent{}, err
+		}
+		if p.Funds.Captured != 0 {
+			return tender.VerifiedEvent{}, tender.ErrConflict
+		}
+		if op.Status == tender.OperationReserved && (op.AwaitingEvidence || h.api.cfg.Now().Before(op.DispatchUntil)) {
+			return tender.VerifiedEvent{}, tender.ErrConflict
+		}
+		r := tender.ProviderRequest{Payment: p, Operation: op.Operation}
+		obs := observation(r)
+		obs.OperationReference = c.ID
+		if event.Kind == "PAYMENT.CAPTURE.PENDING" {
+			obs.Status = tender.OperationPending
+			obs.Snapshot = tender.Snapshot{Status: tender.PaymentPending, ProviderStatus: "PENDING", VerifiedMethod: tender.MethodPayPal, ProviderEvidenceDigest: buyerDigest(p, o.buyerID())}
+		} else {
+			obs.Status = tender.OperationFailed
+			obs.Snapshot = tender.Snapshot{Status: tender.PaymentDeclined, ProviderStatus: "DENIED"}
 		}
 		return tender.VerifiedEvent{ID: id, Provider: "paypal", Observation: obs}, nil
 	})

@@ -61,6 +61,11 @@ func TestACHContract(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		for _, kind := range []tender.OperationKind{tender.OpVoid, tender.OpRefund} {
+			if _, err := adapter.Execute(ctx, tender.ProviderRequest{Payment: created.Payment, Operation: tender.Operation{Kind: kind}}); !errors.Is(err, tender.ErrUnsupported) {
+				t.Fatalf("ACH %s must remain unsupported: %v", kind, err)
+			}
+		}
 		var action adyen.ACHSession
 		if json.Unmarshal([]byte(created.Payment.Action.Data), &action) != nil || action.ID == "" || action.SessionData == "" || action.Reference == "" || created.Payment.Funds != (tender.Funds{}) {
 			t.Fatal("missing or unsafe session", created)
@@ -259,8 +264,16 @@ func TestACHContract(t *testing.T) {
 			post("/sim/mock/return/"+action.ID, "", 202)
 			returnID = next()
 		}
+		if returnFirst {
+			if err = apply(line); !errors.Is(err, tender.ErrConflict) {
+				t.Fatalf("settlement before return worker committed a review: %v", err)
+			}
+			if err = handler.Process(ctx, returnID); err != nil {
+				t.Fatal("process early return before settlement", err)
+			}
+		}
 		if err = apply(line); err != nil {
-			t.Fatal("apply settlement", err)
+			t.Fatal("apply settlement after return worker", err)
 		}
 		if err = apply(line); err != nil {
 			t.Fatal("replay settlement", err)
@@ -282,6 +295,20 @@ func TestACHContract(t *testing.T) {
 			}
 			post("/sim/mock/return/"+action.ID, "", 202)
 			returnID = next()
+		}
+		pre, err := client.Get(srv.URL + "/sim/mock/report/" + action.ID + "/Chargeback")
+		if err != nil {
+			t.Fatal(err)
+		}
+		preReturn, err := ach.ReadSettlement(pre.Body)
+		pre.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !returnFirst {
+			if err := apply(preReturn); !errors.Is(err, tender.ErrConflict) {
+				t.Fatalf("return report before worker committed a review: %v", err)
+			}
 		}
 		for range 2 {
 			if err = handler.Process(ctx, returnID); err != nil {
@@ -308,6 +335,12 @@ func TestACHContract(t *testing.T) {
 		p, err := engine.Get(ctx, "debit")
 		if err != nil || p.Status != tender.PaymentReturned || p.Funds != (tender.Funds{Settled: 1234, Returned: 1234}) {
 			t.Fatal("return erased gross or fabricated card funds", p, err)
+		}
+		reviews, err := db.(interface {
+			AdverseReviews(context.Context, tender.Scope) ([]tender.AdverseNotice, error)
+		}).AdverseReviews(ctx, dbScope)
+		if err != nil || len(reviews) != 1 || reviews[0].Kind != "returned" || reviews[0].PaymentID != p.ID || reviews[0].OriginalReference != p.ProviderReference || reviews[0].Amount != p.Amount || reviews[0].Decision != nil {
+			t.Fatalf("verified ACH return must leave one review notice: %+v, %v", reviews, err)
 		}
 		if o, err := db.Outbox(ctx, dbScope); err != nil || len(o) != wantOut {
 			t.Fatal("duplicate collection", o, err)

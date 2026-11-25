@@ -23,8 +23,22 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  harness:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version: '1.26.x'
+      - name: Verify no-secret gates fail visibly
+        run: go test -count=1 -tags=sandbox ./test/sandbox/... -run '^TestSandboxHarnessOffline$' -v
   qualification:
     if: github.ref == 'refs/heads/main'
+    needs: harness
     environment: sandbox
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -115,6 +129,7 @@ jobs:
         shell: bash
         env:
           TENDER_KLARNA_API_KEY: ${{ secrets.TENDER_KLARNA_API_KEY }}
+          TENDER_KLARNA_MERCHANT_ACCOUNT: ${{ secrets.TENDER_KLARNA_MERCHANT_ACCOUNT }}
           TENDER_KLARNA_HOST_EVIDENCE_B64: ${{ secrets.TENDER_KLARNA_HOST_EVIDENCE_B64 }}
         run: |
           set -euo pipefail

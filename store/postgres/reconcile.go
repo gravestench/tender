@@ -2,12 +2,79 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
+	"strings"
 
 	"github.com/gravestench/tender"
 )
 
 var _ tender.ReconciliationTx = (*transaction)(nil)
+var _ tender.ReturnEvidenceClaimTx = (*transaction)(nil)
+
+func (t *transaction) ClaimReturnEvidenceSet(scope tender.Scope, provider, account, reportID string, claims []tender.ReturnEvidenceClaim) (bool, error) {
+	if scope.Validate() != nil || provider == "" || account == "" || reportID == "" || len(claims) == 0 {
+		return false, tender.ErrValidation
+	}
+	// A transaction-level lock makes the check and insert an atomic set even
+	// when two different report IDs race to claim one signed receipt.
+	if _, err := t.tx.ExecContext(t.ctx, `LOCK TABLE tender_reconciliation_return_claims IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+		return false, dbError(err)
+	}
+	seen := make(map[string]bool, len(claims))
+	lines := make(map[string]bool, len(claims))
+	for _, claim := range claims {
+		if strings.TrimSpace(claim.ProviderEventID) == "" || len(claim.ProviderEventID) > 200 || strings.TrimSpace(claim.LineID) == "" || len(claim.LineID) > 200 || seen[claim.ProviderEventID] || lines[claim.LineID] {
+			return false, tender.ErrValidation
+		}
+		seen[claim.ProviderEventID] = true
+		lines[claim.LineID] = true
+		var processed bool
+		err := t.tx.QueryRowContext(t.ctx, `SELECT EXISTS (
+			SELECT 1 FROM tender_adverse_reviews a JOIN tender_provider_events e
+			USING (merchant_id, environment, provider, merchant_account, event_id)
+			WHERE a.merchant_id=$1 AND a.environment=$2 AND a.provider=$3 AND a.merchant_account=$4
+			AND a.event_id=$5 AND e.processed_at IS NOT NULL)`, scope.MerchantID, scope.Environment, provider, account, claim.ProviderEventID).Scan(&processed)
+		if err != nil {
+			return false, dbError(err)
+		}
+		if !processed {
+			return false, tender.ErrConflict
+		}
+		var priorReport, priorLine string
+		err = t.tx.QueryRowContext(t.ctx, `SELECT report_id,line_id FROM tender_reconciliation_return_claims
+			WHERE merchant_id=$1 AND environment=$2 AND provider=$3 AND merchant_account=$4 AND event_id=$5`,
+			scope.MerchantID, scope.Environment, provider, account, claim.ProviderEventID).Scan(&priorReport, &priorLine)
+		if err == nil && (priorReport != reportID || priorLine != claim.LineID) {
+			return false, nil
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return false, dbError(err)
+		}
+		var priorEvent string
+		err = t.tx.QueryRowContext(t.ctx, `SELECT event_id FROM tender_reconciliation_return_claims
+			WHERE merchant_id=$1 AND environment=$2 AND provider=$3 AND merchant_account=$4 AND report_id=$5 AND line_id=$6`,
+			scope.MerchantID, scope.Environment, provider, account, reportID, claim.LineID).Scan(&priorEvent)
+		if err == nil && priorEvent != claim.ProviderEventID {
+			return false, nil
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return false, dbError(err)
+		}
+	}
+	for _, claim := range claims {
+		_, err := t.tx.ExecContext(t.ctx, `INSERT INTO tender_reconciliation_return_claims
+			(merchant_id,environment,provider,merchant_account,event_id,report_id,line_id)
+			VALUES ($1,$2,$3,$4,$5,$6,$7)
+			ON CONFLICT (merchant_id,environment,provider,merchant_account,event_id) DO NOTHING`,
+			scope.MerchantID, scope.Environment, provider, account, claim.ProviderEventID, reportID, claim.LineID)
+		if err != nil {
+			return false, dbError(err)
+		}
+	}
+	return true, nil
+}
 
 func (t *transaction) ReconciliationRun(scope tender.Scope, provider, account, id string) (tender.ReconciliationRun, error) {
 	var digest string
@@ -24,8 +91,49 @@ func (t *transaction) InsertReconciliationRun(scope tender.Scope, provider, acco
 }
 
 func (t *transaction) InsertSettlementLine(scope tender.Scope, provider, account, reportID string, l tender.SettlementLine) error {
-	_, err := t.tx.ExecContext(t.ctx, `INSERT INTO tender_settlements (merchant_id,environment,provider,merchant_account,report_id,line_id,provider_reference,entry_kind,currency,gross_minor,fee_minor,net_minor,payout_reference,observed_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, scope.MerchantID, scope.Environment, provider, account, reportID, l.ID, l.ProviderReference, l.Kind, l.Currency, l.GrossMinor, l.FeeMinor, l.NetMinor, l.PayoutReference, l.ObservedAt)
+	_, err := t.tx.ExecContext(t.ctx, `INSERT INTO tender_settlements (merchant_id,environment,provider,merchant_account,report_id,line_id,provider_reference,entry_kind,currency,gross_minor,fee_minor,net_minor,payout_reference,observed_at,batch_id,source_part_id,source_section_id,original_reference,modification_reference) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`, scope.MerchantID, scope.Environment, provider, account, reportID, l.ID, l.ProviderReference, l.Kind, l.Currency, l.GrossMinor, l.FeeMinor, l.NetMinor, l.PayoutReference, l.ObservedAt, l.BatchID, l.SourcePartID, l.SourceSectionID, l.OriginalReference, l.ModificationReference)
 	return dbError(err)
+}
+
+func (t *transaction) InsertReconciliationPayoutInput(scope tender.Scope, provider, account, reportID string, report tender.SettlementReport) error {
+	input := struct {
+		Payouts     []tender.PayoutLine
+		Adjustments []tender.PayoutAdjustment
+		Parts       []tender.ReportPart
+		Sections    []tender.ReportSection
+	}{report.Payouts, report.Adjustments, report.Parts, report.Sections}
+	raw, err := json.Marshal(input)
+	if err != nil {
+		return err
+	}
+	_, err = t.tx.ExecContext(t.ctx, `INSERT INTO tender_reconciliation_inputs(merchant_id,environment,provider,merchant_account,run_id,record) VALUES ($1,$2,$3,$4,$5,$6)`, scope.MerchantID, scope.Environment, provider, account, reportID, string(raw))
+	return dbError(err)
+}
+
+func (t *transaction) AppendPayoutReconciliationResult(scope tender.Scope, provider, account, runID string, r tender.PayoutReconciliationResult) error {
+	raw, err := json.Marshal(r)
+	if err != nil {
+		return err
+	}
+	_, err = t.tx.ExecContext(t.ctx, `INSERT INTO tender_reconciliation_payout_history(merchant_id,environment,provider,merchant_account,run_id,payout_id,outcome,evidence) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, scope.MerchantID, scope.Environment, provider, account, runID, r.PayoutID, r.Outcome, string(raw))
+	return dbError(err)
+}
+
+func (t *transaction) PayoutReconciliationResults(scope tender.Scope, provider, account, runID string) ([]tender.PayoutReconciliationResult, error) {
+	rows, err := t.tx.QueryContext(t.ctx, `SELECT evidence FROM tender_reconciliation_payout_history WHERE merchant_id=$1 AND environment=$2 AND provider=$3 AND merchant_account=$4 AND run_id=$5 ORDER BY seq`, scope.MerchantID, scope.Environment, provider, account, runID)
+	if err != nil {
+		return nil, dbError(err)
+	}
+	defer rows.Close()
+	var results []tender.PayoutReconciliationResult
+	for rows.Next() {
+		r, err := read[tender.PayoutReconciliationResult](rows)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, r)
+	}
+	return results, dbError(rows.Err())
 }
 
 func (t *transaction) ResolveSettlementReference(scope tender.Scope, provider, account, ref string) (tender.Payment, tender.OperationRecord, error) {
@@ -145,6 +253,34 @@ func (s *Store) OpenReconciliationDiscrepancies(ctx context.Context, scope tende
 	var items []tender.ReconciliationDiscrepancy
 	for rows.Next() {
 		var item tender.ReconciliationDiscrepancy
+		var raw []byte
+		if err := rows.Scan(&item.ReportID, &raw); err != nil {
+			return nil, dbError(err)
+		}
+		if err := json.Unmarshal(raw, &item.Result); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	return items, dbError(rows.Err())
+}
+
+// OpenPayoutDiscrepancies returns the latest unresolved payout result per
+// report and payout ID for one merchant and processor route.
+func (s *Store) OpenPayoutDiscrepancies(ctx context.Context, scope tender.Scope, provider, account string) ([]tender.PayoutReconciliationDiscrepancy, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT run_id,evidence FROM (
+		SELECT DISTINCT ON (run_id,payout_id) run_id,payout_id,outcome,evidence,seq
+		FROM tender_reconciliation_payout_history
+		WHERE merchant_id=$1 AND environment=$2 AND provider=$3 AND merchant_account=$4
+		ORDER BY run_id,payout_id,seq DESC
+	) latest WHERE outcome <> 'matched' ORDER BY seq`, scope.MerchantID, scope.Environment, provider, account)
+	if err != nil {
+		return nil, dbError(err)
+	}
+	defer rows.Close()
+	var items []tender.PayoutReconciliationDiscrepancy
+	for rows.Next() {
+		var item tender.PayoutReconciliationDiscrepancy
 		var raw []byte
 		if err := rows.Scan(&item.ReportID, &raw); err != nil {
 			return nil, dbError(err)

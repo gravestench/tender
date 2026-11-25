@@ -9,7 +9,7 @@
   <dl>
     <dt>Order</dt><dd>{{.OrderID}}</dd>
     <dt>Total</dt><dd>{{.Price}} {{.Currency}}</dd>
-    <dt>Payment status</dt><dd>{{.Status}}</dd>
+    <dt>Payment status</dt><dd id="payment-status" role="status" aria-label="Payment status" tabindex="-1" {{if ne .Status "unpaid"}}autofocus{{end}}>{{.Status}}</dd>
     <dt>Fulfillment recorded</dt><dd>{{if .Fulfilled}}Yes{{else}}No{{end}}</dd>
   </dl>
   {{if .Action}}

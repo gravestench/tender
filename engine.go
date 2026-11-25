@@ -12,6 +12,8 @@ import (
 	"math/rand/v2"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -26,14 +28,19 @@ type EngineConfig struct {
 	Market                        Market
 	Now                           func() time.Time
 	NewID                         func() string
+	Observer                      Observer
 	// Timeout bounds each provider call (including all recovery query attempts).
 	// Zero uses 15 seconds. An earlier caller deadline always takes precedence.
 	Timeout time.Duration
 }
 
 type Engine struct {
-	config EngineConfig
-	caps   Capabilities
+	config          EngineConfig
+	caps            Capabilities
+	observerMu      sync.Mutex
+	observerQueue   chan OperationalEvent
+	observerRunning bool
+	observerDropped atomic.Uint64
 }
 
 func NewEngine(c EngineConfig) (*Engine, error) {
@@ -177,7 +184,7 @@ func (s state) result() (Result, error) {
 	return r, nil
 }
 
-func (e *Engine) execute(ctx context.Context, kind OperationKind, r Request, predecessor string) (Result, error) {
+func (e *Engine) execute(ctx context.Context, kind OperationKind, r Request, predecessor string) (result Result, err error) {
 	s, dispatch, err := e.reserve(ctx, kind, r, predecessor)
 	if err != nil {
 		return Result{}, err
@@ -185,6 +192,10 @@ func (e *Engine) execute(ctx context.Context, kind OperationKind, r Request, pre
 	if !dispatch {
 		return s.result()
 	}
+	started := time.Now()
+	defer func() {
+		e.observe(ctx, OperationalEvent{Kind: OperationalProviderCall, PaymentID: s.payment.ID, OperationID: s.op.ID, Duration: time.Since(started), ErrorKind: observedErrorKind(err)})
+	}()
 	timeout := e.config.Timeout
 	if !s.op.DispatchUntil.IsZero() {
 		timeout = min(timeout, s.op.DispatchUntil.Sub(e.config.Now().UTC()))
@@ -551,11 +562,15 @@ func (e *Engine) ProcessVerifiedEventWithRecords(ctx context.Context, id string,
 		return ErrValidation
 	}
 	key := VerifiedEventKey{Scope: e.config.Scope, Provider: e.config.ProviderName, MerchantAccount: e.config.MerchantAccount, ID: id}
-	return e.config.Store.Transact(ctx, func(tx Tx) error {
+	started := time.Now()
+	var applied Observation
+	var receivedAt time.Time
+	err := e.config.Store.Transact(ctx, func(tx Tx) error {
 		inbox, ok := tx.(VerifiedEventTx)
 		if !ok {
 			return ErrUnsupported
 		}
+		receivedAt = verifiedReceiptTime(tx, key)
 		return inbox.ProcessVerifiedEvent(key, e.config.Now().UTC(), func(evidence json.RawMessage) error {
 			event, err := normalize(tx, evidence)
 			if err != nil {
@@ -564,10 +579,17 @@ func (e *Engine) ProcessVerifiedEventWithRecords(ctx context.Context, id string,
 			if event.ID != id || event.Provider != key.Provider {
 				return fmt.Errorf("%w: verified event identity does not match inbox", ErrConflict)
 			}
-			_, err = e.applyTx(tx, state{}, event.Observation, "webhook")
-			return err
+			if _, err = e.applyTx(tx, state{}, event.Observation, "webhook"); err != nil {
+				return err
+			}
+			applied = event.Observation
+			return nil
 		})
 	})
+	if err == nil && applied.PaymentID != "" {
+		e.observeReceipt(ctx, started, receivedAt, applied.PaymentID, applied.OperationID)
+	}
+	return err
 }
 
 func (e *Engine) apply(ctx context.Context, original state, o Observation, source string) (state, error) {

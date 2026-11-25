@@ -34,6 +34,9 @@ func TestPayPalSandboxTransaction(t *testing.T) {
 			t.Fatalf("BLOCKED: missing %s", key)
 		}
 	}
+	if err := regularEvidenceFile(os.Getenv("TENDER_PAYPAL_SANDBOX_PROOF_FILE")); err != nil {
+		t.Fatal(err)
+	}
 	f, err := os.Open(os.Getenv("TENDER_PAYPAL_SANDBOX_PROOF_FILE"))
 	if err != nil {
 		t.Fatal("BLOCKED: merchant evidence file unavailable")
@@ -50,6 +53,9 @@ func TestPayPalSandboxTransaction(t *testing.T) {
 	dec.DisallowUnknownFields()
 	if dec.Decode(&proof) != nil || proof.ExpectedBuyerID == "" || proof.ExpectedCaptureID == "" || len(proof.Event) == 0 {
 		t.Fatal("BLOCKED: provide original payment, confirmation, buyer/capture IDs and real webhook delivery")
+	}
+	if !validPayPalDelivery(proof.Headers, proof.Event) {
+		t.Fatal("BLOCKED: webhook export lacks the original provider delivery headers or capture resource")
 	}
 	p := proof.Payment
 	op := proof.Confirm
@@ -109,6 +115,39 @@ func TestPayPalSandboxTransaction(t *testing.T) {
 	if err != nil || boxErr != nil || len(entries) != 1 || pay.Funds != got.Snapshot.Funds {
 		t.Fatal("provider query and verified webhook disagree")
 	}
+	t.Fatal("BLOCKED: read-only order and webhook postback do not prove host-issued adapter capture, authenticated settlement/payout report, or an approved on-page buyer path")
+}
+
+// This is a shape check only. The handler's official PayPal verification
+// postback below remains mandatory before the event can be processed.
+func validPayPalDelivery(headers http.Header, raw json.RawMessage) bool {
+	var transmissionTime string
+	for _, key := range []string{"PAYPAL-TRANSMISSION-ID", "PAYPAL-TRANSMISSION-TIME", "PAYPAL-TRANSMISSION-SIG", "PAYPAL-AUTH-ALGO", "PAYPAL-CERT-URL"} {
+		var values []string
+		for name, entries := range headers {
+			if strings.EqualFold(name, key) {
+				values = append(values, entries...)
+			}
+		}
+		if len(values) != 1 || strings.TrimSpace(values[0]) == "" {
+			return false
+		}
+		if key == "PAYPAL-TRANSMISSION-TIME" {
+			transmissionTime = values[0]
+		}
+	}
+	observed, err := time.Parse(time.RFC3339Nano, transmissionTime)
+	if err != nil || !freshProviderTime(observed, time.Now()) {
+		return false
+	}
+	var event struct {
+		ID        string `json:"id"`
+		EventType string `json:"event_type"`
+		Resource  struct {
+			ID string `json:"id"`
+		} `json:"resource"`
+	}
+	return json.Unmarshal(raw, &event) == nil && event.ID != "" && event.EventType == "PAYMENT.CAPTURE.COMPLETED" && event.Resource.ID != ""
 }
 
 // Query deliberately omits buyer PII from normalized evidence. Read the
@@ -153,4 +192,22 @@ func sandboxWalletBuyer(ctx context.Context, c paypal.Config, order, buyer strin
 		} `json:"payment_source"`
 	}
 	return res.StatusCode == 200 && json.NewDecoder(io.LimitReader(res.Body, 512<<10)).Decode(&o) == nil && o.ID == order && o.Sources.PayPal.Account == buyer
+}
+
+func TestPayPalSandboxRejectsSyntheticCallback(t *testing.T) {
+	if validPayPalDelivery(http.Header{"PAYPAL-TRANSMISSION-ID": {"synthetic"}}, json.RawMessage(`{"event_type":"PAYMENT.CAPTURE.COMPLETED"}`)) {
+		t.Fatal("accepted an unsigned synthetic callback as provider delivery")
+	}
+}
+
+func TestPayPalSandboxRejectsStaleSignedDelivery(t *testing.T) {
+	h := http.Header{}
+	for _, key := range []string{"PAYPAL-TRANSMISSION-ID", "PAYPAL-TRANSMISSION-SIG", "PAYPAL-AUTH-ALGO", "PAYPAL-CERT-URL"} {
+		h.Set(key, "value")
+	}
+	h.Set("PAYPAL-TRANSMISSION-TIME", "2020-01-02T03:04:05Z")
+	event := json.RawMessage(`{"id":"evt","event_type":"PAYMENT.CAPTURE.COMPLETED","resource":{"id":"capture"}}`)
+	if validPayPalDelivery(h, event) {
+		t.Fatal("accepted stale provider-signed transmission time")
+	}
 }

@@ -30,8 +30,9 @@ var _ tender.Store = (*Store)(nil)
 func New(db *sql.DB) *Store { return &Store{db: db} }
 
 type transaction struct {
-	ctx context.Context
-	tx  *sql.Tx
+	ctx        context.Context
+	tx         *sql.Tx
+	processing *tender.VerifiedEventKey
 }
 
 // Transact calls fn once. PostgreSQL's serializable isolation covers absent
@@ -175,7 +176,18 @@ func (t *transaction) InsertVerifiedEvent(key tender.VerifiedEventKey, evidence 
 	return dbError(err)
 }
 
+func (t *transaction) VerifiedEventReceivedAt(key tender.VerifiedEventKey) (time.Time, error) {
+	var received time.Time
+	err := t.tx.QueryRowContext(t.ctx, `SELECT received_at FROM tender_provider_events
+        WHERE merchant_id=$1 AND environment=$2 AND provider=$3 AND merchant_account=$4 AND event_id=$5`,
+		key.Scope.MerchantID, key.Scope.Environment, key.Provider, key.MerchantAccount, key.ID).Scan(&received)
+	return received, dbError(err)
+}
+
 func (t *transaction) ProcessVerifiedEvent(key tender.VerifiedEventKey, at time.Time, apply func(json.RawMessage) error) error {
+	if t.processing != nil {
+		return tender.ErrConflict
+	}
 	var evidence []byte
 	var processed bool
 	err := t.tx.QueryRowContext(t.ctx, `SELECT evidence, processed_at IS NOT NULL FROM tender_provider_events
@@ -186,6 +198,8 @@ func (t *transaction) ProcessVerifiedEvent(key tender.VerifiedEventKey, at time.
 	if processed {
 		return nil
 	}
+	t.processing = &key
+	defer func() { t.processing = nil }()
 	if err = apply(evidence); err != nil {
 		return err
 	}

@@ -1,11 +1,59 @@
 package webhook
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/gravestench/tender"
+	"github.com/gravestench/tender/providers/adyen"
 )
+
+func (h *Adyen) processACHReturn(ctx context.Context, id string) error {
+	return h.cfg.Engine.ProcessVerifiedEventWithAdverse(ctx, id, func(tx tender.EventRecords, raw json.RawMessage) (tender.VerifiedEvent, tender.AdverseNotice, error) {
+		var e evidence
+		if json.Unmarshal(raw, &e) != nil || e.Code != "CHARGEBACK" || e.Account != h.cfg.MerchantAccount {
+			return tender.VerifiedEvent{}, tender.AdverseNotice{}, tender.ErrConflict
+		}
+		if _, ok := e.canonical(); !ok || e.id() != id {
+			return tender.VerifiedEvent{}, tender.AdverseNotice{}, tender.ErrConflict
+		}
+		p, original, err := adyen.ResolveReference(tx, h.cfg.Scope, e.Ref)
+		if err != nil {
+			return tender.VerifiedEvent{}, tender.AdverseNotice{}, err
+		}
+		if p.Market.Method != tender.MethodACH {
+			return tender.VerifiedEvent{}, tender.AdverseNotice{}, tender.ErrUnsupported
+		}
+		observation, err := achObservation(tx, p, original, e)
+		if err != nil {
+			return tender.VerifiedEvent{}, tender.AdverseNotice{}, err
+		}
+		// A signed return PSP must be a new modification identity on this
+		// merchant route, not an operation already bound to another payment.
+		lookup, ok := tx.(merchantOperationReferenceReader)
+		if !ok {
+			return tender.VerifiedEvent{}, tender.AdverseNotice{}, tender.ErrUnsupported
+		}
+		if _, err := lookup.OperationByMerchantReference(h.cfg.Scope, "adyen", e.Account, e.PSP); err == nil {
+			return tender.VerifiedEvent{}, tender.AdverseNotice{}, tender.ErrConflict
+		} else if !errors.Is(err, tender.ErrNotFound) {
+			return tender.VerifiedEvent{}, tender.AdverseNotice{}, err
+		}
+		// An ACH return has no separate host operation. The signed modification
+		// PSP and original payment PSP identify the review work instead.
+		n := tender.AdverseNotice{
+			Scope: h.cfg.Scope, Provider: "adyen", MerchantAccount: e.Account,
+			PaymentID: p.ID, ProviderEventID: id, Kind: "returned",
+			ProviderReference: e.PSP, OriginalReference: e.Original,
+			ModificationReference: e.PSP,
+			Amount:                tender.Money{Minor: *e.Amount.Value, Currency: e.Amount.Currency},
+			ObservedAt:            time.Now().UTC(),
+		}
+		return tender.VerifiedEvent{ID: id, Provider: "adyen", Observation: observation}, n, nil
+	})
+}
 
 // The signed reference identifies the ACH-only session creation. The session
 // result exchange binds its own operation to that same merchant reference.

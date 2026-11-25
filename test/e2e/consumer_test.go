@@ -221,6 +221,35 @@ func TestOfflineCheckoutBrowser(t *testing.T) {
 	}
 }
 
+func TestCheckoutKeyboardAccess(t *testing.T) {
+	d := launch(t)
+	cmd := exec.CommandContext(t.Context(), "node", "accessibility-browser.cjs")
+	cmd.Env = append(os.Environ(), "TENDER_ORIGIN="+d.Origin, "TENDER_GUEST="+d.Guest, "TENDER_ACCOUNT="+d.Account)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("keyboard checkout: %s: %v", output, err)
+	}
+}
+
+func TestCheckoutWalletErrorKeyboard(t *testing.T) {
+	dsn, schema, _ := demoSchema(t)
+	d := launch(t, "TENDER_CONSUMER_PROVIDER=paypal", "TENDER_PAYPAL_MOCK_PRESENTATION=component", "TENDER_CONSUMER_DATABASE_URL="+dsn, "TENDER_CONSUMER_SCHEMA="+schema)
+	cmd := exec.CommandContext(t.Context(), "node", "accessibility-browser.cjs")
+	cmd.Env = append(os.Environ(), "TENDER_ORIGIN="+d.Origin, "TENDER_GUEST="+d.Guest, "TENDER_VIEW=wallet")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("wallet error focus: %s: %v", output, err)
+	}
+}
+
+func TestCheckoutWalletTransitionsKeyboard(t *testing.T) {
+	dsn, schema, _ := demoSchema(t)
+	d := launch(t, "TENDER_CONSUMER_PROVIDER=paypal", "TENDER_PAYPAL_MOCK_PRESENTATION=component", "TENDER_CONSUMER_DATABASE_URL="+dsn, "TENDER_CONSUMER_SCHEMA="+schema)
+	cmd := exec.CommandContext(t.Context(), "node", "accessibility-browser.cjs")
+	cmd.Env = append(os.Environ(), "TENDER_ORIGIN="+d.Origin, "TENDER_GUEST="+d.Guest, "TENDER_VIEW=wallet_lifecycle")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("wallet keyboard lifecycle: %s: %v", output, err)
+	}
+}
+
 func TestConsumerSyntheticAction(t *testing.T) {
 	d := launch(t)
 	c := client(t, d.Origin)

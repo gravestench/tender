@@ -6,14 +6,17 @@ Tender stores the host order claim, payment, attempt and operation reservation b
 
 Use PostgreSQL 17 with a UTF-8 database. Choose a schema where only trusted roles can create objects. Set that schema as the search path for the migration session and **every** connection in the application pool. The example uses an existing schema named `tender`.
 
-Apply outstanding `migrations/*.up.sql` files in lexicographic order before starting workers. Each script contains `BEGIN` and `COMMIT`. Record each successfully applied version in the host migration ledger. A fresh installation needs `001_initial`, `002_reference_integrity`, `003_capture_failures` and `004_reconciliation_digest`. Existing installations apply each version after their last recorded migration. The scripts are also available through `postgres.Migrations` in Go.
+Apply outstanding `migrations/*.up.sql` files in lexicographic order before starting workers. Each script contains `BEGIN` and `COMMIT`. Record each successfully applied version in the host migration ledger. A fresh installation applies `001` through `007`. If your `v0.1.0-alpha.1` schema has migrations through `004`, apply `005_payout_batches`, `006_adverse_review`, and `007_return_evidence_claims` in that order. For other installations, start after the last recorded version. The scripts are also available through `postgres.Migrations` in Go.
 
 ```sh
 PGOPTIONS='-c search_path=tender' psql "$TENDER_MIGRATION_DSN" -X -v ON_ERROR_STOP=1 \
   -f store/postgres/migrations/001_initial.up.sql \
   -f store/postgres/migrations/002_reference_integrity.up.sql \
   -f store/postgres/migrations/003_capture_failures.up.sql \
-  -f store/postgres/migrations/004_reconciliation_digest.up.sql
+  -f store/postgres/migrations/004_reconciliation_digest.up.sql \
+  -f store/postgres/migrations/005_payout_batches.up.sql \
+  -f store/postgres/migrations/006_adverse_review.up.sql \
+  -f store/postgres/migrations/007_return_evidence_claims.up.sql
 ```
 
 Grant the runtime role schema usage, table privileges for its operations, and sequence usage for inserts. Reserve DDL for the migration role. The host owns the SQL driver, pool, credentials, network settings and shutdown. With pgx v5, a PostgreSQL URL can include `search_path=tender` and `sslmode=verify-full` for a remote database. Configure a trusted CA for the server certificate. The `store/postgres` package uses the Go standard library and accepts a pool opened with any PostgreSQL `database/sql` driver that supports serializable transactions and SQLSTATE errors via `SQLState() string`.
@@ -75,23 +78,9 @@ UPDATE tender_capture_failures SET reviewed_at = CURRENT_TIMESTAMP
 WHERE merchant_id = $1 AND environment = $2 AND seq = $3;
 ```
 
-- **Settlement and reconciliation.** Insert normalized signed minor units, currency, payout and processor references into `tender_settlements`. The primary key is merchant, environment, provider, merchant account, report and line ID. Within a transaction, insert with `ON CONFLICT DO NOTHING` and compare an existing line with the normalized facts on replay. Preserve unmatched lines for later resolution. Insert a row in `tender_reconciliation_runs` for each reconciliation run. In a transaction, append matched lines, discrepancies and resolution evidence to `tender_reconciliation_history` and set `finished_at` on the run when complete. Preserve the original evidence and add a new history row for corrections. The provider adapter supplies the report mapping, and the host schedules ingestion.
+- **Settlement and reconciliation.** Call `Engine.Reconcile` only with a report downloaded and authenticated by trusted host code. Its normalized transaction rows, source parts, sections, payout rows and adjustments are inserted with the run and input digest in one serializable transaction. The route key is merchant, environment, provider and merchant account. A repeated identical report is compared with current ledger facts; changed content under the same report ID appends a conflict audit entry and returns `ErrConflict`. Earlier unmatched results remain in history when later verified facts resolve them. `005_payout_batches` adds source and dual-reference columns to `tender_settlements`, `tender_reconciliation_inputs` for the redacted payout/part/section projection, and `tender_reconciliation_payout_history` for immutable batch results. This does not store a raw provider report or shopper data.
 
-For example, use these parameterized statements inside the importer transaction. The lookup locks the immutable report line while the worker decides whether a duplicate agrees. A discrepancy can retain both versions as sanitized history evidence.
-
-```sql
-INSERT INTO tender_settlements
-    (merchant_id, environment, provider, merchant_account, report_id, line_id,
-     provider_reference, entry_kind, currency, gross_minor, fee_minor, net_minor,
-     payout_reference, observed_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-ON CONFLICT (merchant_id, environment, provider, merchant_account, report_id, line_id) DO NOTHING;
-
-SELECT provider_reference, entry_kind, currency, gross_minor, fee_minor, net_minor,
-       payout_reference, observed_at FROM tender_settlements
-WHERE (merchant_id, environment, provider, merchant_account, report_id, line_id)
-    = ($1,$2,$3,$4,$5,$6) FOR SHARE;
-```
+The payout amount uses a **merchant-positive** sign: money delivered to the merchant bank is positive even if the provider journal records its own payout as a debit. A payout matches only when every authenticated numbered part and section is present, attributed row counts and provider-declared totals agree, each exact successful capture/refund operation is counted once across the report, and the batch-wide sum of matched transaction net plus separately reported adjustments equals the payout. A payout reference must also identify one movement across all batches and currencies in the scoped report. Any missing, mismatched or unsupported evidence stays open. A report alone cannot confirm a return or dispute; matching requires a processed verified adverse receipt with the original payment and modification references. The sum of matched return rows for one payment in a report cannot exceed its collected principal (`max(Funds.Captured, Funds.Settled)`) or a nonzero cumulative `Funds.Returned`; a partial report may cover less. A review-only card chargeback with zero `Funds.Returned` uses the exact processed notice amount for comparison within that principal cap and does not advance funds. The host must also detect overlapping movements across distinct report identities and match processor payouts to actual bank deposits before production acceptance.
 
 When matching an opaque reference, scope both the digest lookup and the exact comparison to the provider route. The full value remains in the record. A digest collision in a unique index produces a conflict that requires investigation.
 
@@ -104,7 +93,7 @@ WHERE (merchant_id, environment, provider, merchant_account) = ($1,$2,$3,$4)
 
 The reconciliation history foreign key checks the matched payment's scope, provider and account against the run. Applying `002` validates this constraint against existing rows and rolls back the migration if a historical payment belongs to a different route. Review the report and affected history before correcting a prior mismatch.
 
-`Engine.Reconcile(ctx, SettlementReport)` accepts a host-authenticated normalized feed. The `FeedHostVerified` marker is an assertion by trusted host code, not an authentication mechanism for shopper input. Provider auto-download feeds return `ErrUnsupported` until implemented. One transaction records the report, its input digest, projected lines, run and result history; an exact replay does not duplicate results. Reusing a report ID with changed contents records `report_conflict` and returns `ErrConflict`. Reprocessing after an unmatched line becomes resolvable appends a resolution without rewriting its earlier discrepancy. Reconciliation does not modify payment funds or the fulfillment outbox. For ACH, apply the independently authenticated Adyen report through the ACH signed-report path before interpreting ledger comparison as settlement authority. Query `ReconciliationHistory` for the full audit and `OpenReconciliationDiscrepancies` for the latest unresolved state by scoped report line. The host owns download authentication, scheduling, alerting and operator review.
+`Engine.Reconcile(ctx, SettlementReport)` accepts a host-authenticated normalized feed. The `FeedHostVerified` marker is an assertion by trusted host code, not an authentication mechanism for shopper input. Provider auto-download feeds return `ErrUnsupported` until implemented. One transaction records the report, its input digest, projected lines, payout evidence, run and result histories; an exact replay does not duplicate results. Reusing a report ID with changed contents records `report_conflict` and returns `ErrConflict`. Reprocessing after an unmatched line becomes resolvable appends a resolution without rewriting its earlier discrepancy. Reconciliation does not modify payment funds or the fulfillment outbox. For ACH, apply the independently authenticated Adyen report through the ACH signed-report path before interpreting ledger comparison as settlement authority. Query `ReconciliationHistory` and `OpenReconciliationDiscrepancies` for transaction lines, and `OpenPayoutDiscrepancies` for the latest unresolved batch results. The host owns download authentication, scheduling, alerting and operator review.
 
 The underlying run/history SQL can also support host inspection. Preserve the original report identity and projected input digest on every replay.
 
@@ -124,10 +113,17 @@ WHERE (merchant_id, environment, provider, merchant_account, run_id) = ($1,$2,$3
 
 ## Rollback
 
-Before deployment, back up existing Tender data and verify restore access. A code rollback can keep a compatible schema. Before removing the initial schema, stop all Tender writers and workers, identify pending operations and outbox work, and preserve the full database for recovery. On a disposable database or after the host has explicitly approved deleting the records, run the down migrations in reverse order using the same role and search path. Downgrading `004` removes the reconciliation run input digest and weakens same-ID content conflict detection; retain a backup and do not process reports with older code. Downgrading `003` removes the capture failure review queue and its evidence lookup index. Preserve its review history first. Downgrading `002` restores full-width reference indexes and fails atomically if a stored reference exceeds the old B-tree limit. Preserve the references and the current schema in that case.
+Before deployment, back up existing Tender data and verify restore access. A code rollback can keep a compatible schema. Before removing the initial schema, stop all Tender writers and workers, identify pending operations and outbox work, and preserve the full database for recovery. On a disposable database or after the host has explicitly approved deleting the records, run the down migrations in reverse order using the same role and search path.
+
+Run `007_return_evidence_claims.down.sql` before `006_adverse_review.down.sql` because the claims table references adverse reviews and settlement rows. Downgrading `007` deletes the links that bind each verified adverse event to one settlement row. Back up those claims before downgrading and restore them before resuming return reconciliation that depends on them. Downgrading `006` removes adverse review records. Downgrading `005` removes payout source projections and result history. Retain each history before removing its migration.
+
+Downgrading `004` removes the reconciliation run input digest and weakens same-ID content conflict detection. Retain a backup and suspend report processing on older code. Downgrading `003` removes the capture failure review queue and its evidence lookup index. Preserve its review history first. Downgrading `002` restores full-width reference indexes and fails atomically if a stored reference exceeds the old B-tree limit. Preserve the references and the current schema in that case.
 
 ```sh
 PGOPTIONS='-c search_path=tender' psql "$TENDER_MIGRATION_DSN" -X -v ON_ERROR_STOP=1 \
+  -f store/postgres/migrations/007_return_evidence_claims.down.sql \
+  -f store/postgres/migrations/006_adverse_review.down.sql \
+  -f store/postgres/migrations/005_payout_batches.down.sql \
   -f store/postgres/migrations/004_reconciliation_digest.down.sql \
   -f store/postgres/migrations/003_capture_failures.down.sql \
   -f store/postgres/migrations/002_reference_integrity.down.sql \

@@ -13,8 +13,12 @@ import (
 )
 
 // ACH implements the US consumer debit candidate using Checkout v72 Sessions.
-// Strict first-use collection is qualified only against our loopback fixture.
-type ACH struct{ api *Adapter }
+// Ordinary SANDBOX and LIVE collection remain unavailable. The sandbox build
+// can open one protected qualification path without changing NewACH callers.
+type ACH struct {
+	api                  *Adapter
+	sandboxQualification bool
+}
 
 func NewACH(c Config) (*ACH, error) {
 	api, err := New(c)
@@ -27,8 +31,20 @@ func NewACH(c Config) (*ACH, error) {
 var usDebit = tender.Market{Country: "US", Currency: "USD", Method: tender.MethodACH}
 var fixtureResult = regexp.MustCompile(`^mr_[a-f0-9]{64}$`)
 
+func validSandboxResult(raw string) bool {
+	if len(raw) == 0 || len(raw) > 8192 {
+		return false
+	}
+	for _, r := range raw {
+		if r < 0x21 || r > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
 func (a *ACH) Capabilities() tender.Capabilities {
-	if a.api.cfg.Environment != tender.EnvironmentMock {
+	if a.api.cfg.Environment != tender.EnvironmentMock && !(a.sandboxQualification && a.api.cfg.Environment == tender.EnvironmentSandbox) {
 		return tender.Capabilities{}
 	}
 	return tender.Capabilities{Create: true, Confirm: true, Markets: []tender.MarketCapability{{Market: usDebit}}, ActionModes: []tender.ActionMode{tender.ActionComponent}}
@@ -39,6 +55,9 @@ func (a *ACH) CheckStore(_ tender.OperationKind, tx tender.Tx) error {
 		tender.VerifiedEventTx
 		tender.VerifiedEvidenceReader
 		tender.CaptureFailureTx
+		tender.AdverseReviewTx
+		tender.AdverseEvidenceReader
+		merchantOperationReferenceReader
 	}); !ok {
 		return tender.ErrUnsupported
 	}
@@ -65,7 +84,7 @@ func (a *ACH) CheckoutSession(p tender.Payment) (ACHSession, error) {
 func (a *ACH) session(p tender.Payment) (ACHSession, error) {
 	var s ACHSession
 	c := a.api.cfg
-	if c.Environment != tender.EnvironmentMock || p.Scope.Environment != c.Environment || p.Market != usDebit || p.Provider != "adyen" || p.MerchantAccount != c.MerchantAccount || p.Status != tender.PaymentRequiresAction || p.Action.Mode != tender.ActionComponent || p.Action.Validate(c.Now()) != nil {
+	if !a.Capabilities().Create || p.Scope.Environment != c.Environment || p.Market != usDebit || p.Provider != "adyen" || p.MerchantAccount != c.MerchantAccount || p.Status != tender.PaymentRequiresAction || p.Action.Mode != tender.ActionComponent || p.Action.Validate(c.Now()) != nil {
 		return s, tender.ErrUnsupported
 	}
 	if json.Unmarshal([]byte(p.Action.Data), &s) != nil || !reference.MatchString(s.ID) || s.SessionData == "" || s.Reference == "" {
@@ -113,9 +132,9 @@ func (a *ACH) result(ctx context.Context, r tender.ProviderRequest, o tender.Obs
 	if err != nil {
 		return o, err
 	}
-	// The mock receipt grammar admits only tokens issued by the fixture. A live
-	// receipt format and destination need verification before the gate can open.
-	if !fixtureResult.MatchString(r.Token) {
+	// Mock receipts have a fixture grammar. Protected SANDBOX receipts are
+	// opaque values from the component, bounded before a single official GET.
+	if a.api.cfg.Environment == tender.EnvironmentMock && !fixtureResult.MatchString(r.Token) || a.sandboxQualification && !validSandboxResult(r.Token) {
 		return o, tender.ErrValidation
 	}
 	u := a.api.cfg.BaseURL + "/sessions/" + session.ID + "?" + url.Values{"sessionResult": {r.Token}}.Encode()
