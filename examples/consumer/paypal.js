@@ -32,6 +32,7 @@ for (const button of controls) {
       render(status === "approved" ? await submit("confirm") : status);
     } catch {
       render("unavailable");
+      message.focus();
     } finally {
       controls.forEach(control => control.disabled = false);
     }

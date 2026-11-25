@@ -4,7 +4,7 @@
 <main data-order="{{.ID}}" data-csrf="{{.CSRF}}" data-state="{{.Status}}">
 <h1>PayPal fixture checkout</h1>
 <p>Order {{.ID}} · {{.Price}} USD</p>
-<p id="message" role="status">{{if eq .Status "unavailable"}}PayPal is unavailable for this checkout.{{else}}{{.Status}}{{end}}</p>
+<p id="message" role="status" aria-label="Payment status" tabindex="-1">{{if eq .Status "unavailable"}}PayPal is unavailable for this checkout.{{else}}{{.Status}}{{end}}</p>
 {{if ne .Status "unavailable"}}<button type="button" data-step="start" hidden>Start synthetic wallet checkout</button>
 <section aria-label="Synthetic PayPal approval" hidden>
 <button type="button" data-step="approve">Approve synthetic payment</button>
