@@ -66,10 +66,30 @@ func TestPayPalDurableLifecycle(t *testing.T) {
 			if len(provider.Units) != 1 || len(provider.Units[0].Payments.Captures) != 1 || provider.Units[0].Payments.Captures[0].Status != "PENDING" {
 				t.Fatalf("provider pending capture: %+v", provider)
 			}
+			if got := walletPendingEvidenceStatus(t, guest, d.Origin, orderID, ""); got != 404 {
+				t.Fatalf("unauthenticated pending evidence: %d", got)
+			}
+			if got := walletPendingEvidenceStatus(t, guest, d.Origin, status(t, other, otherBase).OrderID, walletOperatorFixture); got != 409 {
+				t.Fatalf("other order pending evidence: %d", got)
+			}
+			deadline := time.Now().Add(12 * time.Second)
+			for {
+				evidence := walletPendingEvidence(t, guest, d.Origin, orderID)
+				if evidence.Processed {
+					if got := status(t, guest, base); got.Status != "pending" || got.Fulfilled || evidence.ConsumedOutbox != 0 || evidence.Fulfillments != 0 {
+						t.Fatalf("processed pending receipt collected funds: payment=%+v evidence=%+v", got, evidence)
+					}
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("pending receipt was not processed: %+v", evidence)
+				}
+				time.Sleep(25 * time.Millisecond)
+			}
 			if got := walletFixtureTransition(t, guest, d.Origin, orderID, "capture-status", "COMPLETED", walletOperatorFixture); got != 204 {
 				t.Fatalf("complete pending capture: %d", got)
 			}
-			deadline := time.Now().Add(12 * time.Second)
+			deadline = time.Now().Add(12 * time.Second)
 			for {
 				completed := status(t, guest, base)
 				if completed.Status == "captured" && completed.Fulfilled {
@@ -498,6 +518,48 @@ func walletFixtureTransition(t *testing.T, c *http.Client, origin, orderID, acti
 	}
 	defer res.Body.Close()
 	return res.StatusCode
+}
+
+type walletPendingReceiptEvidence struct {
+	Processed      bool
+	ConsumedOutbox int
+	Fulfillments   int
+}
+
+func walletPendingEvidence(t *testing.T, c *http.Client, origin, orderID string) walletPendingReceiptEvidence {
+	t.Helper()
+	code, evidence := walletPendingEvidenceRequest(t, c, origin, orderID, walletOperatorFixture)
+	if code != 200 {
+		t.Fatalf("pending receipt diagnostic: %d", code)
+	}
+	return evidence
+}
+
+func walletPendingEvidenceStatus(t *testing.T, c *http.Client, origin, orderID, key string) int {
+	t.Helper()
+	code, _ := walletPendingEvidenceRequest(t, c, origin, orderID, key)
+	return code
+}
+
+func walletPendingEvidenceRequest(t *testing.T, c *http.Client, origin, orderID, key string) (int, walletPendingReceiptEvidence) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), "GET", origin+"/operator/wallet/orders/"+orderID+"/pending-evidence", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	res, err := c.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var evidence walletPendingReceiptEvidence
+	if res.StatusCode == 200 && json.NewDecoder(res.Body).Decode(&evidence) != nil {
+		t.Fatal("unreadable pending receipt diagnostic")
+	}
+	return res.StatusCode, evidence
 }
 
 func containsRefund(raw string, want int64) bool {

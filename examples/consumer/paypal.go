@@ -116,6 +116,7 @@ func (a *app) installPayPal(mux *http.ServeMux, storage tender.Store) (func(), e
 	mux.HandleFunc("POST /orders/{order}/wallet/{step}", a.owned(wallet.submit))
 	mux.HandleFunc("POST /operator/wallet/orders/{order}/refund", wallet.refund)
 	mux.HandleFunc("GET /operator/wallet/orders/{order}/fixture", wallet.fixture)
+	mux.HandleFunc("GET /operator/wallet/orders/{order}/pending-evidence", wallet.pendingEvidence)
 	mux.HandleFunc("POST /operator/wallet/orders/{order}/{action}/{state}", wallet.fixtureControl)
 	mux.HandleFunc("GET /paypal.js", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/javascript")
@@ -148,6 +149,60 @@ func (wc *walletCheckout) fixture(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(rec.Data)
+		return
+	}
+	http.NotFound(w, r)
+}
+
+// pendingEvidence reports only the durable outcome of this MOCK provider
+// receipt. The event ID comes from the scoped fixture capture, not the caller.
+func (wc *walletCheckout) pendingEvidence(w http.ResponseWriter, r *http.Request) {
+	if wc.scope.Environment != tender.EnvironmentMock || wc.operatorKey == "" || r.Header.Get("Origin") != "" || subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), []byte("Bearer "+wc.operatorKey)) != 1 {
+		http.NotFound(w, r)
+		return
+	}
+	for _, o := range orders {
+		if r.PathValue("order") != o.ID {
+			continue
+		}
+		p, err := wc.engine.Get(r.Context(), o.PaymentID)
+		if err != nil || p.OrderID != o.ID || p.Provider != "paypal" || p.ProviderReference == "" {
+			http.NotFound(w, r)
+			return
+		}
+		rec, ok := wc.sim.Lookup("paypal/order/" + p.ProviderReference)
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		var fixture struct {
+			Units []struct {
+				Payments struct {
+					Captures []struct{ ID, Status string } `json:"captures"`
+				} `json:"payments"`
+			} `json:"purchase_units"`
+		}
+		if json.Unmarshal(rec.Data, &fixture) != nil || len(fixture.Units) != 1 || len(fixture.Units[0].Payments.Captures) != 1 || fixture.Units[0].Payments.Captures[0].Status != "PENDING" {
+			http.Error(w, "pending capture unavailable", http.StatusConflict)
+			return
+		}
+		captureID := fixture.Units[0].Payments.Captures[0].ID
+		var result struct {
+			Processed      bool
+			ConsumedOutbox int
+			Fulfillments   int
+		}
+		err = wc.ledger.QueryRowContext(r.Context(), `SELECT
+			EXISTS (SELECT FROM tender_provider_events WHERE merchant_id=$1 AND environment=$2 AND provider='paypal' AND merchant_account=$3 AND event_id=$4 AND evidence->>'OrderID'=$5 AND evidence->>'CaptureID'=$6 AND evidence->>'Kind'='PAYMENT.CAPTURE.PENDING' AND processed_at IS NOT NULL),
+			(SELECT count(*) FROM tender_outbox WHERE merchant_id=$1 AND environment=$2 AND payment_id=$7 AND consumed_at IS NOT NULL),
+			(SELECT count(*) FROM consumer_fulfillments WHERE merchant_id=$1 AND environment=$2 AND order_id=$8 AND payment_id=$7)`,
+			p.Scope.MerchantID, p.Scope.Environment, p.MerchantAccount, "WH-PENDING-"+captureID, p.ProviderReference, captureID, p.ID, o.ID).Scan(&result.Processed, &result.ConsumedOutbox, &result.Fulfillments)
+		if err != nil {
+			http.Error(w, "pending evidence unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(result)
 		return
 	}
 	http.NotFound(w, r)
