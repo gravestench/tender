@@ -4,9 +4,32 @@ Updated 2026-11-25. The published `v0.1.0-alpha.1` MOCK import and CI evidence b
 
 ## Current development candidate
 
-The candidate on `codex/tender-v1` is untagged. G1 is **PENDING** for this candidate until a tag is published and independently imported without a local `replace`. G2 is **PENDING** final full-matrix verification at the reviewed commit, including native PostgreSQL 17 multi-backend contracts and durable Chromium checks. The older alpha G1/G2 results below do not transfer to new code. G3 and G4 remain **BLOCKED** by merchant credentials, genuine provider-generated records, real browser SDK/issuer behavior and an approved ACH mandate. PayPal payout feed/correlation and refund/reversal settlement/event handling are explicit v1 gaps, rather than qualified or not-applicable rail features. A Blacktop integration and fee-saving live pilot have not run.
+The candidate on `codex/tender-v1` is untagged. G1 is **PENDING** for this candidate until a tag is published and independently imported without a local `replace`. G2 is **PASS for the offline candidate code at `a370861fa5d11f77ed0a513b078d488bf54d7460`**, with the local and remote evidence below. The older alpha G1/G2 results do not transfer to this code. G3 and G4 remain **BLOCKED** by merchant credentials, genuine provider-generated records, real browser SDK/issuer behavior and an approved ACH mandate. PayPal payout feed/correlation and refund/reversal settlement/event handling are explicit v1 gaps, rather than qualified or not-applicable rail features. A Blacktop integration and fee-saving live pilot have not run.
 
-The local verification record for the final reviewed commit belongs here after the unit, race, vet, contract, browser and representative fuzz commands complete. Any local PGlite run validates SQL and durable lifecycle behavior but cannot replace native PostgreSQL multi-backend proof. The next candidate push requires its own CI run link and result; the historical CI links below certify only their named commits.
+### Candidate offline verification at `a370861`
+
+On 2026-11-25 UTC, a clean worktree at `a370861fa5d11f77ed0a513b078d488bf54d7460` used Go 1.26.7, Node 26.12.1, Playwright 1.62.1, installed Chromium 1255 and a fresh private PostgreSQL 17.5 WASM/PGlite Unix socket. `GOPROXY=off` was set for every local Go command. The SQL and browser commands used `TENDER_TEST_PGLITE=1` and `TENDER_TEST_DATABASE_URL='host=/private/tmp/tender-task23-pg user=postgres password=postgres dbname=postgres sslmode=disable default_query_exec_mode=exec'`. The browser command additionally used `TENDER_CHROMIUM='/Users/dylanknuth/Library/Caches/ms-playwright/chromium-1255/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing'`. The password and paths are disposable local fixture values, not merchant credentials.
+
+| Local command (with the environment above) | Exit | Result |
+| --- | --- | --- |
+| `go build ./...` | 0 | All packages build. |
+| `go test -count=1 ./...` | 0 | All offline unit packages pass. |
+| `go test -race -count=1 ./...` | 0 | All offline unit packages pass without a race report. |
+| `go vet ./...` | 0 | No vet finding. |
+| `go test -race -count=1 -timeout=8m -tags=integration -skip '^TestPostgresConflictingOperations' ./test/contract/...` | 0 | Full local SQL/provider contract suite except the two native multi-backend conflict cases; the new concurrent return-claim case self-skips under `TENDER_TEST_PGLITE=1`. PGlite package time: 7.047s. |
+| `go test -race -count=1 -timeout=8m -tags=e2e,integration ./test/e2e/...` | 0 | Full durable consumer, loopback provider and Chromium suite; package time: 83.208s. |
+| `(cd examples/consumer && GOWORK=off go build -o /private/tmp/tender-task23-consumer .)` | 0 | Local replacement build; this is not G1's external tagged import. |
+| `go test -run '^$' -fuzz '^FuzzMoneyJSON$' -fuzztime=1s -parallel=1 .` | 0 | Money JSON fuzz target passes. |
+| `go test -run '^$' -fuzz '^FuzzMoneyAdd$' -fuzztime=1s -parallel=1 .` | 0 | Money addition fuzz target passes. |
+| `go test -run '^$' -fuzz '^FuzzPayPalMutationRejection$' -fuzztime=1s -parallel=1 ./providers/paypal` | 0 | PayPal mutation-error fuzz target passes. |
+| `go test -run '^$' -fuzz '^FuzzACHSettlementRow$' -fuzztime=1s -parallel=1 ./providers/ach` | 0 | ACH report-row fuzz target passes. |
+| `go test -run '^$' -fuzz '^FuzzAdyenStandardNotification$' -fuzztime=1s -parallel=1 ./webhook` | 0 | Adyen notification fuzz target passes. |
+
+The first local browser attempt exited 1 because Playwright's default headless-shell executable was absent. Pointing `TENDER_CHROMIUM` to the installed Chromium binary and rerunning the full suite produced the pass above. An earlier local SQL attempt at `b4c7634` exposed a migration round-trip test that rolled back migration 006 while migration 007's foreign key still referenced it; the test was corrected in `a370861`, then the fresh PGlite contract suite passed. Migration 007's return-claim table must be rolled back before 006 and restored after 006. PGlite's one emulated backend cannot prove independent-session lock/serialization behavior; the native CI run below covers those cases.
+
+[Candidate offline CI run 45539781851](https://github.com/gravestench/tender/actions/runs/45539781851) completed successfully at the exact code commit `a370861fa5d11f77ed0a513b078d488bf54d7460` on 2026-11-25 UTC. GitHub reports all four jobs successful: Go 1.26 and 1.27 build/unit/race/vet/consumer build, full unskipped provider contracts with a native PostgreSQL 17.11 service (including the two-session return-claim test), and full race-enabled Chromium durable consumer against native PostgreSQL. This is offline MOCK/SQL/browser evidence only. A later documentation-only commit needs its own branch CI check before a tag is proposed; no independent tagged import has been run for this candidate.
+
+### Published MOCK alpha evidence
 
 | Gate | Status | Evidence and missing work |
 | --- | --- | --- |
