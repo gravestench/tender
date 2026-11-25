@@ -183,6 +183,9 @@ func TestPayPalContract(t *testing.T) {
 		if replay(d.body, d.header) != 202 {
 			t.Fatal("verified replay rejected")
 		}
+		if code := paypalSignedCapture(t, h, id, "PAYMENT.CAPTURE.COMPLETED", order, res.Operation.ProviderReference, h.cfg.MerchantAccount, "9.99"); code == 202 {
+			t.Fatal("processed receipt accepted a changed verified amount under the same event ID")
+		}
 		if err := h.hook.Process(ctx, id); err != nil {
 			t.Fatal(err)
 		}

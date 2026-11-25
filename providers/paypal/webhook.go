@@ -124,11 +124,27 @@ func (h *Webhook) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return inbox.InsertVerifiedEvent(h.key(e.ID), body)
 	})
 	if errors.Is(err, tender.ErrConflict) {
-		saved, _, readErr := h.load(r.Context(), e.ID)
-		err = readErr
-		if err == nil && saved.ID != "" && saved != e {
-			err = tender.ErrConflict
-		}
+		// ProcessVerifiedEvent skips callbacks for processed rows. Read the
+		// allowlisted receipt regardless of processing state before accepting a
+		// replay with the same provider event ID.
+		err = h.store.Transact(r.Context(), func(tx tender.Tx) error {
+			reader, ok := tx.(tender.VerifiedEvidenceReader)
+			if !ok {
+				return tender.ErrUnsupported
+			}
+			matches, err := reader.MatchingVerifiedEvidence(h.api.cfg.Scope, "paypal", h.api.cfg.MerchantAccount, map[string]string{"ID": e.ID})
+			if err != nil {
+				return err
+			}
+			if len(matches) != 1 {
+				return tender.ErrConflict
+			}
+			var saved receipt
+			if json.Unmarshal(matches[0], &saved) != nil || saved != e {
+				return tender.ErrConflict
+			}
+			return nil
+		})
 	}
 	if err != nil {
 		w.WriteHeader(503)
