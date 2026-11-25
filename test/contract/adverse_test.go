@@ -96,6 +96,20 @@ func TestAdverseReviewDurability(t *testing.T) {
 			if err := insert("event-1", evidence); err != nil {
 				t.Fatal(err)
 			}
+			preRaw, _ := json.Marshal(evidence)
+			preNotice, _ := adverseProjection(nil, preRaw)
+			if err := db.Transact(ctx, func(tx tender.Tx) error {
+				return tx.(tender.AdverseReviewTx).EnqueueAdverse(preNotice)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if premature, err := db.AdverseReviews(ctx, scope); err != nil || len(premature) != 0 {
+				t.Fatalf("unprocessed receipt exposed review item: %+v, %v", premature, err)
+			}
+			prematureDecision := tender.AdverseDecision{Disposition: "investigate", ReviewerID: "operator-1", ReviewedAt: time.Date(2026, 11, 25, 2, 0, 0, 0, time.UTC), Rationale: "await_provider_evidence"}
+			if err := db.ReviewAdverse(ctx, preNotice.Key(), prematureDecision); !errors.Is(err, tender.ErrConflict) {
+				t.Fatalf("unprocessed receipt reviewed: %v", err)
+			}
 			if err := db.Transact(ctx, func(tx tender.Tx) error {
 				rows, err := tx.(tender.AdverseEvidenceReader).AdverseEvidence(scope, "processor", "account", "payment")
 				if err != nil || len(rows) != 0 {

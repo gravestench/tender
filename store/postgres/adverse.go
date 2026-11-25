@@ -55,6 +55,16 @@ func (t *transaction) ReviewAdverse(k tender.AdverseKey, d tender.AdverseDecisio
 	if err != nil {
 		return dbError(err)
 	}
+	var processed bool
+	err = t.tx.QueryRowContext(t.ctx, `SELECT processed_at IS NOT NULL FROM tender_provider_events
+        WHERE merchant_id=$1 AND environment=$2 AND provider=$3 AND merchant_account=$4 AND event_id=$5`,
+		k.Scope.MerchantID, k.Scope.Environment, k.Provider, k.MerchantAccount, k.ProviderEventID).Scan(&processed)
+	if err != nil {
+		return dbError(err)
+	}
+	if !processed {
+		return tender.ErrConflict
+	}
 	if len(saved) != 0 {
 		var previous tender.AdverseDecision
 		if err := json.Unmarshal(saved, &previous); err != nil {
@@ -83,8 +93,9 @@ func (t *transaction) ReviewAdverse(k tender.AdverseKey, d tender.AdverseDecisio
 
 // AdverseReviews returns both open and reviewed items in insertion order.
 func (s *Store) AdverseReviews(ctx context.Context, scope tender.Scope) ([]tender.AdverseNotice, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT record, decision FROM tender_adverse_reviews
-        WHERE merchant_id=$1 AND environment=$2 ORDER BY seq`, scope.MerchantID, scope.Environment)
+	rows, err := s.db.QueryContext(ctx, `SELECT a.record, a.decision FROM tender_adverse_reviews a
+        JOIN tender_provider_events e USING (merchant_id, environment, provider, merchant_account, event_id)
+        WHERE a.merchant_id=$1 AND a.environment=$2 AND e.processed_at IS NOT NULL ORDER BY a.seq`, scope.MerchantID, scope.Environment)
 	if err != nil {
 		return nil, dbError(err)
 	}

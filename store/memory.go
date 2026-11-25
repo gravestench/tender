@@ -328,6 +328,9 @@ func (t *memoryTx) ReviewAdverse(k tender.AdverseKey, d tender.AdverseDecision) 
 	if !found {
 		return tender.ErrNotFound
 	}
+	if !t.events[tender.VerifiedEventKey{Scope: k.Scope, Provider: k.Provider, MerchantAccount: k.MerchantAccount, ID: k.ProviderEventID}].processed {
+		return tender.ErrConflict
+	}
 	if n.Decision != nil {
 		if *n.Decision == d {
 			return nil
@@ -348,7 +351,8 @@ func (m *Memory) AdverseReviews(ctx context.Context, scope tender.Scope) ([]tend
 	defer func() { <-m.lock }()
 	var out []tender.AdverseNotice
 	for _, n := range m.state.adverse {
-		if n.Scope == scope {
+		k := n.Key()
+		if n.Scope == scope && m.state.events[tender.VerifiedEventKey{Scope: k.Scope, Provider: k.Provider, MerchantAccount: k.MerchantAccount, ID: k.ProviderEventID}].processed {
 			if n.Decision != nil {
 				d := *n.Decision
 				n.Decision = &d
