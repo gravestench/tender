@@ -390,8 +390,9 @@ func (e *Engine) Reconcile(ctx context.Context, report SettlementReport) (Reconc
 	return run, nil
 }
 
-// Each successful modification operation can contribute principal once to a
-// report. Split provider rows need a separate, proven aggregate contract.
+// Each successful modification operation or verified adverse identity can
+// contribute principal once to a report. Split provider rows need a separate,
+// proven aggregate contract.
 func (e *Engine) matchSettlementLines(tx ReconciliationTx, lines []SettlementLine) ([]ReconciliationResult, error) {
 	type movementKey struct{ paymentID, modification string }
 	seen := make(map[movementKey]int)
@@ -402,7 +403,8 @@ func (e *Engine) matchSettlementLines(tx ReconciliationTx, lines []SettlementLin
 			return nil, err
 		}
 		results[i] = result
-		if line.BatchID == "" || (line.Kind != SettlementCaptured && line.Kind != SettlementRefunded) || result.Outcome != ReconciliationMatched {
+		principalMovement := line.Kind == SettlementCaptured || line.Kind == SettlementRefunded || line.Kind == SettlementReturned
+		if !principalMovement || result.Outcome != ReconciliationMatched || (line.BatchID == "" && line.Kind != SettlementReturned) {
 			continue
 		}
 		key := movementKey{result.PaymentID, line.ModificationReference}
@@ -742,6 +744,7 @@ func (e *Engine) matchSettlementLine(tx ReconciliationTx, line SettlementLine) (
 		r.Outcome = ReconciliationUnconfirmed
 		return r, nil
 	}
+	var adverseExpected int64
 	if line.Kind == SettlementReturned {
 		// A report cannot corroborate its own return. A provider projector must
 		// first process a scoped verified receipt and persist its exact adverse
@@ -766,6 +769,7 @@ func (e *Engine) matchSettlementLine(tx ReconciliationTx, line SettlementLine) (
 			}
 			if notice.Kind == "returned" || notice.Kind == "chargeback" || notice.Kind == "reversal" {
 				matched = true
+				adverseExpected = notice.Amount.Minor
 				break
 			}
 		}
@@ -783,9 +787,9 @@ func (e *Engine) matchSettlementLine(tx ReconciliationTx, line SettlementLine) (
 	case SettlementSettled:
 		expected = p.Funds.Settled
 	case SettlementReturned:
-		expected = p.Funds.Returned
+		expected = adverseExpected
 	}
-	if op.ID != "" {
+	if op.ID != "" && line.Kind != SettlementReturned {
 		kind := map[SettlementEntryKind]OperationKind{SettlementCaptured: OpCapture, SettlementRefunded: OpRefund}[line.Kind]
 		if kind == "" || op.Kind != kind || op.Status != OperationSucceeded || expected < op.Amount.Minor {
 			r.Outcome = ReconciliationUnconfirmed

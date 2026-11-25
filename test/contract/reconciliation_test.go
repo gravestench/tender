@@ -7,10 +7,12 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"net/http"
 	"testing"
 	"time"
 
 	"github.com/gravestench/tender"
+	"github.com/gravestench/tender/providers/adyen"
 	"github.com/gravestench/tender/store/postgres"
 )
 
@@ -339,6 +341,84 @@ func TestReconcileReports(t *testing.T) {
 	}
 	if _, err := bankEngine.Reconcile(ctx, tender.SettlementReport{ID: "unsupported", Feed: tender.ReportFeed("provider_auto")}); !errors.Is(err, tender.ErrUnsupported) {
 		t.Fatalf("unsupported feed: %v", err)
+	}
+}
+
+func TestReconcileSignedAdyenChargeback(t *testing.T) {
+	db := postgres.New(postgresFixture(t)())
+	h := newAdyenRig(t, db, "Authorised", "")
+	h.create()
+	auth, err := h.confirm()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.process()
+	if _, err := h.e.Capture(t.Context(), h.request("capture", 100)); err != nil {
+		t.Fatal(err)
+	}
+	h.process()
+	beforeOutbox, err := db.Outbox(t.Context(), dbScope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authRecord := h.record(auth)
+	now := time.Now().UTC()
+	fields := map[string]string{
+		"Merchant Account": testAccount, "Tender Merchant Account": testAccount,
+		"Psp Reference": authRecord.PaymentPSP, "Merchant Reference": authRecord.Reference,
+		"Modification Reference": "DISPUTE123", "Payment Method": "visa", "Type": "Chargeback",
+		"Gross Currency": "USD", "Net Currency": "USD", "Batch Number": "42",
+		"Tender Source Part ID": "part-chargeback", "Tender Source Section ID": "section-chargeback",
+		"Gross Debit (GC)": "1.00", "Net Debit (NC)": "1.00",
+	}
+	chargeback, err := adyen.ProjectCardSettlement(fields, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := tender.SettlementReport{ID: "signed-chargeback", Feed: tender.FeedHostVerified, Lines: []tender.SettlementLine{chargeback}}
+	before, err := h.e.Reconcile(t.Context(), report)
+	if err != nil || before.Results[0].Outcome != tender.ReconciliationUnconfirmed {
+		t.Fatalf("report alone confirmed chargeback: %+v, %v", before.Results, err)
+	}
+	if status := h.post(h.sim.AdyenAdverseNotification(authRecord, "CHARGEBACK", "DISPUTE123", 100)); status != http.StatusAccepted {
+		t.Fatalf("signed chargeback callback status: %d", status)
+	}
+	if err := h.hook.Process(t.Context(), h.next()); err != nil {
+		t.Fatal(err)
+	}
+	verified, err := h.e.Reconcile(t.Context(), report)
+	if err != nil || verified.Results[0].Outcome != tender.ReconciliationMatched || verified.Results[0].ExpectedMinor != 100 {
+		t.Fatalf("verified chargeback remained open: %+v, %v", verified.Results, err)
+	}
+	var payment tender.Payment
+	if err := db.Transact(t.Context(), func(tx tender.Tx) error { payment, err = tx.Payment(dbScope, auth.Payment.ID); return err }); err != nil {
+		t.Fatal(err)
+	}
+	if payment.Funds.Returned != 0 {
+		t.Fatalf("reconciliation changed payment funds: %+v", payment.Funds)
+	}
+	duplicate := chargeback
+	duplicate.ID += "-duplicate"
+	doubleReturn := int64(-200)
+	duplicateReport := tender.SettlementReport{
+		ID: "duplicate-signed-chargeback", Feed: tender.FeedHostVerified,
+		Lines:    []tender.SettlementLine{chargeback, duplicate},
+		Payouts:  []tender.PayoutLine{{ID: "duplicate-chargeback-payout", BatchID: "42", SourcePartID: "part-chargeback", SourceSectionID: "section-chargeback", Currency: "USD", PayoutReference: "duplicate-chargeback-bank", AmountMinor: -200, ObservedAt: now}},
+		Parts:    []tender.ReportPart{{ID: "part-chargeback", SectionID: "section-chargeback", Digest: "authenticated-chargeback-artifact", Number: 1, TotalParts: 1, DeclaredRows: 3}},
+		Sections: []tender.ReportSection{{ID: "section-chargeback", BatchID: "42", Currency: "USD", Number: 1, TotalSections: 1, DeclaredRows: 3, DeclaredNetMinor: &doubleReturn, DeclaredPayoutMinor: &doubleReturn}},
+	}
+	duplicateRun, err := h.e.Reconcile(t.Context(), duplicateReport)
+	if err != nil || duplicateRun.Results[0].Outcome != tender.ReconciliationUnconfirmed || duplicateRun.Results[1].Outcome != tender.ReconciliationUnconfirmed || len(duplicateRun.PayoutResults) != 1 || duplicateRun.PayoutResults[0].Outcome != tender.PayoutUnconfirmed {
+		t.Fatalf("one verified chargeback counted twice: %+v, %v", duplicateRun, err)
+	}
+	afterOutbox, err := db.Outbox(t.Context(), dbScope)
+	if err != nil || len(afterOutbox) != len(beforeOutbox) {
+		t.Fatalf("reconciliation changed fulfillment outbox: %+v, %v", afterOutbox, err)
+	}
+	for i := range beforeOutbox {
+		if afterOutbox[i].ID != beforeOutbox[i].ID || afterOutbox[i].Version != beforeOutbox[i].Version {
+			t.Fatalf("reconciliation changed fulfillment outbox: %+v", afterOutbox)
+		}
 	}
 }
 
