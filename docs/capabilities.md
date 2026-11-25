@@ -11,6 +11,8 @@ Tender's implemented reference market is a US merchant charging USD. The Go adap
 
 The Adyen ACH route can reach eligible personal accounts at US banks and credit unions through the ACH network. It does not certify every bank or account and does not eliminate the originating processor or bank relationship. Tender has no validated processor fee comparison. Blacktop's existing multi-merchant Stripe Connect and payout flows are outside this single-merchant direct-acquiring slice. [ACH decision](adr/0005-us-ach-partner.md) · [Blacktop integration seam](blacktop-integration.md).
 
+Dwolla is a **second US ACH adapter candidate** with MOCK-tested pay-in transfer initiation and signed durable webhook ingestion. It is not an enabled SANDBOX/LIVE route: transfer-leg processing, return projection, bank reconciliation, an approved mandate and real merchant evidence remain open. [Dwolla candidate](providers/dwolla.md).
+
 Eligibility further depends on the merchant account, funding source, region, currency, device, browser and authentication flow. Hosts must disable a route when any required condition or evidence is missing. MOCK outcomes never qualify a SANDBOX or LIVE route. Unsupported provider operations are not silently treated as qualified; PayPal's payout correlation is an open v1 gap, while standalone PayPal authorization/void and other operations outside the selected capture-on-confirm product are not applicable to that route. Each provider guide states the exact configuration and unsupported operations.
 
 ## Release gates
