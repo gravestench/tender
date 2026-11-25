@@ -245,6 +245,20 @@ func (ac *achCheckout) consent(w http.ResponseWriter, r *http.Request, o order, 
 		http.Error(w, "synthetic session persistence unavailable", 503)
 		return
 	}
+	// Persist the owning shopper's synthetic consent choice before the mock
+	// provider can queue a signed authorization. A failed write leaves the
+	// action retryable; a later process restores the exact same choice.
+	changed, err := ac.ledger.ExecContext(r.Context(), `UPDATE consumer_ach_fixtures SET decision=$5
+ WHERE merchant_id=$1 AND environment=$2 AND order_id=$3 AND session_id=$4
+ AND (decision='' OR decision=$5)`, ac.scope.MerchantID, ac.scope.Environment, o.ID, action.ID, decision)
+	if err != nil {
+		http.Error(w, "synthetic consent persistence unavailable", 503)
+		return
+	}
+	if n, _ := changed.RowsAffected(); n != 1 {
+		http.Error(w, "synthetic consent changed", 409)
+		return
+	}
 	res, err := ac.fixture(r.Context(), http.MethodPost, "/mock/consent/"+action.ID+"/"+decision)
 	if err != nil || res.StatusCode != http.StatusOK {
 		if res != nil {
@@ -258,17 +272,6 @@ func (ac *achCheckout) consent(w http.ResponseWriter, r *http.Request, o order, 
 	res.Body.Close()
 	if err != nil || receipt.SessionResult == "" {
 		http.Error(w, "fixture consent unavailable", 503)
-		return
-	}
-	changed, err := ac.ledger.ExecContext(r.Context(), `UPDATE consumer_ach_fixtures SET decision=$5
- WHERE merchant_id=$1 AND environment=$2 AND order_id=$3 AND session_id=$4
- AND (decision='' OR decision=$5)`, ac.scope.MerchantID, ac.scope.Environment, o.ID, action.ID, decision)
-	if err != nil {
-		http.Error(w, "synthetic consent persistence unavailable", 503)
-		return
-	}
-	if n, _ := changed.RowsAffected(); n != 1 {
-		http.Error(w, "synthetic consent changed", 409)
 		return
 	}
 	_, err = ac.engine.Confirm(r.Context(), tender.Request{PaymentID: o.PaymentID, Key: "ach/result/" + o.ID, Amount: o.Total, Token: receipt.SessionResult})

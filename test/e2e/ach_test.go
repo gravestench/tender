@@ -320,6 +320,94 @@ func TestACHReturnIntentSurvivesCallbackLoss(t *testing.T) {
 	})
 }
 
+// Rejecting the durable consent write must happen before the simulator queues
+// a signed authorization. Otherwise that callback can bind a PSP while the
+// fixture decision remains empty, leaving an unrecoverable action on restart.
+func TestACHConsentWriteFailureBeforeSignedAuthorization(t *testing.T) {
+	dsn, schema, cfg := demoSchema(t, `ALTER TABLE consumer_ach_fixtures ADD CONSTRAINT reject_decision CHECK (decision='')`)
+	opts := []string{"TENDER_CONSUMER_PROVIDER=adyen_ach", "TENDER_CONSUMER_OPERATOR_KEY=" + operatorFixture, "TENDER_CONSUMER_DATABASE_URL=" + dsn, "TENDER_CONSUMER_SCHEMA=" + schema}
+	var id string
+	t.Run("failed durable decision", func(t *testing.T) {
+		d := launch(t, opts...)
+		c := client(t, d.Origin)
+		p := request(t, c, "GET", d.Guest, "", nil)
+		target := d.Origin + p.path
+		form := url.Values{"csrf": {token(t, p)}}
+		if got := request(t, c, "POST", target+"/ach/start", d.Origin, form); got.status != 200 {
+			t.Fatalf("start: %d %s", got.status, got.body)
+		}
+		if got := request(t, c, "POST", target+"/ach/consent/approve", d.Origin, form); got.status != 503 {
+			t.Fatalf("consent write failure did not stop checkout: %d %s", got.status, got.body)
+		}
+		st := status(t, c, target)
+		id = st.PaymentID
+		if st.Status != "requires_action" || st.Fulfilled {
+			t.Fatalf("failed decision changed payment: %+v", st)
+		}
+		// Keep the callback worker alive long enough to expose a wrongly
+		// queued local authorization before ending the first host process.
+		time.Sleep(time.Second)
+	})
+	conn := inspectDemo(t, cfg, schema)
+	var signed int
+	var providerRef string
+	if err := conn.QueryRow(t.Context(), `SELECT
+ (SELECT count(*) FROM tender_provider_events WHERE evidence->>'eventCode'='AUTHORISATION'),
+ COALESCE((SELECT record->>'ProviderReference' FROM tender_payments WHERE payment_id=$1),'')`, id).Scan(&signed, &providerRef); err != nil {
+		t.Fatal(err)
+	}
+	if signed != 0 || providerRef != "" {
+		t.Fatalf("signed authorization preceded durable consent: callbacks=%d PSP=%q", signed, providerRef)
+	}
+	if _, err := conn.Exec(t.Context(), `ALTER TABLE consumer_ach_fixtures DROP CONSTRAINT reject_decision`); err != nil {
+		t.Fatal(err)
+	}
+	conn.Close(t.Context())
+	t.Run("consent after restart", func(t *testing.T) {
+		d := launch(t, opts...)
+		c := client(t, d.Origin)
+		p := request(t, c, "GET", d.Guest, "", nil)
+		target := d.Origin + p.path
+		if got := request(t, c, "POST", target+"/ach/consent/approve", d.Origin, url.Values{"csrf": {token(t, p)}}); got.status != 200 {
+			t.Fatalf("retry consent: %d %s", got.status, got.body)
+		}
+		if st := status(t, c, target); st.Status != "pending" || st.Fulfilled {
+			t.Fatalf("recovered consent collected before report: %+v", st)
+		}
+	})
+	t.Run("settle after restart", func(t *testing.T) {
+		d := launch(t, opts...)
+		c := client(t, d.Origin)
+		p := request(t, c, "GET", d.Guest, "", nil)
+		target := d.Origin + p.path
+		st := status(t, c, target)
+		if code := operatorRequest(t, c, d.Origin+"/operator/ach/orders/"+st.OrderID+"/settle"); code != 202 {
+			t.Fatalf("settle after failed consent retry: %d", code)
+		}
+		waitACH(t, c, target, "settled", true)
+	})
+	t.Run("return after restart", func(t *testing.T) {
+		d := launch(t, opts...)
+		c := client(t, d.Origin)
+		p := request(t, c, "GET", d.Guest, "", nil)
+		target := d.Origin + p.path
+		st := status(t, c, target)
+		if code := operatorRequest(t, c, d.Origin+"/operator/ach/orders/"+st.OrderID+"/return"); code != 202 {
+			t.Fatalf("return after failed consent retry: %d", code)
+		}
+		waitACH(t, c, target, "returned", true)
+	})
+	conn = inspectDemo(t, cfg, schema)
+	defer conn.Close(t.Context())
+	var fulfillment, reviews, returns int
+	if err := conn.QueryRow(t.Context(), `SELECT
+ (SELECT count(*) FROM consumer_fulfillments WHERE payment_id=$1),
+ (SELECT count(*) FROM tender_adverse_reviews WHERE payment_id=$1),
+ (SELECT count(*) FROM tender_provider_events WHERE event_id LIKE 'CHARGEBACK.%' AND processed_at IS NOT NULL)`, id).Scan(&fulfillment, &reviews, &returns); err != nil || fulfillment != 1 || reviews != 1 || returns != 1 {
+		t.Fatalf("recovered consent durability: fulfillment=%d reviews=%d returns=%d: %v", fulfillment, reviews, returns, err)
+	}
+}
+
 func waitACH(t *testing.T, c *http.Client, target, state string, fulfilled bool) {
 	t.Helper()
 	deadline := time.Now().Add(8 * time.Second)
