@@ -4,7 +4,7 @@ Updated 2026-11-24. The reference route is Adyen Checkout v72 Sessions with Adye
 
 | Scenario | Local observation | Official merchant observation |
 | --- | --- | --- |
-| Bank entry and consent | Synthetic browser component stays on page and the host receives no bank account/routing field. | **BLOCKED:** ACH/giact enrollment, registered origin, credentialed browser transport and a merchant-approved signed mandate presentation/retention design. |
+| Bank entry and consent | Synthetic browser component stays on page and the host receives no bank account/routing field. MOCK consent survives restart; a rejected durable consent write prevents a signed authorization. Keyboard and Enter guards are synthetic. | **BLOCKED:** ACH/giact enrollment, registered origin, credentialed browser transport and a merchant/provider/ODFI-approved signed mandate presentation/retention design. |
 | Debit and refusal | The fixture reports pending authorization or refusal; signed correlated failure creates a review hold. | **BLOCKED:** actual provider test debit, giact validation outcome and generated signed receipt. |
 | Settlement and return | Signed/host-authenticated projected evidence can record gross settlement and later return without erasing collection history. | **BLOCKED:** genuine settled and returned test debit, corresponding Standard events and Settlement details report. |
 | Bank reach and price | ACH network routing can cover eligible personal bank/credit-union accounts through the provider. | **BLOCKED:** account-specific acceptance, fee quote and actual net payout. |

@@ -1,6 +1,12 @@
 # Release gate ledger
 
-Updated 2026-11-25 with the tagged `v0.1.0-alpha.1` MOCK import and CI evidence from `main` at `0667258`. **The four-rail v1.0 release is BLOCKED.** Green offline CI and local mock/PGlite results do not count as official provider sandbox proof. This ledger records the verification distinction and the evidence needed to change status.
+Updated 2026-11-25. The published `v0.1.0-alpha.1` MOCK import and CI evidence below are historical results from `main` at `0667258`. The current development candidate adds provider report projections, payout and adverse review records, durable consumer scenarios, protected gate checks and optional observations. **The four-rail v1.0 release is BLOCKED.** Green offline CI and local mock/PGlite results do not count as official provider sandbox proof. This ledger records the verification distinction and the evidence needed to change status.
+
+## Current development candidate
+
+The candidate on `codex/tender-v1` is untagged. G1 is **PENDING** for this candidate until a tag is published and independently imported without a local `replace`. G2 is **PENDING** final full-matrix verification at the reviewed commit, including native PostgreSQL 17 multi-backend contracts and durable Chromium checks. The older alpha G1/G2 results below do not transfer to new code. G3 and G4 remain **BLOCKED** by merchant credentials, genuine provider-generated records, real browser SDK/issuer behavior and an approved ACH mandate. PayPal payout feed/correlation and refund/reversal settlement/event handling are explicit v1 gaps, rather than qualified or not-applicable rail features. A Blacktop integration and fee-saving live pilot have not run.
+
+The local verification record for the final reviewed commit belongs here after the unit, race, vet, contract, browser and representative fuzz commands complete. Any local PGlite run validates SQL and durable lifecycle behavior but cannot replace native PostgreSQL multi-backend proof. The next candidate push requires its own CI run link and result; the historical CI links below certify only their named commits.
 
 | Gate | Status | Evidence and missing work |
 | --- | --- | --- |

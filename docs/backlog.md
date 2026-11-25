@@ -1,6 +1,6 @@
 # Milestone backlog
 
-The milestone numbers follow the Tender v1.0 implementation handoff. Exit criteria apply in addition to the [implementation plan](superpowers/plans/2026-11-24-tender-v1.md).
+The milestone numbers follow the Tender v1.0 implementation handoff. Exit criteria apply in addition to the [implementation plan](superpowers/plans/2026-11-24-tender-v1.md) and [completion plan](superpowers/plans/2026-11-25-tender-v1-completion.md). Local MOCK and host-supplied evidence work has advanced across all four rails; official qualification remains open.
 
 | Milestone | Deliverable | Exit criteria |
 | --- | --- | --- |
@@ -14,10 +14,10 @@ The milestone numbers follow the Tender v1.0 implementation handoff. Exit criter
 
 ## Early Blacktop integration
 
-1. Validate the host integration boundary with a standalone consumer and agree on the order, verified-event, and fulfillment contracts.
-2. Build the M3 offline card purchase, refund, and recovery paths as soon as the relevant M1 and M2 dependencies are ready. Use that slice to test importing Tender into Blacktop once a change to Blacktop is authorized.
-3. Produce an explicitly labeled card pre-release after verification for its advertised scope. For real payments, get merchant approval, verify the strict checkout policy in the sandbox, and complete production activation together with the acquiring partner.
-4. Continue M4 through M6 for the four-rail v1.0 release.
+1. Use the published `v0.1.0-alpha.1` MOCK tag and the independent consumer to map Blacktop's order totals, merchant scope, callback verification, durable store, fulfillment outbox and refund workflow. A direct Blacktop code integration and production pilot have not been performed.
+2. Recheck a new tagged candidate through a clean external import after it is published; the prior alpha G1 result does not certify current development HEAD.
+3. Obtain each merchant entitlement and run genuine sandbox browser, mutation, signed delivery and complete report checks. For ACH, approve and retain the one-time WEB debit mandate before real checkout. PayPal payout movement and refund/reversal report correlation remain v1 gaps.
+4. Complete an approved, low-value live pilot with actual fee and bank-deposit comparisons before claiming a Blacktop cost reduction. Continue G3/G4 for the four-rail v1.0 release.
 
 ## External dependencies
 
