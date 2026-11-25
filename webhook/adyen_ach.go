@@ -30,6 +30,17 @@ func (h *Adyen) processACHReturn(ctx context.Context, id string) error {
 		if err != nil {
 			return tender.VerifiedEvent{}, tender.AdverseNotice{}, err
 		}
+		// A signed return PSP must be a new modification identity on this
+		// merchant route, not an operation already bound to another payment.
+		lookup, ok := tx.(merchantOperationReferenceReader)
+		if !ok {
+			return tender.VerifiedEvent{}, tender.AdverseNotice{}, tender.ErrUnsupported
+		}
+		if _, err := lookup.OperationByMerchantReference(h.cfg.Scope, "adyen", e.Account, e.PSP); err == nil {
+			return tender.VerifiedEvent{}, tender.AdverseNotice{}, tender.ErrConflict
+		} else if !errors.Is(err, tender.ErrNotFound) {
+			return tender.VerifiedEvent{}, tender.AdverseNotice{}, err
+		}
 		// An ACH return has no separate host operation. The signed modification
 		// PSP and original payment PSP identify the review work instead.
 		n := tender.AdverseNotice{

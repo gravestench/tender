@@ -54,6 +54,16 @@ func TestACHRejectsStoreWithoutReturnReview(t *testing.T) {
 				tender.AdverseReviewTx
 			}{tx, tx.(tender.VerifiedEventTx), tx.(tender.VerifiedEvidenceReader), tx.(tender.CaptureFailureTx), tx.(tender.AdverseReviewTx)}
 		}},
+		{"missing merchant operation lookup", func(tx tender.Tx) tender.Tx {
+			return struct {
+				tender.Tx
+				tender.VerifiedEventTx
+				tender.VerifiedEvidenceReader
+				tender.CaptureFailureTx
+				tender.AdverseReviewTx
+				tender.AdverseEvidenceReader
+			}{tx, tx.(tender.VerifiedEventTx), tx.(tender.VerifiedEvidenceReader), tx.(tender.CaptureFailureTx), tx.(tender.AdverseReviewTx), tx.(tender.AdverseEvidenceReader)}
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			calls := 0
