@@ -47,10 +47,27 @@ type AdverseDecision struct {
 }
 
 // AdverseReviewTx is available on stores supporting durable adverse review.
-// Enqueue requires an existing verified receipt in the same transaction.
+// Enqueue requires an engine-issued claim for the active verified receipt
+// callback in this transaction. The zero claim cannot authorize an insert.
 type AdverseReviewTx interface {
-	EnqueueAdverse(AdverseNotice) error
+	EnqueueAdverse(AdverseNotice, AdverseClaim) error
 	ReviewAdverse(AdverseKey, AdverseDecision) error
+}
+
+// AdverseClaim is a sealed, transaction-scoped authorization for a notice.
+// Only Tender's Engine can construct a valid claim after binding verified
+// evidence to the payment and route. A host or adapter can pass its zero value
+// but cannot create a valid claim or turn an arbitrary inbox row into proof.
+type AdverseClaim struct {
+	key    VerifiedEventKey
+	notice AdverseNotice
+	valid  bool
+}
+
+// ValidFor lets a Store check that the claim belongs to the current verified
+// receipt callback and the exact normalized notice it is about to persist.
+func (c AdverseClaim) ValidFor(key VerifiedEventKey, notice AdverseNotice) bool {
+	return c.valid && c.key == key && c.notice == notice
 }
 
 // AdverseEvidenceReader exposes only notices whose verified inbox receipt is
@@ -125,7 +142,8 @@ func (e *Engine) ProcessVerifiedAdverseEvent(ctx context.Context, id string, pro
 		if !ok {
 			return ErrUnsupported
 		}
-		return inbox.ProcessVerifiedEvent(VerifiedEventKey{Scope: key.Scope, Provider: key.Provider, MerchantAccount: key.MerchantAccount, ID: key.ProviderEventID}, e.config.Now().UTC(), func(evidence json.RawMessage) error {
+		verifiedKey := VerifiedEventKey{Scope: key.Scope, Provider: key.Provider, MerchantAccount: key.MerchantAccount, ID: key.ProviderEventID}
+		return inbox.ProcessVerifiedEvent(verifiedKey, e.config.Now().UTC(), func(evidence json.RawMessage) error {
 			n, err := project(tx, evidence)
 			if err != nil {
 				return err
@@ -153,12 +171,12 @@ func (e *Engine) ProcessVerifiedAdverseEvent(ctx context.Context, id string, pro
 					return err
 				}
 				if op.PaymentID != p.ID || op.AttemptID != p.AttemptID ||
-					(op.ProviderReference != "" && op.ProviderReference != n.ModificationReference) {
+					op.ProviderReference == "" || op.ProviderReference != n.ModificationReference {
 					return fmt.Errorf("%w: adverse operation correlation mismatch", ErrConflict)
 				}
 			}
 			n.ObservedAt = n.ObservedAt.Round(0).UTC()
-			return review.EnqueueAdverse(n)
+			return review.EnqueueAdverse(n, AdverseClaim{key: verifiedKey, notice: n, valid: true})
 		})
 	})
 }

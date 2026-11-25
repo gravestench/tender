@@ -99,15 +99,15 @@ func TestAdverseReviewDurability(t *testing.T) {
 			preRaw, _ := json.Marshal(evidence)
 			preNotice, _ := adverseProjection(nil, preRaw)
 			if err := db.Transact(ctx, func(tx tender.Tx) error {
-				return tx.(tender.AdverseReviewTx).EnqueueAdverse(preNotice)
-			}); err != nil {
-				t.Fatal(err)
+				return tx.(tender.AdverseReviewTx).EnqueueAdverse(preNotice, tender.AdverseClaim{})
+			}); !errors.Is(err, tender.ErrConflict) {
+				t.Fatalf("direct unprocessed enqueue: %v", err)
 			}
 			if premature, err := db.AdverseReviews(ctx, scope); err != nil || len(premature) != 0 {
 				t.Fatalf("unprocessed receipt exposed review item: %+v, %v", premature, err)
 			}
 			prematureDecision := tender.AdverseDecision{Disposition: "investigate", ReviewerID: "operator-1", ReviewedAt: time.Date(2026, 11, 25, 2, 0, 0, 0, time.UTC), Rationale: "await_provider_evidence"}
-			if err := db.ReviewAdverse(ctx, preNotice.Key(), prematureDecision); !errors.Is(err, tender.ErrConflict) {
+			if err := db.ReviewAdverse(ctx, preNotice.Key(), prematureDecision); !errors.Is(err, tender.ErrNotFound) {
 				t.Fatalf("unprocessed receipt reviewed: %v", err)
 			}
 			if err := db.Transact(ctx, func(tx tender.Tx) error {
@@ -166,15 +166,15 @@ func TestAdverseReviewDurability(t *testing.T) {
 			changed := notices[0]
 			changed.Kind = "different_event"
 			if err := db.Transact(ctx, func(tx tender.Tx) error {
-				return tx.(tender.AdverseReviewTx).EnqueueAdverse(changed)
+				return tx.(tender.AdverseReviewTx).EnqueueAdverse(changed, tender.AdverseClaim{})
 			}); !errors.Is(err, tender.ErrConflict) {
 				t.Fatalf("changed notice under existing event key: %v", err)
 			}
 			orphan := notices[0]
 			orphan.ProviderEventID = "not-in-inbox"
 			if err := db.Transact(ctx, func(tx tender.Tx) error {
-				return tx.(tender.AdverseReviewTx).EnqueueAdverse(orphan)
-			}); !errors.Is(err, tender.ErrNotFound) {
+				return tx.(tender.AdverseReviewTx).EnqueueAdverse(orphan, tender.AdverseClaim{})
+			}); !errors.Is(err, tender.ErrConflict) {
 				t.Fatalf("orphan notice accepted: %v", err)
 			}
 			if err := db.Transact(ctx, func(tx tender.Tx) error {
@@ -235,6 +235,10 @@ func TestAdverseReviewRejectsWrongRoute(t *testing.T) {
 	if err := db.Transact(t.Context(), func(tx tender.Tx) error { return tx.InsertOperation(op) }); err != nil {
 		t.Fatal(err)
 	}
+	unbound := tender.OperationRecord{Operation: tender.Operation{Scope: scope, ID: "unbound-operation", PaymentID: p.ID, AttemptID: p.AttemptID, Key: "unbound-key", Fingerprint: "unbound-fingerprint", ProviderKey: "unbound-provider-key", Kind: tender.OpRefund, Status: tender.OperationSucceeded, Amount: tender.Money{Minor: 5000, Currency: "USD"}}}
+	if err := db.Transact(t.Context(), func(tx tender.Tx) error { return tx.InsertOperation(unbound) }); err != nil {
+		t.Fatal(err)
+	}
 	engine, _ := tender.NewEngine(tender.EngineConfig{Store: db, Provider: storageProvider{}, Scope: scope, ProviderName: "processor", MerchantAccount: "account", Market: market})
 	for _, tc := range []struct {
 		name   string
@@ -246,6 +250,7 @@ func TestAdverseReviewRejectsWrongRoute(t *testing.T) {
 		{"swapped", func(e *adverseEvidence) { e.Original, e.Modification = e.Modification, e.Original }},
 		{"amount", func(e *adverseEvidence) { e.Amount = 10001 }},
 		{"operation", func(e *adverseEvidence) { e.OperationID = "capture-operation"; e.Modification = "wrong-capture-psp" }},
+		{"unbound-operation", func(e *adverseEvidence) { e.OperationID = "unbound-operation" }},
 		{"event", func(e *adverseEvidence) { e.EventID = "another-event" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -263,6 +268,71 @@ func TestAdverseReviewRejectsWrongRoute(t *testing.T) {
 	}
 	if notices, err := db.AdverseReviews(t.Context(), scope); err != nil || len(notices) != 0 {
 		t.Fatalf("mismatch created notices: %+v, %v", notices, err)
+	}
+}
+
+func TestAdverseReviewRejectsDirectPostProcessing(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		open func(*testing.T) adverseStore
+	}{
+		{"memory", func(*testing.T) adverseStore { return store.NewMemory() }},
+		{"postgres", func(t *testing.T) adverseStore { open := postgresFixture(t); return postgres.New(open()) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := tc.open(t)
+			ctx := t.Context()
+			scope := tender.Scope{MerchantID: "adverse-shop", Environment: tender.EnvironmentMock}
+			market := tender.Market{Country: "US", Currency: "USD", Method: tender.MethodVisa}
+			for _, seed := range []struct{ id, ref string }{{"payment", "payment-psp"}, {"other-payment", "other-psp"}} {
+				p, _ := tender.NewPayment(scope, seed.id, "order-"+seed.id, tender.Money{Minor: 10000, Currency: "USD"})
+				p.Provider, p.MerchantAccount, p.Market, p.AttemptID, p.ProviderReference = "processor", "account", market, "attempt-"+seed.id, seed.ref
+				if err := db.Transact(ctx, func(tx tender.Tx) error { return tx.InsertPayment(p) }); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, scenario := range []struct {
+				name  string
+				alter func(*tender.AdverseNotice)
+			}{
+				{"exact", func(*tender.AdverseNotice) {}},
+				{"other-payment", func(n *tender.AdverseNotice) { n.PaymentID = "other-payment"; n.OriginalReference = "other-psp" }},
+				{"wrong-original", func(n *tender.AdverseNotice) { n.OriginalReference = "other-psp" }},
+				{"wrong-amount", func(n *tender.AdverseNotice) { n.Amount.Minor = 9999 }},
+			} {
+				t.Run(scenario.name, func(t *testing.T) {
+					e := adverseEvidence{Provider: "processor", Account: "account", EventID: scenario.name, PaymentID: "payment", Original: "payment-psp", Modification: "dispute-" + scenario.name, Kind: "chargeback", Amount: 5000, Currency: "USD"}
+					raw, _ := json.Marshal(e)
+					key := tender.VerifiedEventKey{Scope: scope, Provider: "processor", MerchantAccount: "account", ID: scenario.name}
+					if err := db.Transact(ctx, func(tx tender.Tx) error {
+						inbox := tx.(tender.VerifiedEventTx)
+						if err := inbox.InsertVerifiedEvent(key, raw); err != nil {
+							return err
+						}
+						return inbox.ProcessVerifiedEvent(key, time.Now().UTC(), func(json.RawMessage) error { return nil })
+					}); err != nil {
+						t.Fatal(err)
+					}
+					n, _ := adverseProjection(nil, raw)
+					scenario.alter(&n)
+					if err := db.Transact(ctx, func(tx tender.Tx) error { return tx.(tender.AdverseReviewTx).EnqueueAdverse(n, tender.AdverseClaim{}) }); !errors.Is(err, tender.ErrConflict) {
+						t.Fatalf("direct forged enqueue accepted: %v", err)
+					}
+				})
+			}
+			if reviews, err := db.AdverseReviews(ctx, scope); err != nil || len(reviews) != 0 {
+				t.Fatalf("direct enqueue leaked reviews: %+v, %v", reviews, err)
+			}
+			if err := db.Transact(ctx, func(tx tender.Tx) error {
+				rows, err := tx.(tender.AdverseEvidenceReader).AdverseEvidence(scope, "processor", "account", "payment")
+				if err != nil || len(rows) != 0 {
+					t.Fatalf("direct enqueue became evidence: %+v, %v", rows, err)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 

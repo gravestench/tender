@@ -7,7 +7,10 @@ import (
 	"github.com/gravestench/tender"
 )
 
-func (t *transaction) EnqueueAdverse(n tender.AdverseNotice) error {
+func (t *transaction) EnqueueAdverse(n tender.AdverseNotice, claim tender.AdverseClaim) error {
+	if t.processing == nil || !claim.ValidFor(*t.processing, n) {
+		return tender.ErrConflict
+	}
 	if err := n.Validate(); err != nil {
 		return err
 	}

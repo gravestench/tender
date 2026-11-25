@@ -23,6 +23,7 @@ type inboxEvent struct {
 }
 
 type memoryTx struct {
+	processing      *tender.VerifiedEventKey
 	events          map[tender.VerifiedEventKey]inboxEvent
 	payments        map[key]tender.Payment
 	operations      map[key]tender.OperationRecord
@@ -256,6 +257,9 @@ func (t *memoryTx) InsertVerifiedEvent(key tender.VerifiedEventKey, evidence jso
 }
 
 func (t *memoryTx) ProcessVerifiedEvent(key tender.VerifiedEventKey, _ time.Time, apply func(json.RawMessage) error) error {
+	if t.processing != nil {
+		return tender.ErrConflict
+	}
 	event, found := t.events[key]
 	if !found {
 		return tender.ErrNotFound
@@ -263,6 +267,8 @@ func (t *memoryTx) ProcessVerifiedEvent(key tender.VerifiedEventKey, _ time.Time
 	if event.processed {
 		return nil
 	}
+	t.processing = &key
+	defer func() { t.processing = nil }()
 	if err := apply(slices.Clone(event.evidence)); err != nil {
 		return err
 	}
@@ -295,7 +301,10 @@ func (m *Memory) CaptureFailures(ctx context.Context, scope tender.Scope) ([]ten
 	return notices, nil
 }
 
-func (t *memoryTx) EnqueueAdverse(n tender.AdverseNotice) error {
+func (t *memoryTx) EnqueueAdverse(n tender.AdverseNotice, claim tender.AdverseClaim) error {
+	if t.processing == nil || !claim.ValidFor(*t.processing, n) {
+		return tender.ErrConflict
+	}
 	if err := n.Validate(); err != nil {
 		return err
 	}
