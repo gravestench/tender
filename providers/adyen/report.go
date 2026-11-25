@@ -24,7 +24,7 @@ const (
 
 var reportOpaque = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,200}$`)
 var reportPSP = regexp.MustCompile(`^[A-Za-z0-9]{1,16}$`)
-var payoutDescription = regexp.MustCompile(`^(TX[A-Za-z0-9]+XT) batch ([0-9]+), .+$`)
+var payoutDescription = regexp.MustCompile(`^(TX[A-Za-z0-9]+XT) batch ([0-9]+)(, | ).+$`)
 
 func cardReportIdentity(f map[string]string, observedAt time.Time) (account, batch, part, section string, err error) {
 	account, batch, part, section = f["Merchant Account"], f["Batch Number"], f[sourcePartKey], f[sourceSectionKey]
@@ -211,11 +211,12 @@ func ProjectPayout(f map[string]string, observedAt time.Time) (tender.PayoutLine
 	}
 	description := f["Modification Reference"]
 	matches := payoutDescription.FindStringSubmatch(description)
-	if len(description) > 256 || len(matches) != 3 || matches[2] != batch {
+	if len(description) > 256 || len(matches) != 4 || matches[2] != batch {
 		return tender.PayoutLine{}, tender.ErrValidation
 	}
-	accountDescription := matches[1] + " batch " + batch + ", " + account
-	if description != accountDescription && description != accountDescription+" batch "+batch+", "+account {
+	base := matches[1] + " batch " + batch
+	accountDescription := base + ", " + account
+	if description != accountDescription && description != base+" "+account && description != accountDescription+" batch "+batch+", "+account {
 		return tender.PayoutLine{}, tender.ErrValidation
 	}
 	amount, err := cardMinor(f["Net Debit (NC)"], false)

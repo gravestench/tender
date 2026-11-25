@@ -95,12 +95,23 @@ func TestProjectPayout(t *testing.T) {
 	if got, err := ProjectPayout(repeated, time.Now()); err != nil || got.PayoutReference != line.PayoutReference {
 		t.Fatalf("documented repeated account and batch: %+v, %v", got, err)
 	}
+	noComma := map[string]string{}
+	for k, v := range f {
+		noComma[k] = v
+	}
+	// Adyen's transaction-level reconciliation example omits the comma.
+	noComma["Modification Reference"] = "TX4313726XT batch 42 TestMerchant"
+	if got, err := ProjectPayout(noComma, time.Now()); err != nil || got.PayoutReference != line.PayoutReference || got.AmountMinor != line.AmountMinor {
+		t.Fatalf("documented no-comma payout: %+v, %v", got, err)
+	}
 	for _, bad := range []func(map[string]string){
 		func(m map[string]string) { m["Net Credit (NC)"] = "94.50"; delete(m, "Net Debit (NC)") },
 		func(m map[string]string) { m["Modification Reference"] = "batch 42, TestMerchant" },
 		func(m map[string]string) { m["Modification Reference"] = "TX4313726XT batch 43, TestMerchant" },
 		func(m map[string]string) { m["Merchant Account"] = "Other" },
 		func(m map[string]string) { m["Modification Reference"] = "TX4313726XT batch 42, TestMerchantEvil" },
+		func(m map[string]string) { m["Modification Reference"] = "TX4313726XT batch 42 TestMerchantEvil" },
+		func(m map[string]string) { m["Modification Reference"] = "TX4313726XT batch 43 TestMerchant" },
 		func(m map[string]string) {
 			m["Modification Reference"] = "TX4313726XT batch 42, TestMerchant batch 43, TestMerchant"
 		},
