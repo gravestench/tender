@@ -200,13 +200,16 @@ func (h *Adyen) Process(ctx context.Context, id string) error {
 	if strings.HasPrefix(id, "REFUND_FAILED.") {
 		return h.processAdverse(ctx, id)
 	}
-	err := h.processObservation(ctx, id)
-	// ACH CHARGEBACK changes ACH funds through its own signed-event path.
-	// A card CHARGEBACK is unsupported there and instead queues a review-only
-	// notice. The first transaction rolls back before the adverse path runs.
-	if strings.HasPrefix(id, "CHARGEBACK.") && errors.Is(err, tender.ErrUnsupported) {
-		return h.processAdverse(ctx, id)
+	if strings.HasPrefix(id, "CHARGEBACK.") {
+		// ACH returns update funds and enqueue review in the same receipt
+		// transaction. Card disputes remain notice-only.
+		err := h.processACHReturn(ctx, id)
+		if errors.Is(err, tender.ErrUnsupported) {
+			return h.processAdverse(ctx, id)
+		}
+		return err
 	}
+	err := h.processObservation(ctx, id)
 	return err
 }
 

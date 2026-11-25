@@ -148,35 +148,72 @@ func (e *Engine) ProcessVerifiedAdverseEvent(ctx context.Context, id string, pro
 			if err != nil {
 				return err
 			}
-			if err := n.Validate(); err != nil {
-				return err
-			}
-			if n.Key() != key {
-				return fmt.Errorf("%w: adverse receipt identity mismatch", ErrConflict)
-			}
-			p, err := tx.Payment(n.Scope, n.PaymentID)
+			return e.enqueueVerifiedAdverse(tx, review, key, verifiedKey, n)
+		})
+	})
+}
+
+// ProcessVerifiedEventWithAdverse applies a verified financial update and its
+// review notice in one inbox transaction. A failed correlation rolls back both.
+func (e *Engine) ProcessVerifiedEventWithAdverse(ctx context.Context, id string, project func(EventRecords, json.RawMessage) (VerifiedEvent, AdverseNotice, error)) error {
+	if !boundedOpaque(id, 200) || project == nil {
+		return ErrValidation
+	}
+	key := VerifiedEventKey{Scope: e.config.Scope, Provider: e.config.ProviderName, MerchantAccount: e.config.MerchantAccount, ID: id}
+	adverseKey := AdverseKey{Scope: key.Scope, Provider: key.Provider, MerchantAccount: key.MerchantAccount, ProviderEventID: id}
+	return e.config.Store.Transact(ctx, func(tx Tx) error {
+		inbox, ok := tx.(VerifiedEventTx)
+		if !ok {
+			return ErrUnsupported
+		}
+		review, ok := tx.(AdverseReviewTx)
+		if !ok {
+			return ErrUnsupported
+		}
+		return inbox.ProcessVerifiedEvent(key, e.config.Now().UTC(), func(raw json.RawMessage) error {
+			event, notice, err := project(tx, raw)
 			if err != nil {
 				return err
 			}
-			if err := e.route(p); err != nil {
+			if event.ID != id || event.Provider != key.Provider || event.Observation.PaymentID != notice.PaymentID {
+				return fmt.Errorf("%w: verified event identity does not match inbox", ErrConflict)
+			}
+			if _, err := e.applyTx(tx, state{}, event.Observation, "webhook"); err != nil {
 				return err
 			}
-			if p.ProviderReference == "" || n.OriginalReference != p.ProviderReference ||
-				n.Amount.Currency != p.Amount.Currency || n.Amount.Minor > p.Amount.Minor {
-				return fmt.Errorf("%w: adverse payment correlation mismatch", ErrConflict)
-			}
-			if n.OperationID != "" {
-				op, err := tx.Operation(n.Scope, n.OperationID)
-				if err != nil {
-					return err
-				}
-				if op.PaymentID != p.ID || op.AttemptID != p.AttemptID ||
-					op.ProviderReference == "" || op.ProviderReference != n.ModificationReference {
-					return fmt.Errorf("%w: adverse operation correlation mismatch", ErrConflict)
-				}
-			}
-			n.ObservedAt = n.ObservedAt.Round(0).UTC()
-			return review.EnqueueAdverse(n, AdverseClaim{key: verifiedKey, notice: n, valid: true})
+			return e.enqueueVerifiedAdverse(tx, review, adverseKey, key, notice)
 		})
 	})
+}
+
+func (e *Engine) enqueueVerifiedAdverse(tx Tx, review AdverseReviewTx, key AdverseKey, verifiedKey VerifiedEventKey, n AdverseNotice) error {
+	if err := n.Validate(); err != nil {
+		return err
+	}
+	if n.Key() != key {
+		return fmt.Errorf("%w: adverse receipt identity mismatch", ErrConflict)
+	}
+	p, err := tx.Payment(n.Scope, n.PaymentID)
+	if err != nil {
+		return err
+	}
+	if err := e.route(p); err != nil {
+		return err
+	}
+	if p.ProviderReference == "" || n.OriginalReference != p.ProviderReference ||
+		n.Amount.Currency != p.Amount.Currency || n.Amount.Minor > p.Amount.Minor {
+		return fmt.Errorf("%w: adverse payment correlation mismatch", ErrConflict)
+	}
+	if n.OperationID != "" {
+		op, err := tx.Operation(n.Scope, n.OperationID)
+		if err != nil {
+			return err
+		}
+		if op.PaymentID != p.ID || op.AttemptID != p.AttemptID ||
+			op.ProviderReference == "" || op.ProviderReference != n.ModificationReference {
+			return fmt.Errorf("%w: adverse operation correlation mismatch", ErrConflict)
+		}
+	}
+	n.ObservedAt = n.ObservedAt.Round(0).UTC()
+	return review.EnqueueAdverse(n, AdverseClaim{key: verifiedKey, notice: n, valid: true})
 }

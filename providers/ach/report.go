@@ -174,6 +174,13 @@ func ApplySettlement(ctx context.Context, db tender.Store, engine *tender.Engine
 					return tender.VerifiedEvent{}, err
 				}
 				if held {
+					confirmed, err := processedReturn(tx, p, l, "")
+					if err != nil {
+						return tender.VerifiedEvent{}, err
+					}
+					if !confirmed {
+						return tender.VerifiedEvent{}, tender.ErrConflict
+					}
 					snap.Funds.Returned = p.Amount.Minor
 				}
 			}
@@ -182,7 +189,11 @@ func ApplySettlement(ctx context.Context, db tender.Store, engine *tender.Engine
 			if err != nil {
 				return tender.VerifiedEvent{}, err
 			}
-			if !found {
+			confirmed, err := processedReturn(tx, p, l, l.Modification)
+			if err != nil {
+				return tender.VerifiedEvent{}, err
+			}
+			if !found || !confirmed {
 				return tender.VerifiedEvent{}, tender.ErrConflict
 			}
 			snap.Funds.Returned = p.Amount.Minor
@@ -200,6 +211,29 @@ func ApplySettlement(ctx context.Context, db tender.Store, engine *tender.Engine
 		}
 		return tender.VerifiedEvent{ID: id, Provider: "adyen", Observation: tender.Observation{Scope: scope, PaymentID: p.ID, AttemptID: p.AttemptID, OperationID: op.ID, ProviderReference: l.PSP, MerchantAccount: account, Amount: p.Amount, Status: tender.OperationSucceeded, Snapshot: snap}}, nil
 	})
+}
+
+// A received HMAC-signed return fences fulfillment immediately, but its report
+// cannot project returned funds until the same receipt has committed a durable
+// review notice. The evidence reader omits unprocessed or forged notices.
+func processedReturn(tx tender.EventRecords, p tender.Payment, l SettlementLine, modification string) (bool, error) {
+	reader, ok := tx.(tender.AdverseEvidenceReader)
+	if !ok {
+		return false, tender.ErrUnsupported
+	}
+	notices, err := reader.AdverseEvidence(p.Scope, p.Provider, p.MerchantAccount, p.ID)
+	if err != nil {
+		return false, err
+	}
+	for _, n := range notices {
+		if n.Scope == p.Scope && n.Provider == p.Provider && n.MerchantAccount == p.MerchantAccount && n.PaymentID == p.ID &&
+			n.Kind == "returned" && n.OriginalReference == l.PSP && n.Amount == p.Amount &&
+			n.ModificationReference != "" && n.ProviderReference == n.ModificationReference &&
+			(modification == "" || n.ModificationReference == modification) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // Signed receipts and report amounts must agree before applying funds. In

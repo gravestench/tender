@@ -323,7 +323,7 @@ func (a *app) read(ctx context.Context, o order) (orderStatus, bool, error) {
 		return st, false, errors.New("order binding changed")
 	}
 	st.PaymentID, st.Status = p.ID, string(p.Status)
-	if a.card != nil || mockCheckoutInstallers[a.provider] != nil {
+	if a.card != nil || mockCheckoutInstallers[a.provider] != nil || a.market.Method == tender.MethodACH {
 		st.Funds = &p.Funds
 	}
 	if a.ledger != nil {

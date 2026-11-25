@@ -80,8 +80,12 @@ FOR UPDATE OF n,p`, a.scope.MerchantID, a.scope.Environment, o.PaymentID, o.ID).
 	if err = json.Unmarshal(raw, &p); err != nil {
 		return err
 	}
-	if p.Market != a.market || p.Provider != a.provider || p.MerchantAccount != a.account || p.Amount != o.Total || p.Status != tender.PaymentCaptured ||
-		p.Funds.Captured != o.Total.Minor || p.Funds.Refunded != 0 || p.Funds.Returned != 0 || p.Funds.Disputed != 0 {
+	collected := p.Status == tender.PaymentCaptured && p.Funds.Captured == o.Total.Minor
+	if a.market.Method == tender.MethodACH {
+		collected = p.Status == tender.PaymentSettled && p.VerifiedMethod == tender.MethodACH && p.Funds.Settled == o.Total.Minor
+	}
+	if p.Market != a.market || p.Provider != a.provider || p.MerchantAccount != a.account || p.Amount != o.Total || !collected ||
+		p.Funds.Refunded != 0 || p.Funds.Returned != 0 || p.Funds.Disputed != 0 {
 		return nil // Hold the notice for host review after any conflicting facts.
 	}
 	if p.Provider == "adyen" {
@@ -100,7 +104,7 @@ FOR UPDATE OF n,p`, a.scope.MerchantID, a.scope.Environment, o.PaymentID, o.ID).
 		err = tx.QueryRowContext(ctx, `SELECT EXISTS (
  SELECT FROM tender_provider_events
  WHERE merchant_id=$1 AND environment=$2 AND provider='adyen' AND merchant_account=$3
- AND evidence->>'eventCode'='CAPTURE_FAILED' AND evidence->>'originalReference'=$4
+ AND evidence->>'eventCode' IN ('CAPTURE_FAILED','CHARGEBACK') AND evidence->>'originalReference'=$4
  AND evidence#>>'{amount,currency}'=$5)`, p.Scope.MerchantID, p.Scope.Environment, p.MerchantAccount, p.ProviderReference, p.Amount.Currency).Scan(&adverse)
 		if err != nil || adverse {
 			return err

@@ -8,15 +8,167 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"testing"
+	"time"
 
 	"github.com/gravestench/tender"
 	"github.com/gravestench/tender/mockserver"
 	"github.com/gravestench/tender/providers/adyen"
 	"github.com/gravestench/tender/store"
 )
+
+// A real independent host process owns checkout, the signed inbox, settlement
+// projection, fulfillment outbox and review ledger. Only opaque fixture consent
+// results cross the browser boundary; no bank account fields enter the host.
+func TestACHDurableReturn(t *testing.T) {
+	for _, tc := range []struct {
+		name, decision, fixture string
+		returnFirst             bool
+	}{
+		{"consent denied", "deny", "", false},
+		{"validation refused", "approve", "validation-refusal", false},
+		{"bank pending", "approve", "pending", false},
+		{"settled then returned", "approve", "", false},
+		{"return before settlement", "approve", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dsn, schema, cfg := demoSchema(t)
+			opts := []string{"TENDER_CONSUMER_PROVIDER=adyen_ach", "TENDER_ACH_MOCK_RESULT=" + tc.fixture, "TENDER_CONSUMER_OPERATOR_KEY=" + operatorFixture, "TENDER_CONSUMER_DATABASE_URL=" + dsn, "TENDER_CONSUMER_SCHEMA=" + schema}
+			var id string
+			t.Run("host", func(t *testing.T) {
+				d := launch(t, opts...)
+				c := client(t, d.Origin)
+				if got := request(t, c, "POST", d.Origin+"/simulator/v72/sessions", "", nil); got.status != 404 {
+					t.Fatalf("shopper reached the private ACH fixture: %d", got.status)
+				}
+				p := request(t, c, "GET", d.Guest, "", nil)
+				target := d.Origin + p.path
+				form := url.Values{"csrf": {token(t, p)}}
+				if got := request(t, c, "POST", target+"/ach/start", d.Origin, form); got.status != 200 {
+					t.Fatalf("start ACH: %d %s", got.status, got.body)
+				}
+				if got := status(t, c, target); got.Status != "requires_action" || got.Fulfilled {
+					t.Fatalf("consent pending: %+v", got)
+				}
+				if got := request(t, c, "POST", target+"/ach/consent/approve", d.Origin, url.Values{"csrf": {token(t, p)}, "accountNumber": {"synthetic-sentinel"}}); got.status != 400 {
+					t.Fatalf("host accepted a bank account field: %d", got.status)
+				}
+				if got := request(t, c, "POST", target+"/ach/consent/"+tc.decision, d.Origin, form); got.status != 200 {
+					t.Fatalf("consent: %d %s", got.status, got.body)
+				}
+				got := status(t, c, target)
+				id = got.PaymentID
+				for _, op := range []string{"void", "refund"} {
+					if code := operatorRequest(t, c, d.Origin+"/operator/ach/orders/"+got.OrderID+"/"+op); code != 409 {
+						t.Fatalf("unsupported ACH %s returned %d", op, code)
+					}
+				}
+				if tc.decision == "deny" || tc.fixture == "validation-refusal" {
+					if got.Status != "declined" || got.Fulfilled {
+						t.Fatalf("failed consent collected: %+v", got)
+					}
+					return
+				}
+				if got.Status != "pending" || got.Fulfilled {
+					t.Fatalf("bank debit must await settlement: %+v", got)
+				}
+				if tc.fixture == "pending" {
+					return
+				}
+				settle := d.Origin + "/operator/ach/orders/" + got.OrderID + "/settle"
+				returnURL := d.Origin + "/operator/ach/orders/" + got.OrderID + "/return"
+				if got := request(t, c, "POST", settle, "", nil); got.status != 404 {
+					t.Fatalf("shopper reached settlement projection: %d", got.status)
+				}
+				if tc.returnFirst {
+					if code := operatorRequest(t, c, returnURL); code != 202 {
+						t.Fatalf("early return: %d", code)
+					}
+					if s := status(t, c, target); s.Fulfilled {
+						t.Fatalf("return before settlement fulfilled: %+v", s)
+					}
+				}
+				if code := operatorRequest(t, c, settle); code != 202 {
+					t.Fatalf("authenticated settlement: %d", code)
+				}
+				if tc.returnFirst {
+					waitACH(t, c, target, "returned", false)
+				} else {
+					waitACH(t, c, target, "settled", true)
+					for range 2 {
+						if code := operatorRequest(t, c, returnURL); code != 202 {
+							t.Fatalf("duplicate signed return: %d", code)
+						}
+					}
+					waitACH(t, c, target, "returned", true)
+				}
+			})
+			if t.Failed() || id == "" {
+				return
+			}
+			conn := inspectDemo(t, cfg, schema)
+			var deliveries, notices, returns, processed, consumed int
+			var reviewKind, reviewOriginal, reviewModification string
+			var reviewAmount int64
+			err := conn.QueryRow(t.Context(), `SELECT
+ (SELECT count(*) FROM consumer_fulfillments WHERE payment_id=$1),
+ (SELECT count(*) FROM tender_adverse_reviews WHERE payment_id=$1),
+ (SELECT count(*) FROM tender_provider_events WHERE event_id LIKE 'CHARGEBACK.%'),
+ (SELECT count(*) FROM tender_provider_events WHERE processed_at IS NOT NULL),
+ (SELECT count(*) FROM tender_outbox WHERE payment_id=$1 AND consumed_at IS NOT NULL)`, id).Scan(&deliveries, &notices, &returns, &processed, &consumed)
+			if err == nil && notices == 1 {
+				err = conn.QueryRow(t.Context(), `SELECT record->>'Kind',record->>'OriginalReference',record->>'ModificationReference',(record#>>'{Amount,Minor}')::bigint FROM tender_adverse_reviews WHERE payment_id=$1`, id).Scan(&reviewKind, &reviewOriginal, &reviewModification, &reviewAmount)
+			}
+			conn.Close(t.Context()) // PGlite serves one backend across the restart.
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.decision == "deny" || tc.fixture == "validation-refusal" || tc.fixture == "pending" {
+				if deliveries != 0 || notices != 0 {
+					t.Fatalf("uncollected ACH created host effect: deliveries=%d reviews=%d", deliveries, notices)
+				}
+				return
+			}
+			wantDelivery := 1
+			if tc.returnFirst {
+				wantDelivery = 0
+			}
+			if deliveries != wantDelivery || consumed != wantDelivery || notices != 1 || returns != 1 || processed < 2 || reviewKind != "returned" || reviewOriginal == "" || reviewModification == "" || reviewOriginal == reviewModification || reviewAmount != 2599 {
+				t.Fatalf("durable return: deliveries=%d consumed=%d reviews=%d return receipts=%d processed=%d kind=%s amount=%d", deliveries, consumed, notices, returns, processed, reviewKind, reviewAmount)
+			}
+			t.Run("restart", func(t *testing.T) {
+				d := launch(t, opts...)
+				c := client(t, d.Origin)
+				p := request(t, c, "GET", d.Guest, "", nil)
+				waitACH(t, c, d.Origin+p.path, "returned", wantDelivery == 1)
+			})
+			conn = inspectDemo(t, cfg, schema)
+			var afterReviews, afterDeliveries int
+			if err := conn.QueryRow(t.Context(), `SELECT (SELECT count(*) FROM tender_adverse_reviews WHERE payment_id=$1),(SELECT count(*) FROM consumer_fulfillments WHERE payment_id=$1)`, id).Scan(&afterReviews, &afterDeliveries); err != nil || afterReviews != 1 || afterDeliveries != wantDelivery {
+				t.Fatalf("restart duplicated compensation or delivery: reviews=%d deliveries=%d: %v", afterReviews, afterDeliveries, err)
+			}
+			conn.Close(t.Context())
+		})
+	}
+}
+
+func waitACH(t *testing.T, c *http.Client, target, state string, fulfilled bool) {
+	t.Helper()
+	deadline := time.Now().Add(8 * time.Second)
+	for {
+		got := status(t, c, target)
+		if got.Status == state && got.Fulfilled == fulfilled {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ACH wanted %s fulfilled=%v, got %+v", state, fulfilled, got)
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+}
 
 // Exercise the mock consent surface with a real browser. Its buttons submit a
 // fixture decision to the simulator. Only the opaque session result reaches checkout.
