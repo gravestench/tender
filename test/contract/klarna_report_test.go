@@ -56,36 +56,20 @@ func TestKlarnaReportReconcile(t *testing.T) {
 		return e
 	}
 	detail := func(typ, detailed, amount, capture, refund string) map[string]string {
-		return map[string]string{"type": typ, "detailed_type": detailed, "amount": amount, "order_id": "order-1", "capture_id": capture, "refund_id": refund, "payment_reference": "payout-1", "currency_code": "USD", "merchant_reference1": "cart-1", "Tender Payout Merchant ID": "K123456", "Tender Expected Merchant ID": "K123456", "Tender Payout Reference": "payout-1", "Tender Payout Settlement Type": "NET", "Tender Source Part ID": "part-1", "Tender Source Section ID": "section-1"}
+		return map[string]string{"type": typ, "detailed_type": detailed, "amount": amount, "order_id": "order-1", "capture_id": capture, "refund_id": refund, "payment_reference": "payout-1", "currency_code": "USD", "purchase_country": "US", "merchant_reference1": "cart-1", "Tender Payout Merchant ID": "K123456", "Tender Expected Merchant ID": "K123456", "Tender Payout Reference": "payout-1", "Tender Payout Settlement Type": "NET", "Tender Verified Product": "FIXED_AMOUNT", "Tender Verified Order ID": "order-1", "Tender Source Part ID": "part-1", "Tender Source Section ID": "section-1"}
 	}
-	var report tender.SettlementReport
-	report.ID, report.Feed = "klarna-net-1", tender.FeedHostVerified
-	for _, row := range []map[string]string{detail("SALE", "PURCHASE", "20000", "capture-1", ""), detail("SALE", "PURCHASE", "15000", "capture-2", ""), detail("RETURN", "PURCHASE_RETURN", "2500", "", "refund-1")} {
-		line, err := klarna.ProjectSettlement(row, now)
-		if err != nil {
-			t.Fatal(err)
-		}
-		report.Lines = append(report.Lines, line)
-	}
-	for _, row := range []map[string]string{detail("FEE", "PURCHASE_FEE_FIXED", "35", "capture-1", ""), detail("FEE", "PURCHASE_FEE_PERCENTAGE", "600", "capture-2", "")} {
-		fee, err := klarna.ProjectFee(row, now)
-		if err != nil {
-			t.Fatal(err)
-		}
-		report.Adjustments = append(report.Adjustments, fee)
-	}
+	rows := []map[string]string{detail("SALE", "PURCHASE", "20000", "capture-1", ""), detail("SALE", "PURCHASE", "15000", "capture-2", ""), detail("RETURN", "PURCHASE_RETURN", "2500", "", "refund-1"), detail("FEE", "PURCHASE_FEE_FIXED", "35", "capture-1", ""), detail("FEE", "PURCHASE_FEE_PERCENTAGE", "600", "capture-2", "")}
 	summary := map[string]string{"payment_reference": "payout-1", "merchant_id": "K123456", "currency_code": "USD", "merchant_settlement_type": "NET", "payout_date": "2026-11-25T12:00:00Z", "totals.sale_amount": "35000", "totals.return_amount": "2500", "totals.fee_amount": "635", "totals.settlement_amount": "31865", "Tender Expected Merchant ID": "K123456", "Tender Source Part ID": "part-1", "Tender Source Section ID": "section-1"}
 	for _, k := range []string{"commission_amount", "commission_reversal_amount", "repay_amount", "holdback_amount", "tax_amount", "fee_correction_amount", "reversal_amount", "release_amount", "charge_amount", "credit_amount", "fee_refund_amount", "tax_refund_amount", "deposit_amount", "opening_debt_balance_amount", "closing_debt_balance_amount"} {
 		summary["totals."+k] = "0"
 	}
-	payout, err := klarna.ProjectPayout(summary, now)
+	declared := int64(31865)
+	parts := []tender.ReportPart{{ID: "part-1", SectionID: "section-1", Digest: "host-authenticated-page-digest", Number: 1, TotalParts: 1, DeclaredRows: 6}}
+	sections := []tender.ReportSection{{ID: "section-1", BatchID: "payout-1", Currency: "USD", Number: 1, TotalSections: 1, DeclaredRows: 6, DeclaredNetMinor: &declared, DeclaredPayoutMinor: &declared}}
+	report, err := klarna.ProjectNETReport("klarna-net-1", summary, rows, parts, sections, now)
 	if err != nil {
 		t.Fatal(err)
 	}
-	report.Payouts = []tender.PayoutLine{payout}
-	declared := int64(31865)
-	report.Parts = []tender.ReportPart{{ID: "part-1", SectionID: "section-1", Digest: "host-authenticated-page-digest", Number: 1, TotalParts: 1, DeclaredRows: 6}}
-	report.Sections = []tender.ReportSection{{ID: "section-1", BatchID: "payout-1", Currency: "USD", Number: 1, TotalSections: 1, DeclaredRows: 6, DeclaredNetMinor: &declared, DeclaredPayoutMinor: &declared}}
 	run, err := engine(store).Reconcile(ctx, report)
 	if err != nil {
 		t.Fatal(err)

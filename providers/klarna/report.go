@@ -3,7 +3,9 @@ package klarna
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"math"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -21,6 +23,8 @@ const (
 	klarnaPayoutMerchantKey   = "Tender Payout Merchant ID"
 	klarnaPayoutReferenceKey  = "Tender Payout Reference"
 	klarnaSettlementTypeKey   = "Tender Payout Settlement Type"
+	klarnaVerifiedProductKey  = "Tender Verified Product"
+	klarnaVerifiedOrderKey    = "Tender Verified Order ID"
 )
 
 var klarnaReportID = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,200}$`)
@@ -49,7 +53,7 @@ func reportProvenance(f map[string]string, observedAt time.Time, detail bool) (p
 		return "", "", "", tender.ErrValidation
 	}
 	if detail {
-		if f[klarnaPayoutMerchantKey] != f[klarnaExpectedMerchantKey] || f[klarnaPayoutReferenceKey] != payout || f[klarnaSettlementTypeKey] != "NET" {
+		if f[klarnaPayoutMerchantKey] != f[klarnaExpectedMerchantKey] || f[klarnaPayoutReferenceKey] != payout || f[klarnaSettlementTypeKey] != "NET" || f[klarnaVerifiedProductKey] != "FIXED_AMOUNT" || f[klarnaVerifiedOrderKey] != f["order_id"] || f["purchase_country"] != "US" || f["initial_payment_method_type"] != "" && f["initial_payment_method_type"] != "FIXED_AMOUNT" {
 			return "", "", "", tender.ErrUnsupported
 		}
 	} else if f["merchant_id"] != f[klarnaExpectedMerchantKey] {
@@ -188,4 +192,83 @@ func ProjectPayout(f map[string]string, observedAt time.Time) (tender.PayoutLine
 		BatchID: payout, SourcePartID: part, SourceSectionID: section, Currency: "USD",
 		PayoutReference: payout, AmountMinor: settlement, ObservedAt: observedAt.UTC(),
 	}, nil
+}
+
+// ProjectNETReport is the payout-safe entry point. It projects every row of a
+// host-authenticated, fully paginated payout and binds each summary category
+// to its own rows before returning a report for Engine.Reconcile. The host
+// supplies authenticated page completeness claims as parts and sections.
+func ProjectNETReport(id string, summary map[string]string, rows []map[string]string, parts []tender.ReportPart, sections []tender.ReportSection, observedAt time.Time) (tender.SettlementReport, error) {
+	if !klarnaReportID.MatchString(id) || len(rows) == 0 || len(parts) == 0 || len(sections) == 0 {
+		return tender.SettlementReport{}, tender.ErrValidation
+	}
+	payout, err := ProjectPayout(summary, observedAt)
+	if err != nil {
+		return tender.SettlementReport{}, err
+	}
+	report := tender.SettlementReport{ID: id, Feed: tender.FeedHostVerified, Payouts: []tender.PayoutLine{payout}, Parts: slices.Clone(parts), Sections: slices.Clone(sections)}
+	sales := make(map[string]bool)
+	fees := make([]string, 0)
+	var saleTotal, returnTotal, feeTotal int64
+	add := func(sum *int64, amount int64) error {
+		if amount < 0 || *sum > math.MaxInt64-amount {
+			return tender.ErrValidation
+		}
+		*sum += amount
+		return nil
+	}
+	for _, row := range rows {
+		var amount int64
+		switch row["type"] {
+		case "SALE", "RETURN":
+			line, err := ProjectSettlement(row, observedAt)
+			if err != nil {
+				return tender.SettlementReport{}, err
+			}
+			report.Lines = append(report.Lines, line)
+			if line.Kind == tender.SettlementCaptured {
+				key := line.OriginalReference + "\x00" + line.ModificationReference
+				if sales[key] {
+					return tender.SettlementReport{}, tender.ErrConflict
+				}
+				sales[key] = true
+				amount = line.GrossMinor
+				err = add(&saleTotal, amount)
+			} else {
+				amount = -line.GrossMinor
+				err = add(&returnTotal, amount)
+			}
+			if err != nil {
+				return tender.SettlementReport{}, err
+			}
+		case "FEE":
+			fee, err := ProjectFee(row, observedAt)
+			if err != nil {
+				return tender.SettlementReport{}, err
+			}
+			report.Adjustments = append(report.Adjustments, fee)
+			fees = append(fees, row["order_id"]+"\x00"+row["capture_id"])
+			amount = -fee.SignedMinor
+			if err := add(&feeTotal, amount); err != nil {
+				return tender.SettlementReport{}, err
+			}
+		default:
+			return tender.SettlementReport{}, tender.ErrUnsupported
+		}
+	}
+	for _, key := range fees {
+		if !sales[key] {
+			return tender.SettlementReport{}, tender.ErrValidation
+		}
+	}
+	for _, category := range []struct {
+		name string
+		sum  int64
+	}{{"sale_amount", saleTotal}, {"return_amount", returnTotal}, {"fee_amount", feeTotal}} {
+		declared, err := minorInteger(summary["totals."+category.name], false)
+		if err != nil || declared != category.sum {
+			return tender.SettlementReport{}, tender.ErrValidation
+		}
+	}
+	return report, nil
 }

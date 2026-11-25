@@ -14,8 +14,8 @@ var reportTime = time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
 func TestProjectSettlement(t *testing.T) {
 	base := map[string]string{
 		"type": "SALE", "detailed_type": "PURCHASE", "amount": "20000", "order_id": "order-1", "capture_id": "capture-1", "refund_id": "",
-		"payment_reference": "payout-1", "currency_code": "USD", "merchant_reference1": "cart-1",
-		"Tender Payout Merchant ID": "K123456", "Tender Expected Merchant ID": "K123456", "Tender Payout Reference": "payout-1", "Tender Payout Settlement Type": "NET", "Tender Source Part ID": "part-1", "Tender Source Section ID": "section-1",
+		"payment_reference": "payout-1", "currency_code": "USD", "merchant_reference1": "cart-1", "purchase_country": "US",
+		"Tender Payout Merchant ID": "K123456", "Tender Expected Merchant ID": "K123456", "Tender Payout Reference": "payout-1", "Tender Payout Settlement Type": "NET", "Tender Verified Product": "FIXED_AMOUNT", "Tender Verified Order ID": "order-1", "Tender Source Part ID": "part-1", "Tender Source Section ID": "section-1",
 	}
 	clone := func() map[string]string {
 		c := make(map[string]string)
@@ -49,10 +49,14 @@ func TestProjectSettlement(t *testing.T) {
 		t.Fatalf("refund: %+v %v", returned, err)
 	}
 	for name, mutate := range map[string]func(map[string]string){
-		"missing capture": func(f map[string]string) { delete(f, "capture_id") },
-		"other merchant":  func(f map[string]string) { f["Tender Payout Merchant ID"] = "K654321" },
-		"other currency":  func(f map[string]string) { f["currency_code"] = "EUR" },
-		"gross variant":   func(f map[string]string) { f["Tender Payout Settlement Type"] = "GROSS" },
+		"missing capture":      func(f map[string]string) { delete(f, "capture_id") },
+		"other merchant":       func(f map[string]string) { f["Tender Payout Merchant ID"] = "K654321" },
+		"other currency":       func(f map[string]string) { f["currency_code"] = "EUR" },
+		"gross variant":        func(f map[string]string) { f["Tender Payout Settlement Type"] = "GROSS" },
+		"wrong country":        func(f map[string]string) { f["purchase_country"] = "PL" },
+		"direct debit":         func(f map[string]string) { f["initial_payment_method_type"] = "direct_debit" },
+		"missing product":      func(f map[string]string) { delete(f, "Tender Verified Product") },
+		"wrong verified order": func(f map[string]string) { f["Tender Verified Order ID"] = "other-order" },
 		"wrong payout": func(f map[string]string) {
 			f["payment_reference"] = "payout-2"
 			f["Tender Payout Reference"] = "payout-1"
@@ -81,7 +85,7 @@ func TestProjectSettlement(t *testing.T) {
 }
 
 func TestProjectSettlementFeeAndPayout(t *testing.T) {
-	fee := map[string]string{"type": "FEE", "detailed_type": "PURCHASE_FEE_FIXED", "amount": "35", "order_id": "order-1", "capture_id": "capture-1", "payment_reference": "payout-1", "currency_code": "USD", "Tender Payout Merchant ID": "K123456", "Tender Expected Merchant ID": "K123456", "Tender Payout Reference": "payout-1", "Tender Payout Settlement Type": "NET", "Tender Source Part ID": "part-1", "Tender Source Section ID": "section-1"}
+	fee := map[string]string{"type": "FEE", "detailed_type": "PURCHASE_FEE_FIXED", "amount": "35", "order_id": "order-1", "capture_id": "capture-1", "payment_reference": "payout-1", "currency_code": "USD", "purchase_country": "US", "Tender Payout Merchant ID": "K123456", "Tender Expected Merchant ID": "K123456", "Tender Payout Reference": "payout-1", "Tender Payout Settlement Type": "NET", "Tender Verified Product": "FIXED_AMOUNT", "Tender Verified Order ID": "order-1", "Tender Source Part ID": "part-1", "Tender Source Section ID": "section-1"}
 	a, err := ProjectFee(fee, reportTime)
 	if err != nil || a.SignedMinor != -35 || a.Type != "PURCHASE_FEE_FIXED:order-1:capture-1" || a.BatchID != "payout-1" {
 		t.Fatalf("fee: %+v %v", a, err)
@@ -112,5 +116,32 @@ func TestProjectSettlementFeeAndPayout(t *testing.T) {
 	payout["totals.new_movement_amount"] = "1"
 	if _, err := ProjectPayout(payout, reportTime); !errors.Is(err, tender.ErrUnsupported) {
 		t.Fatalf("unknown payout movement: %v", err)
+	}
+}
+
+func TestProjectNETReportCategoryTotals(t *testing.T) {
+	row := func(typ, detail, amount, capture string) map[string]string {
+		return map[string]string{"type": typ, "detailed_type": detail, "amount": amount, "order_id": "order-1", "capture_id": capture, "payment_reference": "payout-1", "currency_code": "USD", "purchase_country": "US", "Tender Payout Merchant ID": "K123456", "Tender Expected Merchant ID": "K123456", "Tender Payout Reference": "payout-1", "Tender Payout Settlement Type": "NET", "Tender Verified Product": "FIXED_AMOUNT", "Tender Verified Order ID": "order-1", "Tender Source Part ID": "part-1", "Tender Source Section ID": "section-1"}
+	}
+	summary := map[string]string{"payment_reference": "payout-1", "merchant_id": "K123456", "currency_code": "USD", "merchant_settlement_type": "NET", "payout_date": "2026-11-25T12:00:00Z", "totals.sale_amount": "20000", "totals.return_amount": "0", "totals.fee_amount": "35", "totals.settlement_amount": "19965", "Tender Expected Merchant ID": "K123456", "Tender Source Part ID": "part-1", "Tender Source Section ID": "section-1"}
+	for _, k := range []string{"commission_amount", "commission_reversal_amount", "repay_amount", "holdback_amount", "tax_amount", "fee_correction_amount", "reversal_amount", "release_amount", "charge_amount", "credit_amount", "fee_refund_amount", "tax_refund_amount", "deposit_amount", "opening_debt_balance_amount", "closing_debt_balance_amount"} {
+		summary["totals."+k] = "0"
+	}
+	rows := []map[string]string{row("SALE", "PURCHASE", "20000", "capture-1"), row("FEE", "PURCHASE_FEE_FIXED", "35", "capture-1")}
+	parts := []tender.ReportPart{{ID: "part-1", SectionID: "section-1", Digest: "digest", Number: 1, TotalParts: 1, DeclaredRows: 3}}
+	net := int64(19965)
+	sections := []tender.ReportSection{{ID: "section-1", BatchID: "payout-1", Currency: "USD", Number: 1, TotalSections: 1, DeclaredRows: 3, DeclaredNetMinor: &net, DeclaredPayoutMinor: &net}}
+	projected, err := ProjectNETReport("report-1", summary, rows, parts, sections, reportTime)
+	if err != nil || len(projected.Lines) != 1 || len(projected.Adjustments) != 1 || len(projected.Payouts) != 1 {
+		t.Fatalf("valid report: %+v %v", projected, err)
+	}
+	rows[0]["amount"], rows[1]["amount"] = "20100", "135" // Net stays 19965, category totals do not.
+	if _, err := ProjectNETReport("report-2", summary, rows, parts, sections, reportTime); !errors.Is(err, tender.ErrValidation) {
+		t.Fatalf("offsetting category changes: %v", err)
+	}
+	rows[0]["amount"], rows[1]["amount"] = "20000", "35"
+	rows[1]["capture_id"] = "capture-other"
+	if _, err := ProjectNETReport("report-3", summary, rows, parts, sections, reportTime); !errors.Is(err, tender.ErrValidation) {
+		t.Fatalf("unjoined fee: %v", err)
 	}
 }
