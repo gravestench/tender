@@ -231,13 +231,18 @@ func compareAccounting(input io.Reader, merchant, paymentPSP, ref, brand string,
 		return errors.New("invalid accounting CSV")
 	}
 	index := map[string]int{}
-	for _, col := range []string{"Merchant Account", "Psp Reference", "Merchant Reference", "Payment Method", "Record Type", "Payment Currency", "Authorised (PC)", "Captured (PC)", "Modification Psp Reference"} {
+	for _, col := range []string{"Merchant Account", "Psp Reference", "Merchant Reference", "Payment Method", "Record Type", "Payment Currency", "Authorised (PC)", "Captured (PC)", "Modification Psp Reference", "Booking Date (AMS)"} {
 		i := slices.Index(header, col)
-		if i < 0 {
+		if i < 0 || slices.Index(header[i+1:], col) >= 0 {
 			return fmt.Errorf("BLOCKED: include report column %q", col)
 		}
 		index[col] = i
 	}
+	ams, err := time.LoadLocation("Europe/Amsterdam")
+	if err != nil {
+		return errors.New("BLOCKED: Amsterdam report timezone unavailable")
+	}
+	now := time.Now()
 	// Captured (PC) is a clearing register. A SentForSettle credits it
 	// and Settled releases it. The corresponding refund movements have
 	// opposite signs. Use exact decimal arithmetic in payment currency.
@@ -266,6 +271,10 @@ func compareAccounting(input io.Reader, merchant, paymentPSP, ref, brand string,
 		get := func(col string) string { return row[index[col]] }
 		if get("Merchant Account") != merchant || get("Psp Reference") != paymentPSP {
 			continue
+		}
+		bookedAt, err := time.ParseInLocation("2006-01-02 15:04:05", get("Booking Date (AMS)"), ams)
+		if err != nil || !freshProviderTime(bookedAt, now) {
+			return errors.New("BLOCKED: matched accounting row has a stale or invalid Adyen booking date")
 		}
 		kind := get("Record Type")
 		want, ok := expected[kind]
@@ -318,13 +327,18 @@ func registerEquals(raw string, minor int64) bool {
 }
 
 func TestAccountingRegisterEvidence(t *testing.T) {
-	const header = "Merchant Account,Psp Reference,Merchant Reference,Payment Method,Record Type,Payment Currency,Authorised (PC),Captured (PC),Modification Psp Reference\n"
+	const header = "Merchant Account,Psp Reference,Merchant Reference,Payment Method,Record Type,Payment Currency,Authorised (PC),Captured (PC),Modification Psp Reference,Booking Date (AMS)\n"
 	const auth = "merchant,payment,order,visa,Authorised,USD,25.99,0.00,\n"
 	const capture = "merchant,payment,order,visa,SentForSettle,USD,-25.99,25.99,cap\n"
 	const refund = "merchant,payment,order,visa,SentForRefund,USD,0,-25.99,ref\n"
 	const refundAuth = "merchant,payment,order,visa,RefundAuthorised,USD,0,0,ref\n"
 	const bookedAuth = "merchant,payment,order,visa,RefundAuthorised,USD,-25.99,0,ref\n"
 	const releasedAuth = "merchant,payment,order,visa,SentForRefund,USD,25.99,-25.99,ref\n"
+	ams, err := time.LoadLocation("Europe/Amsterdam")
+	if err != nil {
+		t.Fatal(err)
+	}
+	date := time.Now().In(ams).Format("2006-01-02 15:04:05")
 	for _, tc := range []struct {
 		name, rows string
 		ok         bool
@@ -345,11 +359,53 @@ func TestAccountingRegisterEvidence(t *testing.T) {
 		{"settled register signs", auth + capture + refund + "merchant,payment,order,visa,Settled,USD,0,25.99,cap\n", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := compareAccounting(strings.NewReader(header+tc.rows), "merchant", "payment", "order", "visa", 2599, map[string]string{"CAPTURE": "cap", "REFUND": "ref"})
+			err := compareAccounting(strings.NewReader(header+strings.ReplaceAll(tc.rows, "\n", ","+date+"\n")), "merchant", "payment", "order", "visa", 2599, map[string]string{"CAPTURE": "cap", "REFUND": "ref"})
 			if (err == nil) != tc.ok {
 				t.Fatalf("accounting comparison error = %v", err)
 			}
 		})
+	}
+}
+
+func TestAccountingRequiresFreshProviderBookingOnEveryMatchedRow(t *testing.T) {
+	zone, err := time.LoadLocation("Europe/Amsterdam")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fresh := time.Now().In(zone).Format("2006-01-02 15:04:05")
+	const stale = "2020-01-02 03:04:05"
+	const header = "Merchant Account,Psp Reference,Merchant Reference,Payment Method,Record Type,Payment Currency,Authorised (PC),Captured (PC),Modification Psp Reference,Booking Date (AMS)\n"
+	rows := func(dates [3]string) string {
+		return header +
+			"merchant,payment,order,visa,Authorised,USD,25.99,0.00,," + dates[0] + "\n" +
+			"merchant,payment,order,visa,SentForSettle,USD,-25.99,25.99,cap," + dates[1] + "\n" +
+			"merchant,payment,order,visa,SentForRefund,USD,0,-25.99,ref," + dates[2] + "\n"
+	}
+	psps := map[string]string{"CAPTURE": "cap", "REFUND": "ref"}
+	for _, tc := range []struct {
+		name  string
+		dates [3]string
+		valid bool
+	}{
+		{"fresh", [3]string{fresh, fresh, fresh}, true},
+		{"stale authorization", [3]string{stale, fresh, fresh}, false},
+		{"stale capture", [3]string{fresh, stale, fresh}, false},
+		{"stale refund", [3]string{fresh, fresh, stale}, false},
+		{"future refund", [3]string{fresh, fresh, time.Now().In(zone).Add(6 * time.Minute).Format("2006-01-02 15:04:05")}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := compareAccounting(strings.NewReader(rows(tc.dates)), "merchant", "payment", "order", "visa", 2599, psps)
+			if (err == nil) != tc.valid {
+				t.Fatalf("booking date check = %v", err)
+			}
+		})
+	}
+	const noDate = "Merchant Account,Psp Reference,Merchant Reference,Payment Method,Record Type,Payment Currency,Authorised (PC),Captured (PC),Modification Psp Reference\n" +
+		"merchant,payment,order,visa,Authorised,USD,25.99,0.00,\n" +
+		"merchant,payment,order,visa,SentForSettle,USD,-25.99,25.99,cap\n" +
+		"merchant,payment,order,visa,SentForRefund,USD,0,-25.99,ref\n"
+	if err := compareAccounting(strings.NewReader(noDate), "merchant", "payment", "order", "visa", 2599, psps); err == nil {
+		t.Fatal("accepted accounting rows without a provider booking date")
 	}
 }
 
