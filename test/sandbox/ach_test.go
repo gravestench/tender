@@ -22,13 +22,17 @@ import (
 
 // This protected probe submits only Adyen's published TEST fixtures. The Go
 // process handles session setup, while the browser submits directly to Adyen.
+func validACHOrigin(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && u.Scheme == "https" && u.User == nil && u.Host != "" && raw == "https://"+u.Host && !mockHost(u.Hostname())
+}
+
 func TestACHSandboxSessions(t *testing.T) {
 	if os.Getenv("PAYMENTS_ENV") != "sandbox" || os.Getenv("TENDER_ADYEN_API_KEY") == "" || os.Getenv("TENDER_ADYEN_MERCHANT_ACCOUNT") == "" || !strings.HasPrefix(os.Getenv("TENDER_ADYEN_CLIENT_KEY"), "test_") {
 		t.Fatal("BLOCKED: select PAYMENTS_ENV=sandbox and supply the enabled Adyen test merchant, API key and public test client key")
 	}
 	origin := os.Getenv("TENDER_ACH_TEST_ORIGIN")
-	u, err := url.Parse(origin)
-	if err != nil || u.Scheme != "https" || u.User != nil || u.Host == "" || origin != "https://"+u.Host || os.Getenv("TENDER_ACH_GIACT_ENABLED") != "1" {
+	if !validACHOrigin(origin) || os.Getenv("TENDER_ACH_GIACT_ENABLED") != "1" {
 		t.Fatal("BLOCKED: supply a registered HTTPS test origin and merchant-enabled consumer WEB giact validation")
 	}
 	merchant := os.Getenv("TENDER_ADYEN_MERCHANT_ACCOUNT")
@@ -126,4 +130,13 @@ func TestACHSandboxReport(t *testing.T) {
 		}
 	}
 	t.Fatal("BLOCKED: two report rows alone do not prove a host-issued qualified session, approved mandate, signed event and same-order browser path")
+}
+
+func TestACHSandboxRejectsMockOrigin(t *testing.T) {
+	if !validACHOrigin("https://checkout.merchant.com") {
+		t.Fatal("rejected a public HTTPS origin")
+	}
+	if validACHOrigin("https://127.0.0.1") || validACHOrigin("https://merchant.example.test") {
+		t.Fatal("accepted a mock browser origin for official ACH qualification")
+	}
 }
