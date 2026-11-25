@@ -92,10 +92,10 @@ const (
 )
 
 type ReconciliationResult struct {
-	LineID, PaymentID, ExpectedCurrency, AttemptDigest string
-	Outcome                                            ReconciliationOutcome
-	ExpectedMinor                                      int64
-	Line                                               SettlementLine
+	LineID, PaymentID, ExpectedCurrency, AttemptDigest, AdverseEventID string
+	Outcome                                                            ReconciliationOutcome
+	ExpectedMinor                                                      int64
+	Line                                                               SettlementLine
 }
 
 type ReconciliationRun struct {
@@ -152,6 +152,19 @@ type ReconciliationTx interface {
 	InsertReconciliationPayoutInput(Scope, string, string, string, SettlementReport) error
 	AppendPayoutReconciliationResult(Scope, string, string, string, PayoutReconciliationResult) error
 	PayoutReconciliationResults(Scope, string, string, string) ([]PayoutReconciliationResult, error)
+}
+
+// ReturnEvidenceClaim binds one processed adverse receipt to one report row.
+// A provider return must not match again under a different report identity.
+type ReturnEvidenceClaim struct {
+	ProviderEventID, LineID string
+}
+
+// ReturnEvidenceClaimTx atomically claims a complete set in the surrounding
+// store transaction. A conflicting owner returns false without inserting any
+// claims. The same report and line may replay its prior claim.
+type ReturnEvidenceClaimTx interface {
+	ClaimReturnEvidenceSet(Scope, string, string, string, []ReturnEvidenceClaim) (bool, error)
 }
 
 func validSettlementLine(l SettlementLine) error {
@@ -310,7 +323,7 @@ func (e *Engine) Reconcile(ctx context.Context, report SettlementReport) (Reconc
 			for _, r := range history {
 				latest[r.LineID] = r
 			}
-			results, err := e.matchSettlementLines(base, tx, report.Lines)
+			results, payoutResults, err := e.reportResults(base, tx, report)
 			if err != nil {
 				return err
 			}
@@ -321,10 +334,6 @@ func (e *Engine) Reconcile(ctx context.Context, report SettlementReport) (Reconc
 					}
 				}
 				prior.Results = append(prior.Results, result)
-			}
-			payoutResults, err := reconcilePayouts(report, results)
-			if err != nil {
-				return err
 			}
 			priorPayouts, err := tx.PayoutReconciliationResults(scope, provider, account, report.ID)
 			if err != nil {
@@ -360,7 +369,7 @@ func (e *Engine) Reconcile(ctx context.Context, report SettlementReport) (Reconc
 				return err
 			}
 		}
-		results, err := e.matchSettlementLines(base, tx, report.Lines)
+		results, payoutResults, err := e.reportResults(base, tx, report)
 		if err != nil {
 			return err
 		}
@@ -369,10 +378,6 @@ func (e *Engine) Reconcile(ctx context.Context, report SettlementReport) (Reconc
 				return err
 			}
 			run.Results = append(run.Results, result)
-		}
-		payoutResults, err := reconcilePayouts(report, run.Results)
-		if err != nil {
-			return err
 		}
 		for _, result := range payoutResults {
 			if err := tx.AppendPayoutReconciliationResult(scope, provider, account, report.ID, result); err != nil {
@@ -406,6 +411,61 @@ func operationalDiscrepancyCounts(run ReconciliationRun) (int, int) {
 		}
 	}
 	return lines, payouts
+}
+
+// reportResults claims each verified return identity only after the entire
+// projected report is internally matched. A conflicting claim demotes the
+// returns and any affected payout in this same transaction.
+func (e *Engine) reportResults(base Tx, tx ReconciliationTx, report SettlementReport) ([]ReconciliationResult, []PayoutReconciliationResult, error) {
+	results, err := e.matchSettlementLines(base, tx, report.Lines)
+	if err != nil {
+		return nil, nil, err
+	}
+	payouts, err := reconcilePayouts(report, results)
+	if err != nil {
+		return nil, nil, err
+	}
+	claims := make([]ReturnEvidenceClaim, 0)
+	complete := true
+	for _, result := range results {
+		if result.Outcome != ReconciliationMatched {
+			complete = false
+		}
+		if result.Line.Kind == SettlementReturned && result.Outcome == ReconciliationMatched {
+			if !validReportID(result.AdverseEventID) {
+				complete = false
+			}
+			claims = append(claims, ReturnEvidenceClaim{ProviderEventID: result.AdverseEventID, LineID: result.LineID})
+		}
+	}
+	for _, payout := range payouts {
+		if payout.Outcome != PayoutMatched {
+			complete = false
+		}
+	}
+	if len(claims) == 0 {
+		return results, payouts, nil
+	}
+	if complete {
+		claimTx, ok := tx.(ReturnEvidenceClaimTx)
+		if !ok {
+			return nil, nil, ErrUnsupported
+		}
+		claimed, err := claimTx.ClaimReturnEvidenceSet(e.config.Scope, e.config.ProviderName, e.config.MerchantAccount, report.ID, claims)
+		if err != nil {
+			return nil, nil, err
+		}
+		if claimed {
+			return results, payouts, nil
+		}
+	}
+	for i := range results {
+		if results[i].Line.Kind == SettlementReturned && results[i].Outcome == ReconciliationMatched {
+			results[i].Outcome = ReconciliationUnconfirmed
+		}
+	}
+	payouts, err = reconcilePayouts(report, results)
+	return results, payouts, err
 }
 
 // Each successful modification operation or verified adverse identity can
@@ -803,6 +863,23 @@ func (e *Engine) matchSettlementLine(tx ReconciliationTx, line SettlementLine) (
 			r.Outcome = ReconciliationUnconfirmed
 			return r, nil
 		}
+		// Adyen sometimes puts the capture PSP in a Chargeback report row.
+		// Require a full succeeded capture on this payment before considering
+		// a separately verified dispute for that variant.
+		captureVariant := false
+		_, modification, resolveErr := tx.ResolveSettlementReference(e.config.Scope, e.config.ProviderName, e.config.MerchantAccount, line.ModificationReference)
+		if resolveErr == nil {
+			if e.config.ProviderName != "adyen" || (p.Market.Method != MethodVisa && p.Market.Method != MethodMastercard) ||
+				modification.ID == "" || modification.PaymentID != p.ID || modification.AttemptID != p.AttemptID ||
+				modification.Kind != OpCapture || modification.Status != OperationSucceeded || modification.Amount.Currency != line.Currency ||
+				modification.Amount.Minor != -line.GrossMinor || p.Funds.Captured != modification.Amount.Minor {
+				r.Outcome = ReconciliationUnconfirmed
+				return r, nil
+			}
+			captureVariant = true
+		} else if !errors.Is(resolveErr, ErrNotFound) {
+			return r, resolveErr
+		}
 		reader, ok := tx.(AdverseEvidenceReader)
 		if !ok {
 			r.Outcome = ReconciliationUnconfirmed
@@ -812,21 +889,31 @@ func (e *Engine) matchSettlementLine(tx ReconciliationTx, line SettlementLine) (
 		if err != nil {
 			return r, err
 		}
-		matched := false
+		matches := 0
+		var adverseEventID string
 		for _, notice := range notices {
-			if notice.Scope != p.Scope || notice.Provider != p.Provider || notice.MerchantAccount != p.MerchantAccount || notice.PaymentID != p.ID || notice.OriginalReference != line.OriginalReference || notice.ModificationReference != line.ModificationReference || notice.Amount.Currency != line.Currency || notice.Amount.Minor != -line.GrossMinor {
+			if notice.Scope != p.Scope || notice.Provider != p.Provider || notice.MerchantAccount != p.MerchantAccount || notice.PaymentID != p.ID || notice.OriginalReference != line.OriginalReference || notice.Amount.Currency != line.Currency || notice.Amount.Minor != -line.GrossMinor {
 				continue
 			}
-			if notice.Kind == "returned" || notice.Kind == "chargeback" || notice.Kind == "reversal" {
-				matched = true
-				adverseExpected = notice.Amount.Minor
+			if captureVariant {
+				if notice.Kind != "chargeback" || notice.ModificationReference == line.ModificationReference || notice.ModificationReference == p.ProviderReference || notice.ModificationReference == "" || notice.ProviderReference != notice.ModificationReference {
+					continue
+				}
+			} else if notice.ModificationReference != line.ModificationReference || notice.Kind != "returned" && notice.Kind != "chargeback" && notice.Kind != "reversal" {
+				continue
+			}
+			matches++
+			adverseExpected = notice.Amount.Minor
+			adverseEventID = notice.ProviderEventID
+			if matches > 1 {
 				break
 			}
 		}
-		if !matched {
+		if matches != 1 {
 			r.Outcome = ReconciliationUnconfirmed
 			return r, nil
 		}
+		r.AdverseEventID = adverseEventID
 	}
 	var expected int64
 	switch line.Kind {

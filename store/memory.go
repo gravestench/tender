@@ -22,6 +22,11 @@ type inboxEvent struct {
 	processed  bool
 	receivedAt time.Time
 }
+type returnClaimKey struct {
+	scope                      tender.Scope
+	provider, account, eventID string
+}
+type returnClaimOwner struct{ reportID, lineID string }
 
 type memoryTx struct {
 	processing      *tender.VerifiedEventKey
@@ -32,6 +37,7 @@ type memoryTx struct {
 	outbox          []tender.OutboxEntry
 	captureFailures []tender.CaptureFailureNotice
 	adverse         map[tender.AdverseKey]tender.AdverseNotice
+	returnClaims    map[returnClaimKey]returnClaimOwner
 }
 
 // Memory serializes transactions and publishes a new snapshot only on commit.
@@ -41,7 +47,7 @@ type Memory struct {
 }
 
 func NewMemory() *Memory {
-	return &Memory{lock: make(chan struct{}, 1), state: memoryTx{events: make(map[tender.VerifiedEventKey]inboxEvent), payments: make(map[key]tender.Payment), operations: make(map[key]tender.OperationRecord), adverse: make(map[tender.AdverseKey]tender.AdverseNotice)}}
+	return &Memory{lock: make(chan struct{}, 1), state: memoryTx{events: make(map[tender.VerifiedEventKey]inboxEvent), payments: make(map[key]tender.Payment), operations: make(map[key]tender.OperationRecord), adverse: make(map[tender.AdverseKey]tender.AdverseNotice), returnClaims: make(map[returnClaimKey]returnClaimOwner)}}
 }
 
 func (m *Memory) acquire(ctx context.Context) error {
@@ -65,7 +71,8 @@ func (m *Memory) Transact(ctx context.Context, fn func(tender.Tx) error) error {
 		events:   maps.Clone(m.state.events),
 		payments: maps.Clone(m.state.payments), operations: maps.Clone(m.state.operations),
 		history: slices.Clone(m.state.history), outbox: slices.Clone(m.state.outbox), captureFailures: slices.Clone(m.state.captureFailures),
-		adverse: maps.Clone(m.state.adverse),
+		adverse:      maps.Clone(m.state.adverse),
+		returnClaims: maps.Clone(m.state.returnClaims),
 	}
 	if err := fn(&tx); err != nil {
 		return err
@@ -331,6 +338,41 @@ func (t *memoryTx) EnqueueAdverse(n tender.AdverseNotice, claim tender.AdverseCl
 	}
 	t.adverse[k] = n
 	return nil
+}
+
+func (t *memoryTx) ClaimReturnEvidenceSet(scope tender.Scope, provider, account, reportID string, claims []tender.ReturnEvidenceClaim) (bool, error) {
+	if scope.Validate() != nil || provider == "" || account == "" || reportID == "" || len(claims) == 0 {
+		return false, tender.ErrValidation
+	}
+	seen := make(map[string]bool, len(claims))
+	lines := make(map[string]bool, len(claims))
+	for _, claim := range claims {
+		if claim.ProviderEventID == "" || claim.LineID == "" || seen[claim.ProviderEventID] || lines[claim.LineID] {
+			return false, tender.ErrValidation
+		}
+		seen[claim.ProviderEventID] = true
+		lines[claim.LineID] = true
+		key := returnClaimKey{scope, provider, account, claim.ProviderEventID}
+		event := t.events[tender.VerifiedEventKey{Scope: scope, Provider: provider, MerchantAccount: account, ID: claim.ProviderEventID}]
+		if !event.processed {
+			return false, tender.ErrConflict
+		}
+		if _, ok := t.adverse[tender.AdverseKey{Scope: scope, Provider: provider, MerchantAccount: account, ProviderEventID: claim.ProviderEventID}]; !ok {
+			return false, tender.ErrConflict
+		}
+		if prior, ok := t.returnClaims[key]; ok && prior != (returnClaimOwner{reportID, claim.LineID}) {
+			return false, nil
+		}
+		for priorKey, owner := range t.returnClaims {
+			if priorKey.scope == scope && priorKey.provider == provider && priorKey.account == account && priorKey.eventID != claim.ProviderEventID && owner == (returnClaimOwner{reportID, claim.LineID}) {
+				return false, nil
+			}
+		}
+	}
+	for _, claim := range claims {
+		t.returnClaims[returnClaimKey{scope, provider, account, claim.ProviderEventID}] = returnClaimOwner{reportID, claim.LineID}
+	}
+	return true, nil
 }
 
 func (t *memoryTx) ReviewAdverse(k tender.AdverseKey, d tender.AdverseDecision) error {

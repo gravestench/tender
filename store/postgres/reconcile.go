@@ -2,12 +2,79 @@ package postgres
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
+	"strings"
 
 	"github.com/gravestench/tender"
 )
 
 var _ tender.ReconciliationTx = (*transaction)(nil)
+var _ tender.ReturnEvidenceClaimTx = (*transaction)(nil)
+
+func (t *transaction) ClaimReturnEvidenceSet(scope tender.Scope, provider, account, reportID string, claims []tender.ReturnEvidenceClaim) (bool, error) {
+	if scope.Validate() != nil || provider == "" || account == "" || reportID == "" || len(claims) == 0 {
+		return false, tender.ErrValidation
+	}
+	// A transaction-level lock makes the check and insert an atomic set even
+	// when two different report IDs race to claim one signed receipt.
+	if _, err := t.tx.ExecContext(t.ctx, `LOCK TABLE tender_reconciliation_return_claims IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+		return false, dbError(err)
+	}
+	seen := make(map[string]bool, len(claims))
+	lines := make(map[string]bool, len(claims))
+	for _, claim := range claims {
+		if strings.TrimSpace(claim.ProviderEventID) == "" || len(claim.ProviderEventID) > 200 || strings.TrimSpace(claim.LineID) == "" || len(claim.LineID) > 200 || seen[claim.ProviderEventID] || lines[claim.LineID] {
+			return false, tender.ErrValidation
+		}
+		seen[claim.ProviderEventID] = true
+		lines[claim.LineID] = true
+		var processed bool
+		err := t.tx.QueryRowContext(t.ctx, `SELECT EXISTS (
+			SELECT 1 FROM tender_adverse_reviews a JOIN tender_provider_events e
+			USING (merchant_id, environment, provider, merchant_account, event_id)
+			WHERE a.merchant_id=$1 AND a.environment=$2 AND a.provider=$3 AND a.merchant_account=$4
+			AND a.event_id=$5 AND e.processed_at IS NOT NULL)`, scope.MerchantID, scope.Environment, provider, account, claim.ProviderEventID).Scan(&processed)
+		if err != nil {
+			return false, dbError(err)
+		}
+		if !processed {
+			return false, tender.ErrConflict
+		}
+		var priorReport, priorLine string
+		err = t.tx.QueryRowContext(t.ctx, `SELECT report_id,line_id FROM tender_reconciliation_return_claims
+			WHERE merchant_id=$1 AND environment=$2 AND provider=$3 AND merchant_account=$4 AND event_id=$5`,
+			scope.MerchantID, scope.Environment, provider, account, claim.ProviderEventID).Scan(&priorReport, &priorLine)
+		if err == nil && (priorReport != reportID || priorLine != claim.LineID) {
+			return false, nil
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return false, dbError(err)
+		}
+		var priorEvent string
+		err = t.tx.QueryRowContext(t.ctx, `SELECT event_id FROM tender_reconciliation_return_claims
+			WHERE merchant_id=$1 AND environment=$2 AND provider=$3 AND merchant_account=$4 AND report_id=$5 AND line_id=$6`,
+			scope.MerchantID, scope.Environment, provider, account, reportID, claim.LineID).Scan(&priorEvent)
+		if err == nil && priorEvent != claim.ProviderEventID {
+			return false, nil
+		}
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return false, dbError(err)
+		}
+	}
+	for _, claim := range claims {
+		_, err := t.tx.ExecContext(t.ctx, `INSERT INTO tender_reconciliation_return_claims
+			(merchant_id,environment,provider,merchant_account,event_id,report_id,line_id)
+			VALUES ($1,$2,$3,$4,$5,$6,$7)
+			ON CONFLICT (merchant_id,environment,provider,merchant_account,event_id) DO NOTHING`,
+			scope.MerchantID, scope.Environment, provider, account, claim.ProviderEventID, reportID, claim.LineID)
+		if err != nil {
+			return false, dbError(err)
+		}
+	}
+	return true, nil
+}
 
 func (t *transaction) ReconciliationRun(scope tender.Scope, provider, account, id string) (tender.ReconciliationRun, error) {
 	var digest string
