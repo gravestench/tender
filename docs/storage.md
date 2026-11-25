@@ -6,7 +6,7 @@ Tender stores the host order claim, payment, attempt and operation reservation b
 
 Use PostgreSQL 17 with a UTF-8 database. Choose a schema where only trusted roles can create objects. Set that schema as the search path for the migration session and **every** connection in the application pool. The example uses an existing schema named `tender`.
 
-Apply outstanding `migrations/*.up.sql` files in lexicographic order before starting workers. Each script contains `BEGIN` and `COMMIT`. Record each successfully applied version in the host migration ledger. A fresh installation applies `001` through `006`; existing installations apply each version after their last recorded migration. The scripts are also available through `postgres.Migrations` in Go.
+Apply outstanding `migrations/*.up.sql` files in lexicographic order before starting workers. Each script contains `BEGIN` and `COMMIT`. Record each successfully applied version in the host migration ledger. A fresh installation applies `001` through `007`. If your `v0.1.0-alpha.1` schema has migrations through `004`, apply `005_payout_batches`, `006_adverse_review`, and `007_return_evidence_claims` in that order. For other installations, start after the last recorded version. The scripts are also available through `postgres.Migrations` in Go.
 
 ```sh
 PGOPTIONS='-c search_path=tender' psql "$TENDER_MIGRATION_DSN" -X -v ON_ERROR_STOP=1 \
@@ -15,7 +15,8 @@ PGOPTIONS='-c search_path=tender' psql "$TENDER_MIGRATION_DSN" -X -v ON_ERROR_ST
   -f store/postgres/migrations/003_capture_failures.up.sql \
   -f store/postgres/migrations/004_reconciliation_digest.up.sql \
   -f store/postgres/migrations/005_payout_batches.up.sql \
-  -f store/postgres/migrations/006_adverse_review.up.sql
+  -f store/postgres/migrations/006_adverse_review.up.sql \
+  -f store/postgres/migrations/007_return_evidence_claims.up.sql
 ```
 
 Grant the runtime role schema usage, table privileges for its operations, and sequence usage for inserts. Reserve DDL for the migration role. The host owns the SQL driver, pool, credentials, network settings and shutdown. With pgx v5, a PostgreSQL URL can include `search_path=tender` and `sslmode=verify-full` for a remote database. Configure a trusted CA for the server certificate. The `store/postgres` package uses the Go standard library and accepts a pool opened with any PostgreSQL `database/sql` driver that supports serializable transactions and SQLSTATE errors via `SQLState() string`.
@@ -112,10 +113,15 @@ WHERE (merchant_id, environment, provider, merchant_account, run_id) = ($1,$2,$3
 
 ## Rollback
 
-Before deployment, back up existing Tender data and verify restore access. A code rollback can keep a compatible schema. Before removing the initial schema, stop all Tender writers and workers, identify pending operations and outbox work, and preserve the full database for recovery. On a disposable database or after the host has explicitly approved deleting the records, run the down migrations in reverse order using the same role and search path. Downgrading `006` removes adverse review records; `005` removes payout source projections and result history. Retain both histories before either rollback. Downgrading `004` removes the reconciliation run input digest and weakens same-ID content conflict detection; retain a backup and do not process reports with older code. Downgrading `003` removes the capture failure review queue and its evidence lookup index. Preserve its review history first. Downgrading `002` restores full-width reference indexes and fails atomically if a stored reference exceeds the old B-tree limit. Preserve the references and the current schema in that case.
+Before deployment, back up existing Tender data and verify restore access. A code rollback can keep a compatible schema. Before removing the initial schema, stop all Tender writers and workers, identify pending operations and outbox work, and preserve the full database for recovery. On a disposable database or after the host has explicitly approved deleting the records, run the down migrations in reverse order using the same role and search path.
+
+Run `007_return_evidence_claims.down.sql` before `006_adverse_review.down.sql` because the claims table references adverse reviews and settlement rows. Downgrading `007` deletes the links that bind each verified adverse event to one settlement row. Back up those claims before downgrading and restore them before resuming return reconciliation that depends on them. Downgrading `006` removes adverse review records. Downgrading `005` removes payout source projections and result history. Retain each history before removing its migration.
+
+Downgrading `004` removes the reconciliation run input digest and weakens same-ID content conflict detection. Retain a backup and suspend report processing on older code. Downgrading `003` removes the capture failure review queue and its evidence lookup index. Preserve its review history first. Downgrading `002` restores full-width reference indexes and fails atomically if a stored reference exceeds the old B-tree limit. Preserve the references and the current schema in that case.
 
 ```sh
 PGOPTIONS='-c search_path=tender' psql "$TENDER_MIGRATION_DSN" -X -v ON_ERROR_STOP=1 \
+  -f store/postgres/migrations/007_return_evidence_claims.down.sql \
   -f store/postgres/migrations/006_adverse_review.down.sql \
   -f store/postgres/migrations/005_payout_batches.down.sql \
   -f store/postgres/migrations/004_reconciliation_digest.down.sql \
