@@ -430,7 +430,14 @@ func TestAdverseMigrationRoundTrip(t *testing.T) {
 	open := postgresFixture(t)
 	db := open()
 	defer db.Close()
-	for _, path := range []string{"migrations/006_adverse_review.down.sql", "migrations/006_adverse_review.up.sql"} {
+	// 007 has a foreign key into 006, so roll back and restore both in
+	// dependency order after postgresFixture has applied every migration.
+	for _, path := range []string{
+		"migrations/007_return_evidence_claims.down.sql",
+		"migrations/006_adverse_review.down.sql",
+		"migrations/006_adverse_review.up.sql",
+		"migrations/007_return_evidence_claims.up.sql",
+	} {
 		migration, err := postgres.Migrations.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
@@ -442,5 +449,8 @@ func TestAdverseMigrationRoundTrip(t *testing.T) {
 	var table string
 	if err := db.QueryRowContext(t.Context(), `SELECT to_regclass('tender_adverse_reviews')::text`).Scan(&table); err != nil || table != "tender_adverse_reviews" {
 		t.Fatalf("migration round trip left table %q: %v", table, err)
+	}
+	if err := db.QueryRowContext(t.Context(), `SELECT to_regclass('tender_reconciliation_return_claims')::text`).Scan(&table); err != nil || table != "tender_reconciliation_return_claims" {
+		t.Fatalf("migration round trip left return claims table %q: %v", table, err)
 	}
 }
