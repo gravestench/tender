@@ -17,6 +17,14 @@ const { chromium } = require(process.env.TENDER_PLAYWRIGHT || "playwright");
     await ctx.routeWebSocket("**/*", route => route.close());
     const page = await ctx.newPage();
     opened.length = 0;
+    const waitStatus = async value => {
+      await page.waitForFunction(expected => {
+        const status = document.querySelector('[role="status"][aria-label="Payment status"]');
+        return status && status.textContent.trim() === expected;
+      }, value, { timeout: 3000 });
+      const status = page.getByRole("status", { name: "Payment status" });
+      assert.equal((await status.innerText()).trim(), value);
+    };
     if (process.env.TENDER_VIEW === "wallet") {
       await page.route("**/wallet/start", route => route.abort());
       await page.goto(process.env.TENDER_GUEST);
@@ -24,9 +32,7 @@ const { chromium } = require(process.env.TENDER_PLAYWRIGHT || "playwright");
       await page.keyboard.press("Tab");
       assert.equal(await page.evaluate(() => document.activeElement?.textContent.trim()), "Start synthetic wallet checkout");
       await page.keyboard.press("Enter");
-      const status = page.getByRole("status", { name: "Payment status" });
-      await status.waitFor({ timeout: 3000 });
-      assert.equal((await status.innerText()).trim(), "PayPal is unavailable for this checkout.");
+      await waitStatus("PayPal is unavailable for this checkout.");
       assert.equal(await page.evaluate(() => document.activeElement?.id), "message", "error receives keyboard focus");
       assert.equal(await page.getByRole("button").count(), 0, "error hides unavailable controls");
       await page.reload();
@@ -38,14 +44,36 @@ const { chromium } = require(process.env.TENDER_PLAYWRIGHT || "playwright");
       assert.deepEqual(external, []);
       return;
     }
+    if (process.env.TENDER_VIEW === "wallet_lifecycle") {
+      await page.goto(process.env.TENDER_GUEST);
+      const checkout = page.url();
+      await page.keyboard.press("Tab");
+      assert.equal(await page.evaluate(() => document.activeElement?.textContent.trim()), "Start synthetic wallet checkout");
+      await page.keyboard.press("Enter");
+      await waitStatus("Approve or cancel the synthetic payment.");
+      assert.equal(await page.evaluate(() => document.activeElement?.textContent.trim()), "Approve synthetic payment", "approval receives focus after start control hides");
+      await page.keyboard.press("Tab");
+      assert.equal(await page.evaluate(() => document.activeElement?.textContent.trim()), "Cancel approval");
+      await page.keyboard.press("Enter");
+      await waitStatus("Approval cancelled. No payment collected.");
+      assert.equal(await page.evaluate(() => document.activeElement?.id), "message", "cancel result receives focus");
+      await page.keyboard.press("Tab");
+      assert.equal(await page.evaluate(() => document.activeElement?.textContent.trim()), "Start synthetic wallet checkout", "cancel leaves a reachable retry");
+      await page.keyboard.press("Enter");
+      await waitStatus("Approve or cancel the synthetic payment.");
+      assert.equal(await page.evaluate(() => document.activeElement?.textContent.trim()), "Approve synthetic payment");
+      await page.keyboard.press("Enter");
+      await waitStatus("Payment captured.");
+      assert.equal(await page.evaluate(() => document.activeElement?.id), "message", "capture result receives focus");
+      assert.equal(await page.getByRole("button").count(), 0, "paid checkout has no active controls");
+      assert.equal(page.url(), checkout);
+      assert.equal(opened.length, 0);
+      assert.deepEqual(external, []);
+      return;
+    }
     await page.goto(process.env.TENDER_GUEST);
     const checkout = page.url();
     const focused = () => page.evaluate(() => document.activeElement?.id || document.activeElement?.tagName.toLowerCase());
-    const waitStatus = async value => {
-      const status = page.getByRole("status", { name: "Payment status" });
-      await status.waitFor({ timeout: 3000 });
-      assert.equal((await status.innerText()).trim(), value);
-    };
     await page.keyboard.press("Tab");
     assert.equal(await focused(), "scenario", "scenario selector is first in keyboard order");
     assert.equal(await page.getByRole("combobox", { name: "Scenario" }).count(), 1);

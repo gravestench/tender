@@ -18,6 +18,7 @@ function render(state) {
 for (const button of controls) {
   button.addEventListener("click", async () => {
     controls.forEach(control => control.disabled = true);
+    let nextFocus = message;
     try {
       async function submit(step) {
         const response = await fetch(location.pathname + "/wallet/" + step, {
@@ -29,12 +30,14 @@ for (const button of controls) {
         return (await response.json()).status;
       }
       const status = await submit(button.dataset.step);
-      render(status === "approved" ? await submit("confirm") : status);
+      const next = status === "approved" ? await submit("confirm") : status;
+      render(next);
+      if (next === "requires_action") nextFocus = checkout.querySelector('[data-step="approve"]');
     } catch {
       render("unavailable");
-      message.focus();
     } finally {
       controls.forEach(control => control.disabled = false);
+      nextFocus.focus();
     }
   });
 }
