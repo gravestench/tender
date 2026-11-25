@@ -87,12 +87,26 @@ func TestProjectPayout(t *testing.T) {
 	if err != nil || line.AmountMinor != 9450 || line.PayoutReference != "TX4313726XT" || line.BatchID != "42" || line.SourcePartID != "part-1" || line.SourceSectionID != "section-42" || line.ID == "" {
 		t.Fatalf("payout projection: %+v, %v", line, err)
 	}
+	repeated := map[string]string{}
+	for k, v := range f {
+		repeated[k] = v
+	}
+	repeated["Modification Reference"] = "TX4313726XT batch 42, TestMerchant batch 42, TestMerchant"
+	if got, err := ProjectPayout(repeated, time.Now()); err != nil || got.PayoutReference != line.PayoutReference {
+		t.Fatalf("documented repeated account and batch: %+v, %v", got, err)
+	}
 	for _, bad := range []func(map[string]string){
 		func(m map[string]string) { m["Net Credit (NC)"] = "94.50"; delete(m, "Net Debit (NC)") },
 		func(m map[string]string) { m["Modification Reference"] = "batch 42, TestMerchant" },
 		func(m map[string]string) { m["Modification Reference"] = "TX4313726XT batch 43, TestMerchant" },
 		func(m map[string]string) { m["Merchant Account"] = "Other" },
 		func(m map[string]string) { m["Modification Reference"] = "TX4313726XT batch 42, TestMerchantEvil" },
+		func(m map[string]string) {
+			m["Modification Reference"] = "TX4313726XT batch 42, TestMerchant batch 43, TestMerchant"
+		},
+		func(m map[string]string) {
+			m["Modification Reference"] = "TX4313726XT batch 42, TestMerchant batch 42, OtherMerchant"
+		},
 	} {
 		copy := map[string]string{}
 		for k, v := range f {

@@ -214,8 +214,8 @@ func ProjectPayout(f map[string]string, observedAt time.Time) (tender.PayoutLine
 	if len(description) > 256 || len(matches) != 3 || matches[2] != batch {
 		return tender.PayoutLine{}, tender.ErrValidation
 	}
-	suffix := strings.TrimPrefix(description, matches[1]+" batch "+batch+", ")
-	if suffix != account && !strings.HasPrefix(suffix, account+" batch ") {
+	accountDescription := matches[1] + " batch " + batch + ", " + account
+	if description != accountDescription && description != accountDescription+" batch "+batch+", "+account {
 		return tender.PayoutLine{}, tender.ErrValidation
 	}
 	amount, err := cardMinor(f["Net Debit (NC)"], false)
